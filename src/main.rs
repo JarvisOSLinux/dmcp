@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use dmcp::config;
 use dmcp::elevation::{is_elevated, is_system_scope, re_exec_with_pkexec};
 use dmcp::{add_source, call, connect, discovery, fetch_server_from_registry, filter_servers_by_keywords, get_server, install, list_registry_servers, list_registry_servers_from_url, list_servers, list_sources, remove_source, run, run_setup, scope_from_registry_server, set_config_value, uninstall, Paths};
+use dmcp::{sync_index, VectorIndex, VectorEntry};
 
 #[derive(Parser)]
 #[command(name = "dmcp")]
@@ -155,9 +156,10 @@ enum Commands {
     /// Run dmcp as an MCP server (for LLM integration)
     Serve,
 
-    /// Browse servers available in registry sources (or a specific registry URL)
+    /// Browse servers available in registry sources (or a specific registry URL).
+    /// Use --vector / --vectors for semantic search against the local vector index.
     Browse {
-        /// Registry URL to browse (omit to use configured sources)
+        /// Registry URL to browse (omit to use configured sources; ignored for vector search)
         url: Option<String>,
 
         /// Show user-scope sources only (ignored when URL is given)
@@ -175,6 +177,57 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Semantic search: query vector as a JSON array of floats
+        #[arg(long, conflicts_with = "vectors")]
+        vector: Option<String>,
+
+        /// Batch semantic search: JSON array of query vectors (array-of-arrays)
+        #[arg(long, conflicts_with = "vector")]
+        vectors: Option<String>,
+
+        /// Maximum results per query vector (default: 5)
+        #[arg(long, default_value = "5")]
+        top_k: usize,
+
+        /// Minimum cosine similarity score 0.0–1.0 (default: 0.0)
+        #[arg(long, default_value = "0.0")]
+        min_score: f32,
+    },
+
+    /// Count visible MCP servers (local + reachable registries)
+    Count {
+        /// Output as JSON with breakdown { "total", "local", "registry" }
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Download and cache registry vector embeddings for semantic search
+    SyncIndex,
+
+    /// Show the embedding model specification stored in the local vector index
+    EmbeddingSpec {
+        /// Output as JSON (default output is already JSON)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Store externally-computed embedding vectors for a server (non-registry servers)
+    IndexServer {
+        /// Server ID (e.g. com.example.myserver)
+        server_id: String,
+
+        /// Vectors as JSON: {"server": [...], "tools": {"tool_name": [...]}}
+        #[arg(long)]
+        vectors: String,
+
+        /// Server display name (used in search results)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Server description (used in search results)
+        #[arg(long)]
+        description: Option<String>,
     },
 
     /// Show resolved paths (for debugging)
@@ -626,7 +679,79 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Browse { url, user, system, keyword, json } => {
+        Commands::Browse { url, user, system, keyword, json, vector, vectors, top_k, min_score } => {
+            // Vector search mode: search the local index, bypass registry
+            if let Some(ref vec_str) = vector {
+                let query: Vec<f32> = match serde_json::from_str(vec_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Error: --vector must be a JSON array of floats: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let index_path = paths.vector_index_path();
+                let index = match VectorIndex::load(&index_path) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("Error loading vector index: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if index.entries.is_empty() {
+                    eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
+                    std::process::exit(1);
+                }
+                let results = index.search(&query, top_k, min_score);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&results).unwrap());
+                } else {
+                    if results.is_empty() {
+                        println!("No results above min-score {:.2}.", min_score);
+                    } else {
+                        print_vector_results(&results);
+                    }
+                }
+                return;
+            }
+
+            if let Some(ref vecs_str) = vectors {
+                let queries: Vec<Vec<f32>> = match serde_json::from_str(vecs_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Error: --vectors must be a JSON array of float arrays: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let index_path = paths.vector_index_path();
+                let index = match VectorIndex::load(&index_path) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("Error loading vector index: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if index.entries.is_empty() {
+                    eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
+                    std::process::exit(1);
+                }
+                let batch = index.search_batch(&queries, top_k, min_score);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&batch).unwrap());
+                } else {
+                    for (i, results) in batch.iter().enumerate() {
+                        println!("=== Query {} ===", i + 1);
+                        if results.is_empty() {
+                            println!("No results above min-score {:.2}.", min_score);
+                        } else {
+                            print_vector_results(results);
+                        }
+                        println!();
+                    }
+                }
+                return;
+            }
+
+            // Keyword / registry browse mode (existing behavior)
             let (mut servers, errors): (Vec<_>, Vec<_>) = if let Some(ref u) = url {
                 match list_registry_servers_from_url(u) {
                     Ok(s) => (s, vec![]),
@@ -684,6 +809,148 @@ fn main() {
                 }
                 print_browse_table(&servers);
             }
+        }
+
+        Commands::Count { json } => {
+            let local_count = list_servers(&paths, true, true, false).len();
+            let (registry_servers, _errors) = list_registry_servers(&paths, true, true);
+            let registry_count = registry_servers.len();
+            let total = local_count + registry_count;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "total": total,
+                        "local": local_count,
+                        "registry": registry_count,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!("{}", total);
+            }
+        }
+
+        Commands::SyncIndex => {
+            match sync_index(&paths) {
+                Ok(result) => {
+                    for warning in &result.errors {
+                        eprintln!("{}", warning);
+                    }
+                    println!(
+                        "Synced: {} server vectors, {} tool vectors indexed.",
+                        result.servers_indexed, result.tools_indexed
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::EmbeddingSpec { json: _ } => {
+            let index_path = paths.vector_index_path();
+            let index = match VectorIndex::load(&index_path) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("Error loading vector index: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            match index.embedding_spec {
+                Some(spec) => {
+                    println!("{}", serde_json::to_string_pretty(&spec).unwrap());
+                }
+                None => {
+                    eprintln!("No embedding spec found. Run `dmcp sync-index` first.");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::IndexServer { server_id, vectors: vectors_json, name, description } => {
+            let vectors_val: serde_json::Value = match serde_json::from_str(&vectors_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: --vectors must be valid JSON: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let server_name = name.unwrap_or_else(|| server_id.clone());
+            let server_description = description;
+
+            let index_path = paths.vector_index_path();
+            let mut index = match VectorIndex::load(&index_path) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("Error loading vector index: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let mut new_entries: Vec<VectorEntry> = Vec::new();
+
+            // Server-level vector
+            if let Some(server_arr) = vectors_val.get("server").and_then(|v| v.as_array()) {
+                let vec: Vec<f32> = server_arr
+                    .iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect();
+                if !vec.is_empty() {
+                    new_entries.push(VectorEntry {
+                        server_id: server_id.clone(),
+                        server_name: server_name.clone(),
+                        server_description: server_description.clone(),
+                        tool_name: None,
+                        tool_description: None,
+                        parameter_schema: None,
+                        vector: vec,
+                        source: "local".to_string(),
+                    });
+                }
+            }
+
+            // Tool-level vectors
+            if let Some(tools_obj) = vectors_val.get("tools").and_then(|v| v.as_object()) {
+                for (tool_name, tool_vec_val) in tools_obj {
+                    if let Some(arr) = tool_vec_val.as_array() {
+                        let vec: Vec<f32> = arr
+                            .iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect();
+                        if !vec.is_empty() {
+                            new_entries.push(VectorEntry {
+                                server_id: server_id.clone(),
+                                server_name: server_name.clone(),
+                                server_description: server_description.clone(),
+                                tool_name: Some(tool_name.clone()),
+                                tool_description: None,
+                                parameter_schema: None,
+                                vector: vec,
+                                source: "local".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if new_entries.is_empty() {
+                eprintln!("Error: no valid vectors found in --vectors JSON.");
+                std::process::exit(1);
+            }
+
+            let n = new_entries.len();
+            index.upsert_server_entries(&server_id, new_entries);
+
+            if let Err(e) = index.save(&index_path) {
+                eprintln!("Error saving vector index: {}", e);
+                std::process::exit(1);
+            }
+
+            println!("Indexed {} vector(s) for {}.", n, server_id);
         }
     }
 }
@@ -802,6 +1069,32 @@ fn print_list_table(servers: &[dmcp::ServerInfo]) {
         println!("{}Transport: {}", INDENT, s.transport_type);
         println!("{}Scope:     {}", INDENT, scope);
         println!("{}Manifest: {}", INDENT, s.manifest_path);
+        println!();
+    }
+}
+
+fn print_vector_results(results: &[dmcp::SearchResult]) {
+    const INDENT: &str = "        ";
+    for r in results {
+        println!("{}", r.server_id);
+        println!("{}Server:  {}", INDENT, r.server_name);
+        if let Some(ref desc) = r.server_description {
+            if !desc.is_empty() {
+                println!("{}Summary: {}", INDENT, desc.lines().next().unwrap_or("").trim());
+            }
+        }
+        if let Some(ref tool) = r.tool_name {
+            println!("{}Tool:    {}", INDENT, tool);
+        }
+        if let Some(ref desc) = r.tool_description {
+            if !desc.is_empty() {
+                println!("{}Tool desc: {}", INDENT, desc.lines().next().unwrap_or("").trim());
+            }
+        }
+        if let Some(ref schema) = r.parameter_schema {
+            println!("{}Params:  {}", INDENT, schema);
+        }
+        println!("{}Score:   {:.4}", INDENT, r.score);
         println!();
     }
 }

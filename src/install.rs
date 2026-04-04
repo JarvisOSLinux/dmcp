@@ -344,6 +344,13 @@ pub fn uninstall(paths: &Paths, id: &str) -> Result<(), UninstallError> {
 
     update_index_remove(&index_path, id, scope)?;
 
+    // Remove any vector index entries for this server (best-effort, no failure on error)
+    let vector_index_path = paths.vector_index_path();
+    if let Ok(mut vidx) = crate::vector_index::VectorIndex::load(&vector_index_path) {
+        vidx.remove_server_entries(id);
+        let _ = vidx.save(&vector_index_path);
+    }
+
     Ok(())
 }
 
