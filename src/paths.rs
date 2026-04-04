@@ -13,6 +13,7 @@ pub struct Paths {
     pub user_install_dir: PathBuf,
     pub system_sources: PathBuf,
     pub system_install_dir: PathBuf,
+    pub vector_index_dir: PathBuf,
 }
 
 impl Paths {
@@ -43,12 +44,19 @@ impl Paths {
             "/usr/share/mcp/installed/",
             &env_defaults,
         );
+        let vector_index_dir = resolve_path(
+            "MCP_VECTOR_INDEX_DIR",
+            dirs::data_local_dir().map(|p| p.join("mcp/vector_index")),
+            "~/.local/share/mcp/vector_index",
+            &env_defaults,
+        );
 
         Self {
             user_sources,
             user_install_dir,
             system_sources,
             system_install_dir,
+            vector_index_dir,
         }
     }
 
@@ -70,6 +78,16 @@ impl Paths {
     /// System install directory.
     pub fn system_install_dir(&self) -> &Path {
         &self.system_install_dir
+    }
+
+    /// Vector index directory (user-scope only).
+    pub fn vector_index_dir(&self) -> &Path {
+        &self.vector_index_dir
+    }
+
+    /// Path to the vector index JSON file.
+    pub fn vector_index_path(&self) -> PathBuf {
+        self.vector_index_dir.join("index.json")
     }
 }
 

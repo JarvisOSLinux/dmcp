@@ -17,6 +17,8 @@ pub mod run;
 pub mod serve;
 pub mod setup;
 pub mod sources;
+pub mod sync_index;
+pub mod vector_index;
 
 pub use browse::{filter_servers_by_keywords, list_registry_servers, list_registry_servers_from_url, RegistryServer};
 pub use connect::connect;
@@ -29,3 +31,5 @@ pub use setup::run_setup;
 pub use models::{Index, Manifest};
 pub use paths::Paths;
 pub use sources::{add_source, list_sources, remove_source, SourceScope, SourcesError};
+pub use sync_index::{sync_index, SyncResult};
+pub use vector_index::{EmbeddingSpec, SearchResult, VectorEntry, VectorIndex};
