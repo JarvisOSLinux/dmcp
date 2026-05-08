@@ -167,7 +167,11 @@ fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {
 }
 
 fn install_stdio(server: &serde_json::Value, install_dir: &Path) -> Result<(), InstallError> {
-    let source = server.get("source").and_then(|s| s.as_object()).ok_or(InstallError::InvalidRegistry)?;
+    // source is optional — package-based servers (uvx, npm -g, cargo install) need no clone.
+    let source = match server.get("source").and_then(|s| s.as_object()) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
     let url = source.get("url").and_then(|u| u.as_str()).ok_or(InstallError::InvalidRegistry)?;
     let path = source.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
