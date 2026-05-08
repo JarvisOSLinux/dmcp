@@ -28,6 +28,11 @@ node_modules/
 .cache/
 *.log
 
+# makepkg artifacts
+*.tar.gz
+src/
+pkg/
+
 # OS
 .DS_Store
 Thumbs.db
