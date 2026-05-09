@@ -3,10 +3,12 @@
 use std::path::Path;
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::discovery;
-use crate::setup;
 use crate::elevation::is_elevated;
 use crate::paths::Paths;
+use crate::setup;
 use crate::sources::list_sources;
 
 /// Install a server from registry by id.
@@ -29,6 +31,9 @@ pub fn install(
         crate::discovery::Scope::System => paths.system_install_dir().join(id),
     };
 
+    // Clear any stale files from a previous failed install so that
+    // copy_dir_all never hits EACCES on read-only remnants.
+    let _ = std::fs::remove_dir_all(&install_dir);
     std::fs::create_dir_all(&install_dir).map_err(InstallError::CreateDir)?;
 
     let transports = server
@@ -56,24 +61,51 @@ pub fn install(
 
     let manifest_path = install_dir.join("manifest.json");
 
-    // Run setup script if present (filename for local, URL for remote)
     if run_setup {
-        if let Some(setup_script) = manifest.get("setupScript").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        // --- setupScript delivery from registry ---
+        // The script lives in the registry repo (servers/<id>/setup.sh), not in
+        // the cloned server repo. fetch_server_from_registry set setupScriptUrl
+        // when integrity.setupScriptSha256 is present; we download, verify, and
+        // write setup.sh here so the run_setup block below finds it locally.
+        let (script_delivered, deliver_label) = match deliver_setup_script(&server, &install_dir) {
+            DeliverStatus::Downloaded => (true, "ok".to_string()),
+            s => (false, s.label()),
+        };
+        if script_delivered {
+            manifest["setupScript"] = serde_json::json!("setup.sh");
+        }
+
+        // --- run setup script ---
+        if let Some(setup_script) = manifest
+            .get("setupScript")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             let config = manifest
                 .get("config")
                 .and_then(|c| c.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                })
+                .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            if let Ok(()) = setup::run_setup(setup_script, &install_dir, &config) {
-                manifest["setupScriptPath"] = serde_json::json!(install_dir.join(setup_script).to_string_lossy());
-                manifest["setupScriptRunAt"] = serde_json::Value::String(rfc3339_now());
-                manifest["setupScriptVersion"] = manifest.get("setupScriptVersion").cloned().unwrap_or(serde_json::json!("1.0.0"));
+            match setup::run_setup(setup_script, &install_dir, &config) {
+                Ok(()) => {
+                    manifest["setupScriptStatus"] = serde_json::json!("ok");
+                    manifest["setupScriptPath"] =
+                        serde_json::json!(install_dir.join(setup_script).to_string_lossy());
+                    manifest["setupScriptRunAt"] =
+                        serde_json::Value::String(rfc3339_now());
+                    manifest["setupScriptVersion"] = manifest
+                        .get("setupScriptVersion")
+                        .cloned()
+                        .unwrap_or(serde_json::json!("1.0.0"));
+                }
+                Err(e) => {
+                    manifest["setupScriptStatus"] =
+                        serde_json::json!(format!("failed: {}", e));
+                }
             }
             // Install succeeds even if setup fails; user can retry via dmcp setup
+        } else {
+            manifest["setupScriptStatus"] = serde_json::json!(deliver_label);
         }
     }
 
@@ -105,7 +137,10 @@ pub fn scope_from_registry_server(server: &serde_json::Value) -> crate::discover
     }
 }
 
-pub fn fetch_server_from_registry(paths: &Paths, id: &str) -> Result<serde_json::Value, InstallError> {
+pub fn fetch_server_from_registry(
+    paths: &Paths,
+    id: &str,
+) -> Result<serde_json::Value, InstallError> {
     let sources = list_sources(paths, true, true);
     if sources.is_empty() {
         return Err(InstallError::NoSources);
@@ -114,7 +149,7 @@ pub fn fetch_server_from_registry(paths: &Paths, id: &str) -> Result<serde_json:
     let client = reqwest::blocking::Client::builder()
         .user_agent("dmcp/1.0")
         .build()
-        .map_err(|e| InstallError::HttpClient(e))?;
+        .map_err(InstallError::HttpClient)?;
 
     for (url, _) in sources {
         let resp = client.get(&url).send().map_err(InstallError::FetchFailed)?;
@@ -122,7 +157,9 @@ pub fn fetch_server_from_registry(paths: &Paths, id: &str) -> Result<serde_json:
             continue;
         }
         let registry: serde_json::Value = resp.json().map_err(InstallError::FetchFailed)?;
-        let servers_val = registry.get("servers").ok_or(InstallError::InvalidRegistry)?;
+        let servers_val = registry
+            .get("servers")
+            .ok_or(InstallError::InvalidRegistry)?;
 
         let servers: Vec<serde_json::Value> = if let Some(arr) = servers_val.as_array() {
             arr.clone()
@@ -137,14 +174,43 @@ pub fn fetch_server_from_registry(paths: &Paths, id: &str) -> Result<serde_json:
                 continue;
             }
 
-            // If entry has manifest URL, fetch and merge (registry entry may override id, keywords, etc.)
-            if let Some(manifest_url) = server.get("manifest").and_then(|m| m.as_str()).filter(|s| s.starts_with("http")) {
-                let manifest_resp = client.get(manifest_url).send().map_err(InstallError::FetchFailed)?;
+            // If entry has manifest URL, fetch and merge
+            if let Some(manifest_url) = server
+                .get("manifest")
+                .and_then(|m| m.as_str())
+                .filter(|s| s.starts_with("http"))
+            {
+                let manifest_url = manifest_url.to_string();
+                let manifest_resp = client
+                    .get(&manifest_url)
+                    .send()
+                    .map_err(InstallError::FetchFailed)?;
                 if manifest_resp.status().is_success() {
-                    let mut manifest: serde_json::Value = manifest_resp.json().map_err(InstallError::FetchFailed)?;
+                    let mut manifest: serde_json::Value =
+                        manifest_resp.json().map_err(InstallError::FetchFailed)?;
                     // Merge: registry entry overrides manifest (for scope, keywords, etc.)
                     merge_json(&mut manifest, &server);
                     server = manifest;
+                }
+            }
+
+            // Derive setup script URL from the manifest URL when the registry
+            // supplies an integrity hash. The script lives alongside the
+            // manifest in the registry repo: .../servers/<id>/setup.sh
+            let has_setup_hash = server
+                .get("integrity")
+                .and_then(|i| i.get("setupScriptSha256"))
+                .and_then(|h| h.as_str())
+                .filter(|h| !h.is_empty())
+                .is_some();
+            if has_setup_hash {
+                if let Some(manifest_url) =
+                    server.get("manifest").and_then(|m| m.as_str())
+                {
+                    if let Some(base) = manifest_url.strip_suffix("manifest.json") {
+                        server["setupScriptUrl"] =
+                            serde_json::json!(format!("{}setup.sh", base));
+                    }
                 }
             }
 
@@ -155,7 +221,97 @@ pub fn fetch_server_from_registry(paths: &Paths, id: &str) -> Result<serde_json:
     Err(InstallError::ServerNotFound)
 }
 
-/// Merge b into a. Keys in b override a. Used to merge registry metadata over fetched manifest.
+// ---------------------------------------------------------------------------
+// Setup script delivery
+// ---------------------------------------------------------------------------
+
+enum DeliverStatus {
+    Downloaded,
+    SkippedNoScript,
+    SkippedDownloadFailed(String),
+    SkippedHashMismatch,
+    SkippedWriteFailed(String),
+}
+
+impl DeliverStatus {
+    fn label(self) -> String {
+        match self {
+            DeliverStatus::Downloaded => "ok".into(),
+            DeliverStatus::SkippedNoScript => "skipped: no script defined".into(),
+            DeliverStatus::SkippedDownloadFailed(e) => {
+                format!("skipped: download failed: {}", e)
+            }
+            DeliverStatus::SkippedHashMismatch => "skipped: hash mismatch".into(),
+            DeliverStatus::SkippedWriteFailed(e) => format!("skipped: write failed: {}", e),
+        }
+    }
+}
+
+/// Download the registry-hosted setup script, SHA-256 verify it, and write it
+/// to `install_dir/setup.sh`. Returns the delivery outcome so the caller can
+/// set `setupScriptStatus` in the manifest accordingly.
+fn deliver_setup_script(server: &serde_json::Value, install_dir: &Path) -> DeliverStatus {
+    let url = match server.get("setupScriptUrl").and_then(|u| u.as_str()) {
+        Some(u) => u.to_string(),
+        None => return DeliverStatus::SkippedNoScript,
+    };
+
+    let expected_hash = match server
+        .get("integrity")
+        .and_then(|i| i.get("setupScriptSha256"))
+        .and_then(|h| h.as_str())
+        .filter(|h| !h.is_empty())
+    {
+        Some(h) => h.to_string(),
+        None => return DeliverStatus::SkippedNoScript,
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("dmcp/1.0")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return DeliverStatus::SkippedDownloadFailed(e.to_string()),
+    };
+
+    let resp = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(e) => return DeliverStatus::SkippedDownloadFailed(e.to_string()),
+    };
+    if !resp.status().is_success() {
+        return DeliverStatus::SkippedDownloadFailed(format!("HTTP {}", resp.status()));
+    }
+    let content = match resp.bytes() {
+        Ok(b) => b,
+        Err(e) => return DeliverStatus::SkippedDownloadFailed(e.to_string()),
+    };
+
+    // Verify SHA-256 against the registry-supplied hash
+    let actual_hash = format!("{:x}", Sha256::digest(&content));
+    if actual_hash != expected_hash {
+        return DeliverStatus::SkippedHashMismatch;
+    }
+
+    let dest = install_dir.join("setup.sh");
+    if let Err(e) = std::fs::write(&dest, &content) {
+        return DeliverStatus::SkippedWriteFailed(e.to_string());
+    }
+
+    // Mark executable on Unix so `sh setup.sh` isn't required by run_setup
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+
+    DeliverStatus::Downloaded
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+/// Merge b into a. Keys in b override a.
 fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {
     if let (Some(a_obj), Some(b_obj)) = (a.as_object_mut(), b.as_object()) {
         for (k, v) in b_obj {
@@ -167,8 +323,14 @@ fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {
 }
 
 fn install_stdio(server: &serde_json::Value, install_dir: &Path) -> Result<(), InstallError> {
-    let source = server.get("source").and_then(|s| s.as_object()).ok_or(InstallError::InvalidRegistry)?;
-    let url = source.get("url").and_then(|u| u.as_str()).ok_or(InstallError::InvalidRegistry)?;
+    let source = server
+        .get("source")
+        .and_then(|s| s.as_object())
+        .ok_or(InstallError::InvalidRegistry)?;
+    let url = source
+        .get("url")
+        .and_then(|u| u.as_str())
+        .ok_or(InstallError::InvalidRegistry)?;
     let path = source.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
     let temp = std::env::temp_dir().join(format!("dmcp-clone-{}", std::process::id()));
@@ -229,8 +391,10 @@ pub fn update_index_add(
         crate::discovery::Scope::System => paths.system_install_dir().join("index.json"),
     };
 
-    let content = std::fs::read_to_string(&index_path).unwrap_or_else(|_| r#"{"servers":{},"version":"1.0"}"#.to_string());
-    let mut index: serde_json::Value = serde_json::from_str(&content).map_err(InstallError::ParseIndex)?;
+    let content = std::fs::read_to_string(&index_path)
+        .unwrap_or_else(|_| r#"{"servers":{},"version":"1.0"}"#.to_string());
+    let mut index: serde_json::Value =
+        serde_json::from_str(&content).map_err(InstallError::ParseIndex)?;
 
     if index.get("servers").is_none() {
         index["servers"] = serde_json::json!({});
@@ -244,10 +408,10 @@ pub fn update_index_add(
     let output = serde_json::to_string_pretty(&index).map_err(InstallError::Serialize)?;
 
     if scope == crate::discovery::Scope::System && is_elevated() {
-        // Already root from re_exec; write directly
         std::fs::write(&index_path, output).map_err(InstallError::WriteIndex)?;
     } else if scope == crate::discovery::Scope::System {
-        let temp = std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
         std::fs::write(&temp, &output).map_err(InstallError::WriteIndex)?;
         let status = Command::new("pkexec")
             .arg("cp")
@@ -359,19 +523,22 @@ fn update_index_remove(
     id: &str,
     scope: crate::discovery::Scope,
 ) -> Result<(), UninstallError> {
-    let content = std::fs::read_to_string(index_path).map_err(UninstallError::ReadIndex)?;
-    let mut index: serde_json::Value = serde_json::from_str(&content).map_err(UninstallError::ParseIndex)?;
+    let content =
+        std::fs::read_to_string(index_path).map_err(UninstallError::ReadIndex)?;
+    let mut index: serde_json::Value =
+        serde_json::from_str(&content).map_err(UninstallError::ParseIndex)?;
     if let Some(servers) = index.get_mut("servers").and_then(|s| s.as_object_mut()) {
         servers.remove(id);
     }
     index["updated"] = serde_json::Value::String(rfc3339_now());
-    let output = serde_json::to_string_pretty(&index).map_err(UninstallError::SerializeIndex)?;
+    let output =
+        serde_json::to_string_pretty(&index).map_err(UninstallError::SerializeIndex)?;
 
     if scope == crate::discovery::Scope::System && is_elevated() {
-        // Already root from re_exec; write directly
         std::fs::write(index_path, output).map_err(UninstallError::WriteIndex)?;
     } else if scope == crate::discovery::Scope::System {
-        let temp = std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
         std::fs::write(&temp, &output).map_err(UninstallError::WriteIndex)?;
         let status = Command::new("pkexec")
             .arg("cp")
@@ -420,12 +587,16 @@ impl std::error::Error for UninstallError {}
 
 pub fn rfc3339_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = d.as_secs() as i64;
     let nsecs = d.subsec_nanos();
-    // Convert epoch seconds to date (simplified, no leap seconds)
     let (year, month, day, hour, min, sec) = epoch_to_datetime(secs);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z", year, month, day, hour, min, sec, nsecs)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        year, month, day, hour, min, sec, nsecs
+    )
 }
 
 fn epoch_to_datetime(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
@@ -439,12 +610,14 @@ fn epoch_to_datetime(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    let days = days + 719468; // epoch adjust
+    let days = days + 719468;
     let era = days / 146097;
     let day_of_era = (days - era * 146097) as i64;
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
     let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let (month, day) = doy_to_md(day_of_year as u32);
     (year, month, day)
 }
