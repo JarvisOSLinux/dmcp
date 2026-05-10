@@ -3,16 +3,9 @@
 //! - **stdio**: Spawns the process with config injected as env vars, relays stdin/stdout.
 //! - **SSE/WebSocket**: Prints the connection URL (server is already running remotely).
 //!
-//! ## Future: configurableProperties for remote servers
-//!
-//! SSE/WebSocket servers may need config (e.g. API tokens) passed when connecting.
-//! Options to consider:
-//! - **Config snippet with env refs**: Emit MCP client config using `${VAR}` placeholders;
-//!   user sets env from `dmcp config`. Safest (no secrets in output).
-//! - **Headers in generated config**: If the MCP client supports headers, generate a snippet
-//!   with `Authorization: Bearer ${TOKEN}` etc.
-//! - **Local proxy**: Spawn a small stdio adapter that connects to remote with auth from manifest.
-//!   Unifies interface but adds complexity.
+//! Config keys are passed directly as environment variables using the key name stored
+//! in the manifest (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY). This matches
+//! what upstream servers expect based on their configurableProperties definitions.
 
 use std::collections::HashMap;
 use std::io;
@@ -54,8 +47,8 @@ impl std::error::Error for RunError {}
 
 /// Run an installed MCP server by id.
 ///
-/// - **stdio**: Spawns the process, injects config as `MCP_CONFIG_*` env vars, inherits stdin/stdout/stderr.
-/// - **SSE/WebSocket**: Prints "<name> is running on <url>" and exits. Config passing not yet supported.
+/// - **stdio**: Spawns the process, injects config as env vars, inherits stdin/stdout/stderr.
+/// - **SSE/WebSocket**: Prints "<name> is running on <url>" and exits.
 pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
     let (manifest, _scope) = get_server(paths, id).ok_or_else(|| RunError::ServerNotFound(id.to_string()))?;
 
@@ -119,16 +112,19 @@ fn run_stdio(
     Ok(())
 }
 
-/// Convert manifest config to env vars: MCP_CONFIG_<KEY> (uppercase, underscores).
-pub fn config_to_env(config: &std::collections::HashMap<String, serde_json::Value>) -> HashMap<String, std::ffi::OsString> {
+/// Convert manifest config to env vars using the key name as-is.
+/// Config keys in configurableProperties ARE the expected env var names
+/// (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY).
+pub fn config_to_env(
+    config: &std::collections::HashMap<String, serde_json::Value>,
+) -> HashMap<String, std::ffi::OsString> {
     let mut env = HashMap::new();
     for (key, value) in config {
-        let env_key = format!("MCP_CONFIG_{}", key.to_uppercase().replace('-', "_").replace('.', "_"));
         let env_val = match value {
             serde_json::Value::String(s) => s.clone(),
             _ => value.to_string(),
         };
-        env.insert(env_key, std::ffi::OsString::from(env_val));
+        env.insert(key.clone(), std::ffi::OsString::from(env_val));
     }
     env
 }
