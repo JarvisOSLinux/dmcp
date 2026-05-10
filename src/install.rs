@@ -76,21 +76,24 @@ pub fn install(
         }
 
         // --- run setup script ---
-        if let Some(setup_script) = manifest
+        if let Some(setup_script_ref) = manifest
             .get("setupScript")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
+            // Clone to owned String to end the immutable borrow on `manifest`
+            // before the mutable index assignments below.
+            let setup_script = setup_script_ref.to_string();
             let config = manifest
                 .get("config")
                 .and_then(|c| c.as_object())
                 .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            match setup::run_setup(setup_script, &install_dir, &config) {
+            match setup::run_setup(&setup_script, &install_dir, &config) {
                 Ok(()) => {
                     manifest["setupScriptStatus"] = serde_json::json!("ok");
                     manifest["setupScriptPath"] =
-                        serde_json::json!(install_dir.join(setup_script).to_string_lossy());
+                        serde_json::json!(install_dir.join(&setup_script).to_string_lossy());
                     manifest["setupScriptRunAt"] =
                         serde_json::Value::String(rfc3339_now());
                     manifest["setupScriptVersion"] = manifest
@@ -566,6 +569,7 @@ pub enum UninstallError {
     RmFailed(std::io::Error),
     ReadIndex(std::io::Error),
     ParseIndex(serde_json::Error),
+    SerializeError(serde_json::Error),
     SerializeIndex(serde_json::Error),
     WriteIndex(std::io::Error),
 }
@@ -577,6 +581,7 @@ impl std::fmt::Display for UninstallError {
             UninstallError::RmFailed(e) => write!(f, "Failed to remove: {}", e),
             UninstallError::ReadIndex(e) => write!(f, "Failed to read index: {}", e),
             UninstallError::ParseIndex(e) => write!(f, "Failed to parse index: {}", e),
+            UninstallError::SerializeError(e) => write!(f, "Failed to serialize: {}", e),
             UninstallError::SerializeIndex(e) => write!(f, "Failed to serialize index: {}", e),
             UninstallError::WriteIndex(e) => write!(f, "Failed to write index: {}", e),
         }
