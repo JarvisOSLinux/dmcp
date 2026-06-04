@@ -63,6 +63,34 @@ pub struct Manifest {
     pub scope: Option<String>,
     #[serde(default)]
     pub source: Option<serde_json::Value>,
+    /// Schema for user-facing configuration fields. Parsed by installers/wrappers
+    /// (e.g. JARVIS) to collect values before setup. dmcp itself stores the values
+    /// in `config` and injects them as env vars — it does not validate against this schema.
+    #[serde(default)]
+    pub configurable_properties: Vec<ConfigurableProperty>,
+}
+
+/// One user-facing configuration field declared by a server manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigurableProperty {
+    /// Environment variable name passed to the server process (e.g. "BRAVE_API_KEY").
+    pub key: String,
+    /// Human-readable field name shown in configuration UIs.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Help text explaining the value and where to obtain it.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// If true, mask the value in UIs and logs.
+    #[serde(default)]
+    pub sensitive: bool,
+    /// If true, the server cannot start without this value being set.
+    #[serde(default)]
+    pub required: bool,
+    /// Pre-filled value used when no saved value exists.
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
