@@ -3,8 +3,13 @@
 use clap::{Parser, Subcommand};
 use dmcp::config;
 use dmcp::elevation::{is_elevated, is_system_scope, re_exec_with_pkexec};
-use dmcp::{add_source, call, connect, discovery, fetch_server_from_registry, filter_servers_by_keywords, get_server, install, list_registry_servers, list_registry_servers_from_url, list_servers, list_sources, remove_source, run, run_setup, scope_from_registry_server, set_config_value, uninstall, Paths};
-use dmcp::{sync_index, VectorIndex, VectorEntry};
+use dmcp::{
+    add_source, call, connect, discovery, fetch_server_from_registry, filter_servers_by_keywords,
+    get_server, install, list_registry_servers, list_registry_servers_from_url, list_servers,
+    list_sources, remove_source, run, run_setup, scope_from_registry_server, set_config_value,
+    uninstall, Paths,
+};
+use dmcp::{sync_index, VectorEntry, VectorIndex};
 
 #[derive(Parser)]
 #[command(name = "dmcp")]
@@ -307,15 +312,18 @@ fn main() {
     match cli.command {
         Commands::Paths => {
             println!("User install dir:  {}", paths.user_install_dir().display());
-            println!("System install dir: {}", paths.system_install_dir().display());
+            println!(
+                "System install dir: {}",
+                paths.system_install_dir().display()
+            );
             let user_index = paths.user_install_dir().join("index.json");
             let system_index = paths.system_install_dir().join("index.json");
             println!("User index exists:  {}", user_index.exists());
             println!("System index exists: {}", system_index.exists());
         }
         Commands::List { user, system, json } => {
-            let include_user = user || (!user && !system);
-            let include_system = system || (!user && !system);
+            let include_user = user || !system;
+            let include_system = system || !user;
             let servers = list_servers(&paths, include_user, include_system, debug);
 
             if json {
@@ -329,96 +337,96 @@ fn main() {
                 print_list_table(&servers);
             }
         }
-        Commands::Info { id, json } => {
-            match get_server(&paths, &id) {
-                Some((manifest, scope)) => {
-                    let scope_str = match scope {
-                        dmcp::discovery::Scope::User => "user",
-                        dmcp::discovery::Scope::System => "system",
-                    };
-                    if json {
-                        let output = serde_json::to_string_pretty(&manifest).unwrap();
-                        println!("{output}");
+        Commands::Info { id, json } => match get_server(&paths, &id) {
+            Some((manifest, scope)) => {
+                let scope_str = match scope {
+                    dmcp::discovery::Scope::User => "user",
+                    dmcp::discovery::Scope::System => "system",
+                };
+                if json {
+                    let output = serde_json::to_string_pretty(&manifest).unwrap();
+                    println!("{output}");
+                } else {
+                    print_info_output(&manifest, scope_str);
+                }
+            }
+            None => {
+                eprintln!("Server not found: {}", id);
+                std::process::exit(1);
+            }
+        },
+        Commands::Config { id, action } => match action {
+            ConfigAction::Set { key, value } => match set_config_value(&paths, &id, &key, &value) {
+                Ok(()) => println!("Set {} = {}", key, value),
+                Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
+                    if is_system_scope(&manifest_path, paths.system_install_dir()) {
+                        re_exec_with_pkexec();
                     } else {
-                        print_info_output(&manifest, scope_str);
+                        eprintln!("Error: Failed to write manifest (permission denied)");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            ConfigAction::Get { key, json } => match get_server(&paths, &id) {
+                Some((manifest, _)) => {
+                    if let Some(k) = key {
+                        match manifest.config.get(&k) {
+                            Some(v) => {
+                                if json {
+                                    println!("{}", serde_json::to_string_pretty(v).unwrap());
+                                } else {
+                                    let val: String = v
+                                        .as_str()
+                                        .map(String::from)
+                                        .unwrap_or_else(|| v.to_string());
+                                    println!("{}", val);
+                                }
+                            }
+                            None => {
+                                eprintln!("Config key not found: {}", k);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        if json {
+                            let output = serde_json::to_string_pretty(&manifest.config).unwrap();
+                            println!("{output}");
+                        } else {
+                            if manifest.config.is_empty() {
+                                println!("No config set.");
+                            } else {
+                                for (k, v) in &manifest.config {
+                                    let val: String = v
+                                        .as_str()
+                                        .map(String::from)
+                                        .unwrap_or_else(|| v.to_string());
+                                    println!("{} = {}", k, val);
+                                }
+                            }
+                        }
                     }
                 }
                 None => {
                     eprintln!("Server not found: {}", id);
                     std::process::exit(1);
                 }
-            }
-        }
-        Commands::Config { id, action } => match action {
-            ConfigAction::Set { key, value } => {
-                match set_config_value(&paths, &id, &key, &value) {
-                    Ok(()) => println!("Set {} = {}", key, value),
-                    Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
-                        if is_system_scope(&manifest_path, paths.system_install_dir()) {
-                            re_exec_with_pkexec();
-                        } else {
-                            eprintln!("Error: Failed to write manifest (permission denied)");
-                            std::process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            ConfigAction::Get { key, json } => {
-                match get_server(&paths, &id) {
-                    Some((manifest, _)) => {
-                        if let Some(k) = key {
-                            match manifest.config.get(&k) {
-                                Some(v) => {
-                                    if json {
-                                        println!("{}", serde_json::to_string_pretty(v).unwrap());
-                                    } else {
-                                        let val: String = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                                        println!("{}", val);
-                                    }
-                                }
-                                None => {
-                                    eprintln!("Config key not found: {}", k);
-                                    std::process::exit(1);
-                                }
-                            }
-                        } else {
-                            if json {
-                                let output = serde_json::to_string_pretty(&manifest.config).unwrap();
-                                println!("{output}");
-                            } else {
-                                if manifest.config.is_empty() {
-                                    println!("No config set.");
-                                } else {
-                                    for (k, v) in &manifest.config {
-                                        let val: String = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                                        println!("{} = {}", k, val);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        eprintln!("Server not found: {}", id);
-                        std::process::exit(1);
-                    }
-                }
-            }
+            },
         },
         Commands::Sources { action } => match action {
             SourcesAction::List { user, system } => {
-                let include_user = user || (!user && !system);
-                let include_system = system || (!user && !system);
+                let include_user = user || !system;
+                let include_system = system || !user;
                 let sources = list_sources(&paths, include_user, include_system);
                 if sources.is_empty() {
                     println!("No registry sources configured.");
                     println!("Add URLs to ~/.config/mcp/sources.list or /etc/mcp/sources.list");
                     return;
                 }
-                println!("{:<8} {}", "SCOPE", "URL");
+                println!("{:<8} URL", "SCOPE");
                 println!("{}", "-".repeat(80));
                 for (url, scope) in sources {
                     let scope_str = match scope {
@@ -465,73 +473,75 @@ fn main() {
                 }
             }
         },
-        Commands::Install { id_or_url, system, no_setup } => {
+        Commands::Install {
+            id_or_url,
+            system,
+            no_setup,
+        } => {
             let run_setup = !no_setup;
             let is_url = id_or_url.starts_with("http://") || id_or_url.starts_with("https://");
             if is_url {
-                    // URL: use connect flow
-                    let scope = if system {
-                        dmcp::discovery::Scope::System
-                    } else {
-                        dmcp::discovery::Scope::User
-                    };
-                    if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                        re_exec_with_pkexec();
+                // URL: use connect flow
+                let scope = if system {
+                    dmcp::discovery::Scope::System
+                } else {
+                    dmcp::discovery::Scope::User
+                };
+                if scope == dmcp::discovery::Scope::System && !is_elevated() {
+                    re_exec_with_pkexec();
+                }
+                match connect(
+                    &paths,
+                    &id_or_url,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    scope,
+                    run_setup,
+                ) {
+                    Ok(id) => println!("Installed {}", id),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
                     }
-                    match connect(
-                        &paths,
-                        &id_or_url,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                        scope,
-                        run_setup,
-                    ) {
-                        Ok(id) => println!("Installed {}", id),
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
+                }
             } else {
-                    // ID: use registry install flow
-                    let id = id_or_url;
-                    let server = match fetch_server_from_registry(&paths, &id) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
-                    let scope = if system {
-                        dmcp::discovery::Scope::System
-                    } else {
-                        scope_from_registry_server(&server)
-                    };
-                    if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                        re_exec_with_pkexec();
+                // ID: use registry install flow
+                let id = id_or_url;
+                let server = match fetch_server_from_registry(&paths, &id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
                     }
-                    match install(&paths, &id, scope, Some(server), run_setup) {
-                        Ok(()) => println!("Installed {}", id),
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
+                };
+                let scope = if system {
+                    dmcp::discovery::Scope::System
+                } else {
+                    scope_from_registry_server(&server)
+                };
+                if scope == dmcp::discovery::Scope::System && !is_elevated() {
+                    re_exec_with_pkexec();
+                }
+                match install(&paths, &id, scope, Some(server), run_setup) {
+                    Ok(()) => println!("Installed {}", id),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
                     }
-            }
-        }
-        Commands::Run { id, verbose } => {
-            match run(&paths, &id, verbose) {
-                Ok(()) => {}
-                Err(dmcp::run::RunError::ProcessExited(code)) => std::process::exit(code),
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
                 }
             }
         }
+        Commands::Run { id, verbose } => match run(&paths, &id, verbose) {
+            Ok(()) => {}
+            Err(dmcp::run::RunError::ProcessExited(code)) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        },
         Commands::Uninstall { id } => {
             if let Some((_, _, scope)) = discovery::get_uninstall_info(&paths, &id) {
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
@@ -564,7 +574,7 @@ fn main() {
             if scope == dmcp::discovery::Scope::System && !is_elevated() {
                 re_exec_with_pkexec();
             }
-            let config_ref: Vec<(String, String)> = config.iter().cloned().collect();
+            let config_ref: Vec<(String, String)> = config.to_vec();
             let run_setup = !no_setup;
             match connect(
                 &paths,
@@ -587,10 +597,7 @@ fn main() {
         Commands::Setup { id } => {
             match get_server(&paths, &id) {
                 Some((manifest, _)) => {
-                    let setup_script = manifest
-                        .setup_script
-                        .as_deref()
-                        .filter(|s| !s.is_empty());
+                    let setup_script = manifest.setup_script.as_deref().filter(|s| !s.is_empty());
                     match setup_script {
                         Some(script) => {
                             let install_dir = manifest
@@ -610,17 +617,30 @@ fn main() {
                                         std::process::exit(1);
                                     }
                                     // Update manifest with setup run timestamp
-                                    if let Some(manifest_path) = discovery::get_manifest_path(&paths, &id) {
-                                        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                                            if let Ok(mut m) = serde_json::from_str::<serde_json::Value>(&content) {
-                                                m["setupScriptPath"] = serde_json::json!(dir.join(script).to_string_lossy());
-                                                m["setupScriptRunAt"] = serde_json::Value::String(dmcp::install::rfc3339_now());
+                                    if let Some(manifest_path) =
+                                        discovery::get_manifest_path(&paths, &id)
+                                    {
+                                        if let Ok(content) = std::fs::read_to_string(&manifest_path)
+                                        {
+                                            if let Ok(mut m) =
+                                                serde_json::from_str::<serde_json::Value>(&content)
+                                            {
+                                                m["setupScriptPath"] = serde_json::json!(dir
+                                                    .join(script)
+                                                    .to_string_lossy());
+                                                m["setupScriptRunAt"] = serde_json::Value::String(
+                                                    dmcp::install::rfc3339_now(),
+                                                );
                                                 m["setupScriptVersion"] = manifest
                                                     .setup_script_version
                                                     .as_ref()
                                                     .map(|s| serde_json::Value::String(s.clone()))
                                                     .unwrap_or(serde_json::json!("1.0.0"));
-                                                let _ = std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap_or_default());
+                                                let _ = std::fs::write(
+                                                    &manifest_path,
+                                                    serde_json::to_string_pretty(&m)
+                                                        .unwrap_or_default(),
+                                                );
                                             }
                                         }
                                     }
@@ -679,7 +699,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Browse { url, user, system, keyword, json, vector, vectors, top_k, min_score } => {
+        Commands::Browse {
+            url,
+            user,
+            system,
+            keyword,
+            json,
+            vector,
+            vectors,
+            top_k,
+            min_score,
+        } => {
             // Vector search mode: search the local index, bypass registry
             if let Some(ref vec_str) = vector {
                 let query: Vec<f32> = match serde_json::from_str(vec_str) {
@@ -718,7 +748,10 @@ fn main() {
                 let queries: Vec<Vec<f32>> = match serde_json::from_str(vecs_str) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("Error: --vectors must be a JSON array of float arrays: {}", e);
+                        eprintln!(
+                            "Error: --vectors must be a JSON array of float arrays: {}",
+                            e
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -761,34 +794,30 @@ fn main() {
                     }
                 }
             } else {
-                let include_user = user || (!user && !system);
-                let include_system = system || (!user && !system);
+                let include_user = user || !system;
+                let include_system = system || !user;
                 list_registry_servers(&paths, include_user, include_system)
             };
 
             let (include_user, include_system) = if url.is_some() {
                 (true, true)
             } else {
-                (
-                    user || (!user && !system),
-                    system || (!user && !system),
-                )
+                (user || !system, system || !user)
             };
-            let installed_ids: std::collections::HashSet<String> = list_servers(&paths, include_user, include_system, false)
-                .into_iter()
-                .map(|s| s.id)
-                .collect();
+            let installed_ids: std::collections::HashSet<String> =
+                list_servers(&paths, include_user, include_system, false)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect();
 
             for s in &mut servers {
                 s.installed = installed_ids.contains(&s.id);
             }
             servers = filter_servers_by_keywords(servers, &keyword);
-            servers.sort_by(|a, b| {
-                match (a.installed, b.installed) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.id.cmp(&b.id),
-                }
+            servers.sort_by(|a, b| match (a.installed, b.installed) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.id.cmp(&b.id),
             });
 
             for e in &errors {
@@ -800,7 +829,9 @@ fn main() {
                 println!("{output}");
             } else {
                 if servers.is_empty() && errors.is_empty() && url.is_none() {
-                    println!("No registry sources configured. Add one with: dmcp sources add <url>");
+                    println!(
+                        "No registry sources configured. Add one with: dmcp sources add <url>"
+                    );
                     return;
                 }
                 if servers.is_empty() {
@@ -832,23 +863,21 @@ fn main() {
             }
         }
 
-        Commands::SyncIndex => {
-            match sync_index(&paths) {
-                Ok(result) => {
-                    for warning in &result.errors {
-                        eprintln!("{}", warning);
-                    }
-                    println!(
-                        "Synced: {} server vectors, {} tool vectors indexed.",
-                        result.servers_indexed, result.tools_indexed
-                    );
+        Commands::SyncIndex => match sync_index(&paths) {
+            Ok(result) => {
+                for warning in &result.errors {
+                    eprintln!("{}", warning);
                 }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+                println!(
+                    "Synced: {} server vectors, {} tool vectors indexed.",
+                    result.servers_indexed, result.tools_indexed
+                );
             }
-        }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        },
 
         Commands::EmbeddingSpec { json: _ } => {
             let index_path = paths.vector_index_path();
@@ -870,7 +899,12 @@ fn main() {
             }
         }
 
-        Commands::IndexServer { server_id, vectors: vectors_json, name, description } => {
+        Commands::IndexServer {
+            server_id,
+            vectors: vectors_json,
+            name,
+            description,
+        } => {
             let vectors_val: serde_json::Value = match serde_json::from_str(&vectors_json) {
                 Ok(v) => v,
                 Err(e) => {
@@ -975,9 +1009,7 @@ fn format_tools(tools: &[serde_json::Value]) -> String {
         .iter()
         .map(|t| {
             if let Some(obj) = t.as_object() {
-                obj.get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("?")
+                obj.get("name").and_then(|n| n.as_str()).unwrap_or("?")
             } else {
                 t.as_str().unwrap_or("?")
             }
@@ -991,10 +1023,7 @@ fn format_transports(transports: &[dmcp::models::Transport]) -> String {
         .iter()
         .map(|t| match t {
             dmcp::models::Transport::Stdio { command, args, .. } => {
-                let args_str = args
-                    .as_ref()
-                    .map(|a| a.join(" "))
-                    .unwrap_or_default();
+                let args_str = args.as_ref().map(|a| a.join(" ")).unwrap_or_default();
                 format!("stdio ({command} {args_str})")
             }
             dmcp::models::Transport::Sse { url, .. } => format!("sse ({url})"),
@@ -1008,8 +1037,16 @@ fn print_info_output(manifest: &dmcp::Manifest, scope_str: &str) {
     const INDENT: &str = "        ";
 
     println!("{}", manifest.id.as_deref().unwrap_or("?"));
-    println!("{}Name:        {}", INDENT, manifest.name.as_deref().unwrap_or("?"));
-    println!("{}Version:     {}", INDENT, manifest.version.as_deref().unwrap_or("?"));
+    println!(
+        "{}Name:        {}",
+        INDENT,
+        manifest.name.as_deref().unwrap_or("?")
+    );
+    println!(
+        "{}Version:     {}",
+        INDENT,
+        manifest.version.as_deref().unwrap_or("?")
+    );
     println!("{}Scope:       {}", INDENT, scope_str);
     if let Some(s) = manifest.summary.as_deref().filter(|x| !x.is_empty()) {
         println!("{}Summary:     {}", INDENT, s);
@@ -1033,7 +1070,11 @@ fn print_info_output(manifest: &dmcp::Manifest, scope_str: &str) {
         println!("{}Categories:  {}", INDENT, manifest.categories.join(", "));
     }
     if !manifest.capabilities.is_empty() {
-        println!("{}Capabilities: {}", INDENT, manifest.capabilities.join(", "));
+        println!(
+            "{}Capabilities: {}",
+            INDENT,
+            manifest.capabilities.join(", ")
+        );
     }
     if !manifest.tools.is_empty() {
         println!("{}Tools:       {}", INDENT, format_tools(&manifest.tools));
@@ -1046,7 +1087,10 @@ fn print_info_output(manifest: &dmcp::Manifest, scope_str: &str) {
     }
     if !manifest.config.is_empty() {
         for (k, v) in &manifest.config {
-            let val: String = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
+            let val: String = v
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| v.to_string());
             println!("{}Config.{}:   {}", INDENT, k, val);
         }
     }
@@ -1080,7 +1124,11 @@ fn print_vector_results(results: &[dmcp::SearchResult]) {
         println!("{}Server:  {}", INDENT, r.server_name);
         if let Some(ref desc) = r.server_description {
             if !desc.is_empty() {
-                println!("{}Summary: {}", INDENT, desc.lines().next().unwrap_or("").trim());
+                println!(
+                    "{}Summary: {}",
+                    INDENT,
+                    desc.lines().next().unwrap_or("").trim()
+                );
             }
         }
         if let Some(ref tool) = r.tool_name {
@@ -1088,7 +1136,11 @@ fn print_vector_results(results: &[dmcp::SearchResult]) {
         }
         if let Some(ref desc) = r.tool_description {
             if !desc.is_empty() {
-                println!("{}Tool desc: {}", INDENT, desc.lines().next().unwrap_or("").trim());
+                println!(
+                    "{}Tool desc: {}",
+                    INDENT,
+                    desc.lines().next().unwrap_or("").trim()
+                );
             }
         }
         if let Some(ref schema) = r.parameter_schema {
@@ -1103,14 +1155,22 @@ fn print_browse_table(servers: &[dmcp::RegistryServer]) {
     const INDENT: &str = "        ";
 
     for s in servers {
-        let status = if s.installed { "INSTALLED" } else { "NOT INSTALLED" };
+        let status = if s.installed {
+            "INSTALLED"
+        } else {
+            "NOT INSTALLED"
+        };
         println!("{}", s.id);
         println!("{}Name:      {}", INDENT, s.name);
         println!("{}Version:   {}", INDENT, s.version);
         println!("{}Transport: {}", INDENT, s.transport);
         println!("{}Status:    {}", INDENT, status);
         if !s.summary.is_empty() {
-            println!("{}Summary:   {}", INDENT, s.summary.lines().next().unwrap_or("").trim());
+            println!(
+                "{}Summary:   {}",
+                INDENT,
+                s.summary.lines().next().unwrap_or("").trim()
+            );
         }
         println!("{}Source:    {}", INDENT, s.source);
         println!();

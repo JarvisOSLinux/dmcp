@@ -2,8 +2,8 @@
 //!
 //! Exposes dmcp operations as MCP tools so LLMs (Cursor, Claude, etc.) can control dmcp.
 
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
@@ -86,14 +86,16 @@ impl DmcpServer {
         }
     }
 
-    #[tool(description = "List installed MCP servers. Use user=true for user scope, system=true for system scope.")]
+    #[tool(
+        description = "List installed MCP servers. Use user=true for user scope, system=true for system scope."
+    )]
     async fn list_servers(
         &self,
         params: Parameters<ListServersParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
-        let user = p.user || (!p.user && !p.system);
-        let system = p.system || (!p.user && !p.system);
+        let user = p.user || !p.system;
+        let system = p.system || !p.user;
         let servers = crate::list_servers(&self.paths, user, system, false);
         let json = serde_json::to_string_pretty(&servers).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -113,9 +115,18 @@ impl DmcpServer {
                     "system"
                 };
                 let mut out = serde_json::Map::new();
-                out.insert("id".into(), manifest.id.clone().unwrap_or(id.clone()).into());
-                out.insert("name".into(), manifest.name.clone().unwrap_or_default().into());
-                out.insert("version".into(), manifest.version.clone().unwrap_or_default().into());
+                out.insert(
+                    "id".into(),
+                    manifest.id.clone().unwrap_or(id.clone()).into(),
+                );
+                out.insert(
+                    "name".into(),
+                    manifest.name.clone().unwrap_or_default().into(),
+                );
+                out.insert(
+                    "version".into(),
+                    manifest.version.clone().unwrap_or_default().into(),
+                );
                 out.insert("scope".into(), scope_str.into());
                 if let Some(ref t) = manifest.transports {
                     let types: Vec<String> = t
@@ -127,14 +138,18 @@ impl DmcpServer {
                         })
                         .map(String::from)
                         .collect();
-                    out.insert("transports".into(), serde_json::to_string_pretty(&types).unwrap().into());
+                    out.insert(
+                        "transports".into(),
+                        serde_json::to_string_pretty(&types).unwrap().into(),
+                    );
                 }
                 let json = serde_json::to_string_pretty(&out).unwrap_or_default();
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            None => Ok(CallToolResult::error(vec![Content::text(
-                format!("Server not found: {}", id),
-            )])),
+            None => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Server not found: {}",
+                id
+            ))])),
         }
     }
 
@@ -151,7 +166,8 @@ impl DmcpServer {
                 } else {
                     crate::install::scope_from_registry_server(&server)
                 };
-                match crate::install::install(&self.paths, &p.id, scope, Some(server), !p.no_setup) {
+                match crate::install::install(&self.paths, &p.id, scope, Some(server), !p.no_setup)
+                {
                     Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                         "Installed {}",
                         p.id
@@ -230,7 +246,9 @@ impl DmcpServer {
         }
     }
 
-    #[tool(description = "Dispatch multiple MCP tool calls concurrently. Returns PIDs for tracking. Use get_task_status to poll results, kill_task to abort.")]
+    #[tool(
+        description = "Dispatch multiple MCP tool calls concurrently. Returns PIDs for tracking. Use get_task_status to poll results, kill_task to abort."
+    )]
     async fn dispatch_tasks(
         &self,
         params: Parameters<DispatchTasksParams>,
@@ -248,7 +266,9 @@ impl DmcpServer {
         }
     }
 
-    #[tool(description = "Get completed/failed tasks since last call. Set include_log=true for rolling 20-entry log window.")]
+    #[tool(
+        description = "Get completed/failed tasks since last call. Set include_log=true for rolling 20-entry log window."
+    )]
     async fn get_task_status(
         &self,
         params: Parameters<GetTaskStatusParams>,

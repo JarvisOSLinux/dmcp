@@ -50,13 +50,19 @@ impl std::error::Error for RunError {}
 /// - **stdio**: Spawns the process, injects config as env vars, inherits stdin/stdout/stderr.
 /// - **SSE/WebSocket**: Prints "<name> is running on <url>" and exits.
 pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
-    let (manifest, _scope) = get_server(paths, id).ok_or_else(|| RunError::ServerNotFound(id.to_string()))?;
+    let (manifest, _scope) =
+        get_server(paths, id).ok_or_else(|| RunError::ServerNotFound(id.to_string()))?;
 
-    let transports = manifest.transports.as_deref().ok_or(RunError::NoTransports)?;
+    let transports = manifest
+        .transports
+        .as_deref()
+        .ok_or(RunError::NoTransports)?;
     let primary = transports.first().ok_or(RunError::NoTransports)?;
 
     match primary {
-        Transport::Stdio { command, args, .. } => run_stdio(paths, &manifest, id, command, args.as_deref()),
+        Transport::Stdio { command, args, .. } => {
+            run_stdio(paths, &manifest, id, command, args.as_deref())
+        }
         Transport::Sse { url, .. } => run_remote(&manifest, "SSE", url),
         Transport::WebSocket { ws_url, .. } => run_remote(&manifest, "WebSocket", ws_url),
     }
@@ -75,9 +81,7 @@ fn run_stdio(
         .map(Path::new)
         .filter(|p| p.is_absolute())
         .map(|p| p.to_path_buf())
-        .or_else(|| {
-            get_manifest_path(paths, id).and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        })
+        .or_else(|| get_manifest_path(paths, id).and_then(|p| p.parent().map(|p| p.to_path_buf())))
         .ok_or(RunError::NoStdioTransport)?;
 
     let env = config_to_env(&manifest.config);
@@ -130,7 +134,10 @@ pub fn config_to_env(
 }
 
 fn run_remote(manifest: &Manifest, transport_name: &str, url: &str) -> Result<(), RunError> {
-    let name = manifest.name.as_deref().unwrap_or(manifest.id.as_deref().unwrap_or("MCP Server"));
+    let name = manifest
+        .name
+        .as_deref()
+        .unwrap_or(manifest.id.as_deref().unwrap_or("MCP Server"));
     println!("{} is running on {} ({})", name, url, transport_name);
     Ok(())
 }

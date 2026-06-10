@@ -78,10 +78,7 @@ pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
                             index.embedding_spec = Some(spec);
                         }
                     }
-                    let n_tools = new_entries
-                        .iter()
-                        .filter(|e| e.tool_name.is_some())
-                        .count();
+                    let n_tools = new_entries.iter().filter(|e| e.tool_name.is_some()).count();
                     let n_server = new_entries.len() - n_tools;
                     servers_indexed += n_server;
                     tools_indexed += n_tools;
@@ -108,10 +105,12 @@ pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
 ///
 /// Returns a list of `(server_id, entries, embedding_spec)` tuples.
 /// `embedding_spec` is derived from the embeddings block (model/version/dimensions).
+type RegistryEmbeddings = Vec<(String, Vec<VectorEntry>, Option<EmbeddingSpec>)>;
+
 fn fetch_embeddings_from_registry(
     client: &reqwest::blocking::Client,
     url: &str,
-) -> Result<Vec<(String, Vec<VectorEntry>, Option<EmbeddingSpec>)>, reqwest::Error> {
+) -> Result<RegistryEmbeddings, reqwest::Error> {
     let resp = client.get(url).send()?;
     if !resp.status().is_success() {
         return Err(resp.error_for_status().unwrap_err());
@@ -209,9 +208,7 @@ fn fetch_embeddings_from_registry(
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|t| {
-                            t.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|name| (name, t))
+                            t.get("name").and_then(|n| n.as_str()).map(|name| (name, t))
                         })
                         .collect()
                 })
@@ -255,5 +252,9 @@ fn parse_vector(val: Option<&serde_json::Value>) -> Option<Vec<f32>> {
         .iter()
         .filter_map(|v| v.as_f64().map(|f| f as f32))
         .collect();
-    if vec.is_empty() { None } else { Some(vec) }
+    if vec.is_empty() {
+        None
+    } else {
+        Some(vec)
+    }
 }

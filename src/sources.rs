@@ -7,7 +7,11 @@ use crate::paths::Paths;
 /// Load registry URLs from sources.list files.
 /// Shows all entries from both scopes (no deduplication) so the user can see
 /// where each URL is configured. For execution/fetch, user scope takes priority.
-pub fn list_sources(paths: &Paths, include_user: bool, include_system: bool) -> Vec<(String, SourceScope)> {
+pub fn list_sources(
+    paths: &Paths,
+    include_user: bool,
+    include_system: bool,
+) -> Vec<(String, SourceScope)> {
     let mut result = Vec::new();
 
     if include_user {
@@ -77,7 +81,7 @@ pub fn remove_source(paths: &Paths, url: &str, scope: SourceScope) -> Result<(),
         return Err(SourcesError::InvalidUrl);
     }
 
-    let content = std::fs::read_to_string(&path).map_err(|e| SourcesError::ReadFailed(e))?;
+    let content = std::fs::read_to_string(&path).map_err(SourcesError::ReadFailed)?;
 
     let original_urls: Vec<&str> = content
         .lines()

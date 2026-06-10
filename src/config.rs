@@ -5,11 +5,17 @@ use crate::paths::Paths;
 
 /// Set a config value for a server. Persists to manifest.json.
 /// Uses raw JSON to preserve all manifest fields.
-pub fn set_config_value(paths: &Paths, id: &str, key: &str, value: &str) -> Result<(), SetConfigError> {
+pub fn set_config_value(
+    paths: &Paths,
+    id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), SetConfigError> {
     let manifest_path = get_manifest_path(paths, id).ok_or(SetConfigError::ServerNotFound)?;
 
     let content = std::fs::read_to_string(&manifest_path).map_err(SetConfigError::ReadFailed)?;
-    let mut manifest: serde_json::Value = serde_json::from_str(&content).map_err(SetConfigError::ParseFailed)?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&content).map_err(SetConfigError::ParseFailed)?;
 
     // Ensure config object exists
     if manifest.get("config").is_none() {
@@ -21,10 +27,15 @@ pub fn set_config_value(paths: &Paths, id: &str, key: &str, value: &str) -> Resu
         .and_then(|c| c.as_object_mut())
         .ok_or(SetConfigError::InvalidManifest)?;
 
-    config.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    config.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
 
-    let output = serde_json::to_string_pretty(&manifest).map_err(SetConfigError::SerializeFailed)?;
-    std::fs::write(&manifest_path, output).map_err(|e| SetConfigError::WriteFailed(e, manifest_path.clone()))?;
+    let output =
+        serde_json::to_string_pretty(&manifest).map_err(SetConfigError::SerializeFailed)?;
+    std::fs::write(&manifest_path, output)
+        .map_err(|e| SetConfigError::WriteFailed(e, manifest_path.clone()))?;
 
     Ok(())
 }

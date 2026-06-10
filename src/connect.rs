@@ -9,6 +9,7 @@ use crate::paths::Paths;
 use crate::setup;
 
 /// Connect to a remote MCP server. Tries to fetch manifest from URL; falls back to raw endpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn connect(
     paths: &Paths,
     url: &str,
@@ -29,8 +30,16 @@ pub fn connect(
         // Manifest mode: use fetched manifest, apply overrides
         let id = id_override
             .map(String::from)
-            .or_else(|| manifest.get("id").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or_else(|| next_connected_server_id(paths, scope).unwrap_or_else(|_| "com.user.connected.server1".to_string()));
+            .or_else(|| {
+                manifest
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| {
+                next_connected_server_id(paths, scope)
+                    .unwrap_or_else(|_| "com.user.connected.server1".to_string())
+            });
 
         let install_dir = match scope {
             crate::discovery::Scope::User => paths.user_install_dir().join(&id),
@@ -39,7 +48,8 @@ pub fn connect(
 
         std::fs::create_dir_all(&install_dir).map_err(ConnectError::CreateDir)?;
 
-        manifest["installDir"] = serde_json::Value::String(install_dir.to_string_lossy().to_string());
+        manifest["installDir"] =
+            serde_json::Value::String(install_dir.to_string_lossy().to_string());
         manifest["id"] = serde_json::Value::String(id.clone());
 
         if let Some(n) = name {
@@ -51,7 +61,8 @@ pub fn connect(
         if let Some(s) = summary {
             manifest["summary"] = serde_json::Value::String(s.to_string());
         } else if manifest.get("summary").is_none() {
-            manifest["summary"] = serde_json::Value::String("Connected via dmcp connect".to_string());
+            manifest["summary"] =
+                serde_json::Value::String("Connected via dmcp connect".to_string());
         }
 
         if let Some(v) = version {
@@ -76,7 +87,11 @@ pub fn connect(
 
         // Run setup script if present
         if run_setup {
-            if let Some(setup_script) = manifest.get("setupScript").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(setup_script) = manifest
+                .get("setupScript")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 let config_map = manifest
                     .get("config")
                     .and_then(|c| c.as_object())
@@ -91,7 +106,11 @@ pub fn connect(
         let keywords: Vec<String> = manifest
             .get("keywords")
             .and_then(|k| k.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         crate::install::update_index_add(paths, &id, &manifest_path, scope, &keywords)
             .map_err(|e| ConnectError::IndexError(e.to_string()))?;
@@ -100,7 +119,16 @@ pub fn connect(
     }
 
     // Raw fallback: treat URL as endpoint
-    connect_raw(paths, url, id_override, name, summary, version, config, scope)
+    connect_raw(
+        paths,
+        url,
+        id_override,
+        name,
+        summary,
+        version,
+        config,
+        scope,
+    )
 }
 
 /// Try to fetch URL as JSON manifest. Returns Some if valid (has id and transports).
@@ -128,6 +156,7 @@ fn try_fetch_manifest(url: &str) -> Option<serde_json::Value> {
 }
 
 /// Raw endpoint mode: infer transport from URL, auto-generate metadata.
+#[allow(clippy::too_many_arguments)]
 fn connect_raw(
     paths: &Paths,
     url: &str,
@@ -144,9 +173,10 @@ fn connect_raw(
         "sse"
     };
 
-    let id = id_override
-        .map(String::from)
-        .unwrap_or_else(|| next_connected_server_id(paths, scope).unwrap_or_else(|_| "com.user.connected.server1".into()));
+    let id = id_override.map(String::from).unwrap_or_else(|| {
+        next_connected_server_id(paths, scope)
+            .unwrap_or_else(|_| "com.user.connected.server1".into())
+    });
 
     let install_dir = match scope {
         crate::discovery::Scope::User => paths.user_install_dir().join(&id),
@@ -192,21 +222,32 @@ fn connect_raw(
     Ok(id)
 }
 
-fn next_connected_server_id(paths: &Paths, scope: crate::discovery::Scope) -> Result<String, ConnectError> {
+fn next_connected_server_id(
+    paths: &Paths,
+    scope: crate::discovery::Scope,
+) -> Result<String, ConnectError> {
     let index_path = match scope {
         crate::discovery::Scope::User => paths.user_install_dir().join("index.json"),
         crate::discovery::Scope::System => paths.system_install_dir().join("index.json"),
     };
 
-    let content = std::fs::read_to_string(&index_path).unwrap_or_else(|_| r#"{"servers":{},"version":"1.0"}"#.to_string());
-    let index: serde_json::Value = serde_json::from_str(&content).map_err(ConnectError::ParseIndex)?;
+    let content = std::fs::read_to_string(&index_path)
+        .unwrap_or_else(|_| r#"{"servers":{},"version":"1.0"}"#.to_string());
+    let index: serde_json::Value =
+        serde_json::from_str(&content).map_err(ConnectError::ParseIndex)?;
 
     let empty = serde_json::Map::new();
-    let servers = index.get("servers").and_then(|s| s.as_object()).unwrap_or(&empty);
+    let servers = index
+        .get("servers")
+        .and_then(|s| s.as_object())
+        .unwrap_or(&empty);
 
     let mut max_n = 0u32;
     for (id, _) in servers {
-        if let Some(n) = id.strip_prefix("com.user.connected.server").and_then(|s| s.parse::<u32>().ok()) {
+        if let Some(n) = id
+            .strip_prefix("com.user.connected.server")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
             if n > max_n {
                 max_n = n;
             }
