@@ -353,8 +353,7 @@ fn install_stdio(server: &serde_json::Value, install_dir: &Path) -> Result<(), I
         .status()
         .map_err(InstallError::GitFailed)?;
     if !status.success() {
-        return Err(InstallError::GitFailed(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(InstallError::GitFailed(std::io::Error::other(
             "git clone failed",
         )));
     }
@@ -431,8 +430,7 @@ pub fn update_index_add(
             .map_err(InstallError::WriteIndex)?;
         let _ = std::fs::remove_file(&temp);
         if !status.success() {
-            return Err(InstallError::WriteIndex(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(InstallError::WriteIndex(std::io::Error::other(
                 "pkexec cp failed",
             )));
         }
@@ -500,8 +498,7 @@ pub fn uninstall(paths: &Paths, id: &str) -> Result<(), UninstallError> {
             .status()
             .map_err(UninstallError::RmFailed)?;
         if !status.success() {
-            return Err(UninstallError::RmFailed(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(UninstallError::RmFailed(std::io::Error::other(
                 "pkexec rm -rf failed",
             )));
         }
@@ -555,8 +552,7 @@ fn update_index_remove(
             .map_err(UninstallError::WriteIndex)?;
         let _ = std::fs::remove_file(&temp);
         if !status.success() {
-            return Err(UninstallError::WriteIndex(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(UninstallError::WriteIndex(std::io::Error::other(
                 "pkexec cp failed",
             )));
         }
@@ -609,8 +605,8 @@ pub fn rfc3339_now() -> String {
 }
 
 fn epoch_to_datetime(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86400) as i64;
-    let time = (secs % 86400 + 86400) % 86400;
+    let days = secs / 86400;
+    let time = secs.rem_euclid(86400);
     let hour = (time / 3600) as u32;
     let min = ((time % 3600) / 60) as u32;
     let sec = (time % 60) as u32;
@@ -621,7 +617,7 @@ fn epoch_to_datetime(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let days = days + 719468;
     let era = days / 146097;
-    let day_of_era = (days - era * 146097) as i64;
+    let day_of_era = days - era * 146097;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
     let year = year_of_era + era * 400;

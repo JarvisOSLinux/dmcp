@@ -105,10 +105,12 @@ pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
 ///
 /// Returns a list of `(server_id, entries, embedding_spec)` tuples.
 /// `embedding_spec` is derived from the embeddings block (model/version/dimensions).
+type RegistryEmbeddings = Vec<(String, Vec<VectorEntry>, Option<EmbeddingSpec>)>;
+
 fn fetch_embeddings_from_registry(
     client: &reqwest::blocking::Client,
     url: &str,
-) -> Result<Vec<(String, Vec<VectorEntry>, Option<EmbeddingSpec>)>, reqwest::Error> {
+) -> Result<RegistryEmbeddings, reqwest::Error> {
     let resp = client.get(url).send()?;
     if !resp.status().is_success() {
         return Err(resp.error_for_status().unwrap_err());

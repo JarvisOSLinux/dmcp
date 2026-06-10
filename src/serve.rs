@@ -94,8 +94,8 @@ impl DmcpServer {
         params: Parameters<ListServersParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
-        let user = p.user || (!p.user && !p.system);
-        let system = p.system || (!p.user && !p.system);
+        let user = p.user || !p.system;
+        let system = p.system || !p.user;
         let servers = crate::list_servers(&self.paths, user, system, false);
         let json = serde_json::to_string_pretty(&servers).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json)]))

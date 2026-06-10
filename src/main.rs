@@ -322,8 +322,8 @@ fn main() {
             println!("System index exists: {}", system_index.exists());
         }
         Commands::List { user, system, json } => {
-            let include_user = user || (!user && !system);
-            let include_system = system || (!user && !system);
+            let include_user = user || !system;
+            let include_system = system || !user;
             let servers = list_servers(&paths, include_user, include_system, debug);
 
             if json {
@@ -418,15 +418,15 @@ fn main() {
         },
         Commands::Sources { action } => match action {
             SourcesAction::List { user, system } => {
-                let include_user = user || (!user && !system);
-                let include_system = system || (!user && !system);
+                let include_user = user || !system;
+                let include_system = system || !user;
                 let sources = list_sources(&paths, include_user, include_system);
                 if sources.is_empty() {
                     println!("No registry sources configured.");
                     println!("Add URLs to ~/.config/mcp/sources.list or /etc/mcp/sources.list");
                     return;
                 }
-                println!("{:<8} {}", "SCOPE", "URL");
+                println!("{:<8} URL", "SCOPE");
                 println!("{}", "-".repeat(80));
                 for (url, scope) in sources {
                     let scope_str = match scope {
@@ -574,7 +574,7 @@ fn main() {
             if scope == dmcp::discovery::Scope::System && !is_elevated() {
                 re_exec_with_pkexec();
             }
-            let config_ref: Vec<(String, String)> = config.iter().cloned().collect();
+            let config_ref: Vec<(String, String)> = config.to_vec();
             let run_setup = !no_setup;
             match connect(
                 &paths,
@@ -794,15 +794,15 @@ fn main() {
                     }
                 }
             } else {
-                let include_user = user || (!user && !system);
-                let include_system = system || (!user && !system);
+                let include_user = user || !system;
+                let include_system = system || !user;
                 list_registry_servers(&paths, include_user, include_system)
             };
 
             let (include_user, include_system) = if url.is_some() {
                 (true, true)
             } else {
-                (user || (!user && !system), system || (!user && !system))
+                (user || !system, system || !user)
             };
             let installed_ids: std::collections::HashSet<String> =
                 list_servers(&paths, include_user, include_system, false)

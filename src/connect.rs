@@ -9,6 +9,7 @@ use crate::paths::Paths;
 use crate::setup;
 
 /// Connect to a remote MCP server. Tries to fetch manifest from URL; falls back to raw endpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn connect(
     paths: &Paths,
     url: &str,
@@ -155,6 +156,7 @@ fn try_fetch_manifest(url: &str) -> Option<serde_json::Value> {
 }
 
 /// Raw endpoint mode: infer transport from URL, auto-generate metadata.
+#[allow(clippy::too_many_arguments)]
 fn connect_raw(
     paths: &Paths,
     url: &str,

@@ -81,7 +81,7 @@ pub fn remove_source(paths: &Paths, url: &str, scope: SourceScope) -> Result<(),
         return Err(SourcesError::InvalidUrl);
     }
 
-    let content = std::fs::read_to_string(&path).map_err(|e| SourcesError::ReadFailed(e))?;
+    let content = std::fs::read_to_string(&path).map_err(SourcesError::ReadFailed)?;
 
     let original_urls: Vec<&str> = content
         .lines()

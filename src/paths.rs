@@ -119,12 +119,10 @@ fn load_env_example_defaults() -> HashMap<String, String> {
         dirs::config_dir().map(|p| p.join("mcp/.env.example")),
         Some(PathBuf::from("/etc/dmcp/env.example")),
     ];
-    for opt in &candidates {
-        if let Some(ref path) = opt {
-            if path.exists() {
-                if let Ok(map) = parse_env_file(path) {
-                    return map;
-                }
+    for path in candidates.iter().flatten() {
+        if path.exists() {
+            if let Ok(map) = parse_env_file(path) {
+                return map;
             }
         }
     }

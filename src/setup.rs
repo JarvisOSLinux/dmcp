@@ -84,10 +84,7 @@ fn build_env(
         OsString::from(install_dir.to_string_lossy().as_ref()),
     );
     for (key, value) in config {
-        let env_key = format!(
-            "MCP_CONFIG_{}",
-            key.to_uppercase().replace('-', "_").replace('.', "_")
-        );
+        let env_key = format!("MCP_CONFIG_{}", key.to_uppercase().replace(['-', '.'], "_"));
         let env_val = match value {
             serde_json::Value::String(s) => s.clone(),
             _ => value.to_string(),
