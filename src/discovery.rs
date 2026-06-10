@@ -125,7 +125,11 @@ fn load_from_scope(base: &Path, scope: Scope, debug: bool) -> Option<Vec<ServerI
     }
 
     if debug {
-        eprintln!("[debug] Loaded {} servers from {:?} scope", servers.len(), scope);
+        eprintln!(
+            "[debug] Loaded {} servers from {:?} scope",
+            servers.len(),
+            scope
+        );
     }
 
     Some(servers)
@@ -159,19 +163,30 @@ pub fn get_manifest_path(paths: &Paths, id: &str) -> Option<std::path::PathBuf> 
 }
 
 /// Get manifest path, install dir, and scope for uninstall.
-pub fn get_uninstall_info(paths: &Paths, id: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, Scope)> {
-    if let Some((_, scope, manifest_path)) = load_server_from_scope(paths.user_install_dir(), id, Scope::User) {
+pub fn get_uninstall_info(
+    paths: &Paths,
+    id: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, Scope)> {
+    if let Some((_, scope, manifest_path)) =
+        load_server_from_scope(paths.user_install_dir(), id, Scope::User)
+    {
         let install_dir = manifest_path.parent()?.to_path_buf();
         return Some((manifest_path, install_dir, scope));
     }
-    if let Some((_, scope, manifest_path)) = load_server_from_scope(paths.system_install_dir(), id, Scope::System) {
+    if let Some((_, scope, manifest_path)) =
+        load_server_from_scope(paths.system_install_dir(), id, Scope::System)
+    {
         let install_dir = manifest_path.parent()?.to_path_buf();
         return Some((manifest_path, install_dir, scope));
     }
     None
 }
 
-fn load_server_from_scope(base: &Path, id: &str, scope: Scope) -> Option<(Manifest, Scope, std::path::PathBuf)> {
+fn load_server_from_scope(
+    base: &Path,
+    id: &str,
+    scope: Scope,
+) -> Option<(Manifest, Scope, std::path::PathBuf)> {
     let index_path = base.join("index.json");
     let s = std::fs::read_to_string(&index_path).ok()?;
     let index: Index = serde_json::from_str(&s).ok()?;

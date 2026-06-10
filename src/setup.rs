@@ -43,12 +43,15 @@ pub fn run_setup(
     install_dir: &Path,
     config: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<(), SetupError> {
-    let script_path = if setup_script.starts_with("http://") || setup_script.starts_with("https://") {
+    let script_path = if setup_script.starts_with("http://") || setup_script.starts_with("https://")
+    {
         fetch_script(setup_script)?
     } else {
         let path = install_dir.join(setup_script);
         if !path.exists() {
-            return Err(SetupError::ScriptNotFound(path.to_string_lossy().to_string()));
+            return Err(SetupError::ScriptNotFound(
+                path.to_string_lossy().to_string(),
+            ));
         }
         path
     };
@@ -81,7 +84,10 @@ fn build_env(
         OsString::from(install_dir.to_string_lossy().as_ref()),
     );
     for (key, value) in config {
-        let env_key = format!("MCP_CONFIG_{}", key.to_uppercase().replace('-', "_").replace('.', "_"));
+        let env_key = format!(
+            "MCP_CONFIG_{}",
+            key.to_uppercase().replace('-', "_").replace('.', "_")
+        );
         let env_val = match value {
             serde_json::Value::String(s) => s.clone(),
             _ => value.to_string(),
@@ -106,7 +112,9 @@ fn fetch_script(url: &str) -> Result<std::path::PathBuf, SetupError> {
         return Err(SetupError::FetchFailed(format!("HTTP {}", resp.status())));
     }
 
-    let body = resp.bytes().map_err(|e| SetupError::FetchFailed(e.to_string()))?;
+    let body = resp
+        .bytes()
+        .map_err(|e| SetupError::FetchFailed(e.to_string()))?;
 
     let temp = std::env::temp_dir().join(format!("dmcp-setup-{}.sh", std::process::id()));
     std::fs::write(&temp, &body).map_err(|e| SetupError::FetchFailed(e.to_string()))?;

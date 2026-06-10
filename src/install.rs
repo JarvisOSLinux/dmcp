@@ -42,7 +42,10 @@ pub fn install(
         .ok_or(InstallError::InvalidRegistry)?;
 
     let first_transport = transports.first().ok_or(InstallError::InvalidRegistry)?;
-    let transport_type = first_transport.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let transport_type = first_transport
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
 
     if transport_type == "stdio" {
         install_stdio(&server, &install_dir)?;
@@ -94,16 +97,14 @@ pub fn install(
                     manifest["setupScriptStatus"] = serde_json::json!("ok");
                     manifest["setupScriptPath"] =
                         serde_json::json!(install_dir.join(&setup_script).to_string_lossy());
-                    manifest["setupScriptRunAt"] =
-                        serde_json::Value::String(rfc3339_now());
+                    manifest["setupScriptRunAt"] = serde_json::Value::String(rfc3339_now());
                     manifest["setupScriptVersion"] = manifest
                         .get("setupScriptVersion")
                         .cloned()
                         .unwrap_or(serde_json::json!("1.0.0"));
                 }
                 Err(e) => {
-                    manifest["setupScriptStatus"] =
-                        serde_json::json!(format!("failed: {}", e));
+                    manifest["setupScriptStatus"] = serde_json::json!(format!("failed: {}", e));
                 }
             }
             // Install succeeds even if setup fails; user can retry via dmcp setup
@@ -132,7 +133,10 @@ pub fn install(
 
 /// Resolve install scope: from --system/--user override, or from registry's "scope" field (default "user").
 pub fn scope_from_registry_server(server: &serde_json::Value) -> crate::discovery::Scope {
-    let s = server.get("scope").and_then(|v| v.as_str()).unwrap_or("user");
+    let s = server
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("user");
     if s == "system" {
         crate::discovery::Scope::System
     } else {
@@ -207,12 +211,9 @@ pub fn fetch_server_from_registry(
                 .filter(|h| !h.is_empty())
                 .is_some();
             if has_setup_hash {
-                if let Some(manifest_url) =
-                    server.get("manifest").and_then(|m| m.as_str())
-                {
+                if let Some(manifest_url) = server.get("manifest").and_then(|m| m.as_str()) {
                     if let Some(base) = manifest_url.strip_suffix("manifest.json") {
-                        server["setupScriptUrl"] =
-                            serde_json::json!(format!("{}setup.sh", base));
+                        server["setupScriptUrl"] = serde_json::json!(format!("{}setup.sh", base));
                     }
                 }
             }
@@ -341,7 +342,14 @@ fn install_stdio(server: &serde_json::Value, install_dir: &Path) -> Result<(), I
     std::fs::create_dir_all(&temp).map_err(InstallError::CreateDir)?;
 
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", "--filter=blob:none", url, temp.to_str().unwrap()])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            url,
+            temp.to_str().unwrap(),
+        ])
         .status()
         .map_err(InstallError::GitFailed)?;
     if !status.success() {
@@ -413,8 +421,7 @@ pub fn update_index_add(
     if scope == crate::discovery::Scope::System && is_elevated() {
         std::fs::write(&index_path, output).map_err(InstallError::WriteIndex)?;
     } else if scope == crate::discovery::Scope::System {
-        let temp =
-            std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
         std::fs::write(&temp, &output).map_err(InstallError::WriteIndex)?;
         let status = Command::new("pkexec")
             .arg("cp")
@@ -479,8 +486,8 @@ impl std::error::Error for InstallError {}
 
 /// Uninstall a server by id. Removes install dir and updates index.
 pub fn uninstall(paths: &Paths, id: &str) -> Result<(), UninstallError> {
-    let (manifest_path, install_dir, scope) = discovery::get_uninstall_info(paths, id)
-        .ok_or(UninstallError::ServerNotFound)?;
+    let (manifest_path, install_dir, scope) =
+        discovery::get_uninstall_info(paths, id).ok_or(UninstallError::ServerNotFound)?;
 
     // Remove install directory
     if scope == crate::discovery::Scope::System && is_elevated() {
@@ -526,22 +533,19 @@ fn update_index_remove(
     id: &str,
     scope: crate::discovery::Scope,
 ) -> Result<(), UninstallError> {
-    let content =
-        std::fs::read_to_string(index_path).map_err(UninstallError::ReadIndex)?;
+    let content = std::fs::read_to_string(index_path).map_err(UninstallError::ReadIndex)?;
     let mut index: serde_json::Value =
         serde_json::from_str(&content).map_err(UninstallError::ParseIndex)?;
     if let Some(servers) = index.get_mut("servers").and_then(|s| s.as_object_mut()) {
         servers.remove(id);
     }
     index["updated"] = serde_json::Value::String(rfc3339_now());
-    let output =
-        serde_json::to_string_pretty(&index).map_err(UninstallError::SerializeIndex)?;
+    let output = serde_json::to_string_pretty(&index).map_err(UninstallError::SerializeIndex)?;
 
     if scope == crate::discovery::Scope::System && is_elevated() {
         std::fs::write(index_path, output).map_err(UninstallError::WriteIndex)?;
     } else if scope == crate::discovery::Scope::System {
-        let temp =
-            std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
         std::fs::write(&temp, &output).map_err(UninstallError::WriteIndex)?;
         let status = Command::new("pkexec")
             .arg("cp")
@@ -621,8 +625,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
     let year = year_of_era + era * 400;
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let (month, day) = doy_to_md(day_of_year as u32);
     (year, month, day)
 }

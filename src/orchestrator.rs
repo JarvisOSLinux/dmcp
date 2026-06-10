@@ -116,7 +116,8 @@ impl Orchestrator {
         tokio::spawn(async move {
             while let Some(sig) = rx.recv().await {
                 let pid = sig.pid;
-                let is_complete = sig.signal_type == SignalType::Exit || sig.signal_type == SignalType::Kill;
+                let is_complete =
+                    sig.signal_type == SignalType::Exit || sig.signal_type == SignalType::Kill;
                 let mut s = state_clone.write().await;
                 s.log.push(sig.clone());
                 if s.log.len() > LOG_WINDOW {

@@ -31,7 +31,9 @@ impl std::fmt::Display for CallError {
             CallError::ServerNotFound(id) => write!(f, "Server not found: {}", id),
             CallError::NoTransports => write!(f, "No transports defined"),
             CallError::NoStdioTransport => write!(f, "Server has no stdio transport"),
-            CallError::RemoteNotSupported(t) => write!(f, "Remote transport not yet supported: {}", t),
+            CallError::RemoteNotSupported(t) => {
+                write!(f, "Remote transport not yet supported: {}", t)
+            }
             CallError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
             CallError::ToolCallFailed(e) => write!(f, "Tool call failed: {}", e),
         }
@@ -47,18 +49,29 @@ pub async fn call_tool(
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let (manifest, _) = get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
+    let (manifest, _) =
+        get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let transports = manifest.transports.as_deref().ok_or(CallError::NoTransports)?;
+    let transports = manifest
+        .transports
+        .as_deref()
+        .ok_or(CallError::NoTransports)?;
     let primary = transports.first().ok_or(CallError::NoTransports)?;
 
     match primary {
         Transport::Stdio { command, args, .. } => {
-            call_tool_stdio(paths, &manifest, id, command, args.as_deref(), tool_name, arguments).await
+            call_tool_stdio(
+                paths,
+                &manifest,
+                id,
+                command,
+                args.as_deref(),
+                tool_name,
+                arguments,
+            )
+            .await
         }
-        Transport::Sse { url, .. } => {
-            call_tool_remote(url, "sse", tool_name, arguments).await
-        }
+        Transport::Sse { url, .. } => call_tool_remote(url, "sse", tool_name, arguments).await,
         Transport::WebSocket { ws_url, .. } => {
             call_tool_remote(ws_url, "websocket", tool_name, arguments).await
         }
@@ -89,17 +102,12 @@ async fn call_tool_stdio(
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
         .unwrap_or_default();
-    cmd.args(&args)
-        .current_dir(&install_dir)
-        .envs(env);
+    cmd.args(&args).current_dir(&install_dir).envs(env);
 
     let transport = TokioChildProcess::new(cmd.configure(|_| {}))
         .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
-    let client = ()
-        .serve(transport)
-        .await
-        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let args_obj = arguments
         .and_then(|v| v.as_object().cloned())
@@ -135,10 +143,7 @@ async fn call_tool_remote(
 
     let transport = StreamableHttpClientTransport::from_uri(Arc::from(url));
 
-    let client = ()
-        .serve(transport)
-        .await
-        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let args_obj = arguments
         .and_then(|v| v.as_object().cloned())
@@ -165,9 +170,13 @@ async fn call_tool_remote(
 
 /// List tools available on a server.
 pub async fn list_tools(paths: &Paths, id: &str) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    let (manifest, _) = get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
+    let (manifest, _) =
+        get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let transports = manifest.transports.as_deref().ok_or(CallError::NoTransports)?;
+    let transports = manifest
+        .transports
+        .as_deref()
+        .ok_or(CallError::NoTransports)?;
     let primary = transports.first().ok_or(CallError::NoTransports)?;
 
     match primary {
@@ -206,10 +215,7 @@ async fn list_tools_stdio(
     let transport = TokioChildProcess::new(cmd.configure(|_| {}))
         .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
-    let client = ()
-        .serve(transport)
-        .await
-        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let tools = client
         .list_tools(Default::default())
@@ -227,10 +233,7 @@ async fn list_tools_remote(url: &str) -> Result<Vec<rmcp::model::Tool>, CallErro
 
     let transport = StreamableHttpClientTransport::from_uri(Arc::from(url));
 
-    let client = ()
-        .serve(transport)
-        .await
-        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let tools = client
         .list_tools(Default::default())

@@ -104,9 +104,7 @@ pub fn filter_servers_by_keywords(
             ]
             .join(" ")
             .to_lowercase();
-            keywords_lower
-                .iter()
-                .any(|kw| searchable.contains(kw))
+            keywords_lower.iter().any(|kw| searchable.contains(kw))
         })
         .collect()
 }
@@ -197,10 +195,7 @@ fn fetch_registry(
 #[derive(Debug)]
 pub enum BrowseError {
     HttpClient(reqwest::Error),
-    FetchFailed {
-        url: String,
-        cause: reqwest::Error,
-    },
+    FetchFailed { url: String, cause: reqwest::Error },
 }
 
 impl std::fmt::Display for BrowseError {
