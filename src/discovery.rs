@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::doc_comments;
 use crate::models::{Index, Manifest};
 use crate::paths::Paths;
 
@@ -125,7 +126,11 @@ fn load_from_scope(base: &Path, scope: Scope, debug: bool) -> Option<Vec<ServerI
     }
 
     if debug {
-        eprintln!("[debug] Loaded {} servers from {:?} scope", servers.len(), scope);
+        eprintln!(
+            "[debug] Loaded {} servers from {:?} scope",
+            servers.len(),
+            scope
+        );
     }
 
     Some(servers)
@@ -159,25 +164,67 @@ pub fn get_manifest_path(paths: &Paths, id: &str) -> Option<std::path::PathBuf> 
 }
 
 /// Get manifest path, install dir, and scope for uninstall.
-pub fn get_uninstall_info(paths: &Paths, id: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, Scope)> {
-    if let Some((_, scope, manifest_path)) = load_server_from_scope(paths.user_install_dir(), id, Scope::User) {
+pub fn get_uninstall_info(
+    paths: &Paths,
+    id: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, Scope)> {
+    if let Some((_, scope, manifest_path)) =
+        load_server_from_scope(paths.user_install_dir(), id, Scope::User)
+    {
         let install_dir = manifest_path.parent()?.to_path_buf();
         return Some((manifest_path, install_dir, scope));
     }
-    if let Some((_, scope, manifest_path)) = load_server_from_scope(paths.system_install_dir(), id, Scope::System) {
+    if let Some((_, scope, manifest_path)) =
+        load_server_from_scope(paths.system_install_dir(), id, Scope::System)
+    {
         let install_dir = manifest_path.parent()?.to_path_buf();
         return Some((manifest_path, install_dir, scope));
     }
     None
 }
 
-fn load_server_from_scope(base: &Path, id: &str, scope: Scope) -> Option<(Manifest, Scope, std::path::PathBuf)> {
+fn load_server_from_scope(
+    base: &Path,
+    id: &str,
+    scope: Scope,
+) -> Option<(Manifest, Scope, std::path::PathBuf)> {
     let index_path = base.join("index.json");
     let s = std::fs::read_to_string(&index_path).ok()?;
     let index: Index = serde_json::from_str(&s).ok()?;
     let entry = index.servers.get(id)?;
     let manifest_path = std::path::PathBuf::from(&entry.location);
     let s = std::fs::read_to_string(&manifest_path).ok()?;
-    let manifest: Manifest = serde_json::from_str(&s).ok()?;
+    let mut manifest: Manifest = serde_json::from_str(&s).ok()?;
+    enrich_manifest_from_doc_comments(&mut manifest, &manifest_path);
     Some((manifest, scope, manifest_path))
+}
+
+/// If the manifest has no `description` and no `summary`, scan the server's
+/// install directory for Python `@mcp.tool` docstrings and use the first one
+/// found as a description fallback.
+fn enrich_manifest_from_doc_comments(manifest: &mut Manifest, manifest_path: &Path) {
+    let has_description = manifest
+        .description
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_summary = manifest
+        .summary
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_description || has_summary {
+        return;
+    }
+
+    // Derive install dir from the manifest path (parent directory).
+    let install_dir = match manifest_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let docs = doc_comments::extract_tool_docs(install_dir);
+    if let Some(desc) = doc_comments::first_description(&docs) {
+        manifest.description = Some(desc);
+    }
 }

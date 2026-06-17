@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::doc_comments;
 use crate::install::rfc3339_now;
 use crate::paths::Paths;
 use crate::sources::list_sources;
@@ -36,6 +37,8 @@ impl std::error::Error for SyncError {}
 ///
 /// - Replaces all `"registry"` entries with fresh data.
 /// - Keeps `"local"` entries (from `dmcp index-server`) unchanged.
+/// - If a local entry is missing a description, falls back to `@mcp.tool`
+///   docstrings found in the server's install directory.
 /// - If a registry is unreachable, reports a warning and continues.
 /// - Updates `embedding_spec` from the first server that declares one.
 pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
@@ -46,6 +49,9 @@ pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
 
     // Drop all registry entries; they will be re-fetched
     index.entries.retain(|e| e.source != "registry");
+
+    // Enrich local entries that are missing descriptions from @mcp.tool docstrings
+    enrich_local_entries_from_doc_comments(paths, &mut index);
 
     let client = match reqwest::blocking::Client::builder()
         .user_agent("dmcp/1.0")
@@ -78,10 +84,7 @@ pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
                             index.embedding_spec = Some(spec);
                         }
                     }
-                    let n_tools = new_entries
-                        .iter()
-                        .filter(|e| e.tool_name.is_some())
-                        .count();
+                    let n_tools = new_entries.iter().filter(|e| e.tool_name.is_some()).count();
                     let n_server = new_entries.len() - n_tools;
                     servers_indexed += n_server;
                     tools_indexed += n_tools;
@@ -108,10 +111,12 @@ pub fn sync_index(paths: &Paths) -> Result<SyncResult, SyncError> {
 ///
 /// Returns a list of `(server_id, entries, embedding_spec)` tuples.
 /// `embedding_spec` is derived from the embeddings block (model/version/dimensions).
+type RegistryEmbeddings = Vec<(String, Vec<VectorEntry>, Option<EmbeddingSpec>)>;
+
 fn fetch_embeddings_from_registry(
     client: &reqwest::blocking::Client,
     url: &str,
-) -> Result<Vec<(String, Vec<VectorEntry>, Option<EmbeddingSpec>)>, reqwest::Error> {
+) -> Result<RegistryEmbeddings, reqwest::Error> {
     let resp = client.get(url).send()?;
     if !resp.status().is_success() {
         return Err(resp.error_for_status().unwrap_err());
@@ -209,9 +214,7 @@ fn fetch_embeddings_from_registry(
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|t| {
-                            t.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|name| (name, t))
+                            t.get("name").and_then(|n| n.as_str()).map(|name| (name, t))
                         })
                         .collect()
                 })
@@ -255,5 +258,103 @@ fn parse_vector(val: Option<&serde_json::Value>) -> Option<Vec<f32>> {
         .iter()
         .filter_map(|v| v.as_f64().map(|f| f as f32))
         .collect();
-    if vec.is_empty() { None } else { Some(vec) }
+    if vec.is_empty() {
+        None
+    } else {
+        Some(vec)
+    }
+}
+
+/// Back-fill `server_description` (and `tool_description`) on `"local"` vector
+/// entries that were stored without descriptions.
+///
+/// For each unique server ID in local entries that lacks a description, this
+/// function:
+/// 1. Looks up the server's install directory via the installed manifest.
+/// 2. Scans that directory for Python files with `@mcp.tool` decorators.
+/// 3. Uses the first docstring found as the `server_description` for all
+///    entries belonging to that server.
+/// 4. For tool-level entries, uses the matching per-tool docstring when one
+///    exists.
+fn enrich_local_entries_from_doc_comments(paths: &Paths, index: &mut VectorIndex) {
+    use std::collections::HashMap;
+
+    // Collect server IDs of local entries that are missing a description
+    let servers_needing_enrichment: Vec<String> = {
+        let mut seen: HashMap<&str, bool> = HashMap::new();
+        for e in &index.entries {
+            if e.source == "local" {
+                let missing = e
+                    .server_description
+                    .as_deref()
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                seen.entry(&e.server_id)
+                    .and_modify(|v| {
+                        *v = *v && missing;
+                    })
+                    .or_insert(missing);
+            }
+        }
+        seen.into_iter()
+            .filter_map(|(id, needs)| if needs { Some(id.to_string()) } else { None })
+            .collect()
+    };
+
+    if servers_needing_enrichment.is_empty() {
+        return;
+    }
+
+    // For each server, resolve its install dir and parse doc comments
+    for server_id in &servers_needing_enrichment {
+        let install_dir = match crate::discovery::get_manifest_path(paths, server_id) {
+            Some(p) => match p.parent().map(|p| p.to_path_buf()) {
+                Some(d) => d,
+                None => continue,
+            },
+            None => continue,
+        };
+
+        let tool_docs = doc_comments::extract_tool_docs(&install_dir);
+        let server_desc = doc_comments::first_description(&tool_docs);
+
+        if server_desc.is_none() {
+            continue;
+        }
+
+        // Build a quick lookup: tool_name -> docstring
+        let tool_doc_map: std::collections::HashMap<&str, &str> = tool_docs
+            .iter()
+            .filter_map(|d| d.docstring.as_deref().map(|ds| (d.tool_name.as_str(), ds)))
+            .collect();
+
+        // Patch entries for this server
+        for entry in index.entries.iter_mut() {
+            if entry.source != "local" || entry.server_id != *server_id {
+                continue;
+            }
+            // Fill server description if still absent
+            if entry
+                .server_description
+                .as_deref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+            {
+                entry.server_description = server_desc.clone();
+            }
+            // Fill tool description from per-tool docstring if absent
+            if let Some(ref tool_name) = entry.tool_name.clone() {
+                if entry
+                    .tool_description
+                    .as_deref()
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(&doc) = tool_doc_map.get(tool_name.as_str()) {
+                        entry.tool_description = Some(doc.to_string());
+                    }
+                }
+            }
+        }
+    }
 }
