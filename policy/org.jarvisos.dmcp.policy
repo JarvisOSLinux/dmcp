@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<!--
+  org.jarvisos.dmcp.policy
+  PolicyKit policy for dmcp — MCP server manager.
+
+  Governs privilege escalation for system-scoped MCP server operations.
+  Install this file to /usr/share/polkit-1/actions/ so polkit recognises
+  the actions defined here.
+
+  Matching JS rules live in packages/polkit/org.jarvisos.jarvis.rules (JARVIS OS)
+  or can be added to /etc/polkit-1/rules.d/ on any system.
+-->
+
+<policyconfig>
+
+  <!--
+    org.jarvisos.dmcp.run-system-server
+    Launch a system-scoped MCP server binary with root privileges.
+
+    This action is invoked by `dmcp run <id>` when the target server is
+    installed in system scope (/usr/share/mcp/installed/).  Because dmcp
+    itself runs as an unprivileged user, pkexec is used to re-execute
+    the server command with root credentials.
+
+    allow_any:       not authorised — remote/batch sessions must not
+                     silently gain root for arbitrary server binaries.
+    allow_inactive:  not authorised — the session must be active (on-seat).
+    allow_active:    authentication required — the active desktop user must
+                     authenticate (password prompt) before the server starts.
+
+    On JARVIS OS the companion JS rules in org.jarvisos.jarvis.rules can
+    be extended to grant YES for members of a trusted group (e.g.
+    "jarvis-elevated") so that the daemon can start system servers without
+    a password prompt while still requiring that the user be the active
+    session owner.
+  -->
+  <action id="org.jarvisos.dmcp.run-system-server">
+    <description>Run a system-scoped MCP server</description>
+    <message>Authentication is required to start a system-wide MCP server.</message>
+    <icon_name>applications-system</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/dmcp</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

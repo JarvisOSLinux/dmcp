@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::doc_comments;
 use crate::models::{Index, Manifest};
 use crate::paths::Paths;
 
@@ -193,6 +194,37 @@ fn load_server_from_scope(
     let entry = index.servers.get(id)?;
     let manifest_path = std::path::PathBuf::from(&entry.location);
     let s = std::fs::read_to_string(&manifest_path).ok()?;
-    let manifest: Manifest = serde_json::from_str(&s).ok()?;
+    let mut manifest: Manifest = serde_json::from_str(&s).ok()?;
+    enrich_manifest_from_doc_comments(&mut manifest, &manifest_path);
     Some((manifest, scope, manifest_path))
+}
+
+/// If the manifest has no `description` and no `summary`, scan the server's
+/// install directory for Python `@mcp.tool` docstrings and use the first one
+/// found as a description fallback.
+fn enrich_manifest_from_doc_comments(manifest: &mut Manifest, manifest_path: &Path) {
+    let has_description = manifest
+        .description
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_summary = manifest
+        .summary
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_description || has_summary {
+        return;
+    }
+
+    // Derive install dir from the manifest path (parent directory).
+    let install_dir = match manifest_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let docs = doc_comments::extract_tool_docs(install_dir);
+    if let Some(desc) = doc_comments::first_description(&docs) {
+        manifest.description = Some(desc);
+    }
 }

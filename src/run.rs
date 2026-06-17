@@ -6,13 +6,24 @@
 //! Config keys are passed directly as environment variables using the key name stored
 //! in the manifest (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY). This matches
 //! what upstream servers expect based on their configurableProperties definitions.
+//!
+//! ## System-scoped servers
+//!
+//! When the server is installed in system scope (`/usr/share/mcp/installed/`) and the
+//! current process is not already running as root, dmcp uses `pkexec` to re-execute
+//! itself under the polkit action `org.jarvisos.dmcp.run-system-server`.  This keeps
+//! the privilege-escalation path auditable and avoids hardcoded `sudoers` NOPASSWD
+//! entries or setuid wrappers.
+//!
+//! See `policy/org.jarvisos.dmcp.policy` for the polkit action definition.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::discovery::{get_manifest_path, get_server};
+use crate::discovery::{get_manifest_path, get_server, Scope};
+use crate::elevation::{is_elevated, re_exec_with_pkexec};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 
@@ -49,9 +60,24 @@ impl std::error::Error for RunError {}
 ///
 /// - **stdio**: Spawns the process, injects config as env vars, inherits stdin/stdout/stderr.
 /// - **SSE/WebSocket**: Prints "<name> is running on <url>" and exits.
+///
+/// When the server is system-scoped and the current process is not already
+/// root, this re-executes dmcp via `pkexec` so that polkit handles privilege
+/// escalation under the `org.jarvisos.dmcp.run-system-server` action.
 pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
-    let (manifest, _scope) =
+    let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| RunError::ServerNotFound(id.to_string()))?;
+
+    // System-scoped stdio servers need root to access /usr/share/mcp/.
+    // Re-execute dmcp through pkexec so polkit can authenticate the user.
+    // Remote transports (SSE/WebSocket) just print a URL and need no root.
+    if scope == Scope::System && !is_elevated() {
+        if let Some(transports) = manifest.transports.as_deref() {
+            if let Some(Transport::Stdio { .. }) = transports.first() {
+                re_exec_with_pkexec();
+            }
+        }
+    }
 
     let transports = manifest
         .transports

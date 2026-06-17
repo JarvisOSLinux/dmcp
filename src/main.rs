@@ -914,7 +914,15 @@ fn main() {
             };
 
             let server_name = name.unwrap_or_else(|| server_id.clone());
-            let server_description = description;
+
+            // When --description is omitted, fall back to @mcp.tool docstrings
+            // found in the server's install directory.
+            let (server_description, tool_doc_map) = if description.is_some() {
+                (description, std::collections::HashMap::new())
+            } else {
+                let (desc, map) = resolve_doc_comment_descriptions(&paths, &server_id);
+                (desc, map)
+            };
 
             let index_path = paths.vector_index_path();
             let mut index = match VectorIndex::load(&index_path) {
@@ -956,12 +964,14 @@ fn main() {
                             .filter_map(|v| v.as_f64().map(|f| f as f32))
                             .collect();
                         if !vec.is_empty() {
+                            // Use per-tool docstring when available
+                            let tool_description = tool_doc_map.get(tool_name.as_str()).cloned();
                             new_entries.push(VectorEntry {
                                 server_id: server_id.clone(),
                                 server_name: server_name.clone(),
                                 server_description: server_description.clone(),
                                 tool_name: Some(tool_name.clone()),
-                                tool_description: None,
+                                tool_description,
                                 parameter_schema: None,
                                 vector: vec,
                                 source: "local".to_string(),
@@ -1175,4 +1185,30 @@ fn print_browse_table(servers: &[dmcp::RegistryServer]) {
         println!("{}Source:    {}", INDENT, s.source);
         println!();
     }
+}
+
+/// For the `index-server` command: when `--description` is not provided,
+/// look up the server's install directory and parse `@mcp.tool` docstrings.
+///
+/// Returns `(server_description, tool_name -> docstring map)`.
+fn resolve_doc_comment_descriptions(
+    paths: &dmcp::Paths,
+    server_id: &str,
+) -> (Option<String>, std::collections::HashMap<String, String>) {
+    let install_dir = match dmcp::get_manifest_path(paths, server_id) {
+        Some(p) => match p.parent().map(|p| p.to_path_buf()) {
+            Some(d) => d,
+            None => return (None, std::collections::HashMap::new()),
+        },
+        None => return (None, std::collections::HashMap::new()),
+    };
+
+    let tool_docs = dmcp::extract_tool_docs(&install_dir);
+    let server_desc = dmcp::first_description(&tool_docs);
+    let map: std::collections::HashMap<String, String> = tool_docs
+        .into_iter()
+        .filter_map(|d| d.docstring.map(|ds| (d.tool_name, ds)))
+        .collect();
+
+    (server_desc, map)
 }
