@@ -94,6 +94,58 @@ src/
 
 Core features implemented: list, info, config, sources, browse, install, uninstall, connect, run, setup.
 
+## System-scoped servers
+
+System-scoped MCP servers are installed under `/usr/share/mcp/installed/` and are
+visible to every user on the machine.  Starting them requires root because the
+install directory is owned by root.
+
+### Why not sudo?
+
+`sudo` cannot prompt for a password when dmcp has no TTY — for example when it is
+launched by the JARVIS daemon or another MCP client.  Hardcoding `NOPASSWD` in
+`/etc/sudoers` would skip authentication entirely, which is too broad.
+
+### The polkit approach
+
+dmcp uses `pkexec` (part of [polkit](https://gitlab.freedesktop.org/polkit/polkit))
+to escalate privileges for system-scoped stdio server startup.  This is consistent
+with how the rest of JARVIS OS handles privilege escalation.
+
+The polkit action is defined in `policy/org.jarvisos.dmcp.policy`:
+
+```
+org.jarvisos.dmcp.run-system-server
+```
+
+Default behaviour:
+
+| Session type | Result |
+|---|---|
+| Active desktop session | `auth_admin_keep` — user authenticates once, grant is cached for the task |
+| Inactive or remote session | Denied |
+
+When `dmcp run <id>` is called for a system-scoped stdio server and the process is
+not already root, dmcp transparently re-executes itself through `pkexec`.  polkit
+presents an authentication dialog (or uses the cached grant) before handing control
+back to the now-elevated dmcp process, which then spawns the server normally.
+
+SSE and WebSocket servers only print a connection URL and never need root, so they
+skip the escalation path entirely.
+
+### Installation
+
+Copy the policy file to the polkit actions directory:
+
+```bash
+sudo install -m 644 policy/org.jarvisos.dmcp.policy /usr/share/polkit-1/actions/
+```
+
+On JARVIS OS this is handled automatically by the PKGBUILD.  The companion JS rules
+in `packages/polkit/org.jarvisos.jarvis.rules` can be extended to grant `YES` for
+members of the `jarvis-elevated` group, removing the password prompt for trusted
+service accounts.
+
 ## LLM Integration
 
 Run dmcp as an MCP server so LLMs (Cursor, Claude, etc.) can control it:
