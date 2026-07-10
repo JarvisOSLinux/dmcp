@@ -327,3 +327,74 @@ pub fn run(paths: &Paths) -> Result<(), Box<dyn std::error::Error>> {
     })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Agent-confinement invariant — see docs/TRUST-MODEL.md §2.2 (mcp-registry).
+    //
+    // Project-JARVIS reaches dmcp only through this MCP surface, and it must NOT
+    // be able to widen the set of sources it can install from. Two locks:
+    //   1. no tool mutates the source list (sources.list);
+    //   2. install_server is id-only — no url/path/source — so the agent can only
+    //      install servers a human already trusted by configuring a registry.
+    // These tests introspect the actual generated tool router, so they catch a
+    // regression the moment a tool or field is added. If a change here is
+    // intended, update these lists AND TRUST-MODEL.md deliberately.
+
+    #[test]
+    fn serve_surface_has_no_source_mutation_tool() {
+        let allowed = [
+            "list_servers",
+            "get_server_info",
+            "install_server",
+            "uninstall_server",
+            "set_config",
+            "list_server_tools",
+            "call_server_tool",
+            "dispatch_tasks",
+            "get_task_status",
+            "kill_task",
+        ];
+        for tool in DmcpServer::tool_router().list_all() {
+            let name = tool.name.as_ref();
+            assert!(
+                allowed.contains(&name),
+                "unexpected MCP tool '{name}' on the serve surface; if it can reach \
+                 the source list it breaks agent confinement (TRUST-MODEL.md §2.2)"
+            );
+            let lower = name.to_lowercase();
+            assert!(
+                !lower.contains("source") && !lower.contains("registr"),
+                "tool '{name}' looks like it manages sources; confinement forbids it"
+            );
+        }
+    }
+
+    #[test]
+    fn install_server_tool_is_id_only() {
+        let router = DmcpServer::tool_router();
+        let tool = router
+            .get("install_server")
+            .expect("install_server tool must exist");
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("install_server input schema must list properties");
+        for forbidden in [
+            "url", "uri", "path", "source", "manifest", "endpoint", "registry",
+        ] {
+            assert!(
+                !props.contains_key(forbidden),
+                "InstallParams gained a '{forbidden}' field — the agent could install \
+                 from an arbitrary location, breaking source confinement"
+            );
+        }
+        assert!(
+            props.contains_key("id"),
+            "install_server must install by id"
+        );
+    }
+}
