@@ -517,6 +517,17 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
+                // Human CLI trust gate: any tier is installable, but community
+                // is a "you are trusting the submitter" warning and removed is
+                // refused (TRUST-MODEL §2.1).
+                match dmcp::install::cli_trust_gate(dmcp::install::trust_status(&server)) {
+                    dmcp::install::TrustGate::Deny(reason) => {
+                        eprintln!("Error: refusing to install {}: {}", id, reason);
+                        std::process::exit(1);
+                    }
+                    dmcp::install::TrustGate::Warn(msg) => eprintln!("[warn] {}", msg),
+                    dmcp::install::TrustGate::Allow => {}
+                }
                 let scope = if system {
                     dmcp::discovery::Scope::System
                 } else {

@@ -356,6 +356,99 @@ fn verify_manifest_hash(raw: &[u8], expected: Option<&str>) -> Result<(), Instal
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Trust policy (see mcp-registry docs/TRUST-MODEL.md)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a trust-policy check for an install.
+pub enum TrustGate {
+    Allow,
+    Warn(String),
+    Deny(String),
+}
+
+/// The trust tier recorded for a server entry, defaulting to the most cautious
+/// tier when the field is absent.
+pub fn trust_status(server: &serde_json::Value) -> &str {
+    server
+        .get("trustStatus")
+        .and_then(|t| t.as_str())
+        .unwrap_or("community")
+}
+
+/// Whether the agent path may install community-tier servers. The transitional
+/// default is permissive so installs work before any server is promoted to
+/// `official`; set `DMCP_AGENT_ALLOW_COMMUNITY=0` to enforce official-only.
+pub fn agent_allow_community_from_env() -> bool {
+    match std::env::var("DMCP_AGENT_ALLOW_COMMUNITY") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Policy for the autonomous-agent path (`dmcp serve`). The agent inherits the
+/// human's configured sources and, by policy, installs `official`-tier servers
+/// only — unless a human-controlled config opens the gate to `community`.
+/// `deprecated`/`removed` servers are never installable by the agent.
+pub fn agent_trust_gate(status: &str, allow_community: bool) -> TrustGate {
+    match status {
+        "official" => TrustGate::Allow,
+        "removed" => TrustGate::Deny("server has been removed from the registry".into()),
+        "deprecated" => {
+            TrustGate::Deny("server is deprecated; not installable by the agent".into())
+        }
+        other => {
+            if allow_community {
+                TrustGate::Warn(format!(
+                    "installing '{}'-tier server: not maintainer-reviewed",
+                    other
+                ))
+            } else {
+                TrustGate::Deny(format!(
+                    "agent policy allows official-tier only; '{}' refused \
+                     (set DMCP_AGENT_ALLOW_COMMUNITY=1 to allow community-tier)",
+                    other
+                ))
+            }
+        }
+    }
+}
+
+/// Policy for the human CLI path. The operator may install any tier; a
+/// community install carries a "you are trusting the submitter" warning, and a
+/// removed server is refused. See TRUST-MODEL.md §2.1.
+pub fn cli_trust_gate(status: &str) -> TrustGate {
+    match status {
+        "official" => TrustGate::Allow,
+        "removed" => TrustGate::Deny("server has been removed from the registry".into()),
+        "deprecated" => TrustGate::Warn("server is deprecated".into()),
+        other => TrustGate::Warn(format!(
+            "'{}'-tier server: not maintainer-reviewed — you are trusting the submitter",
+            other
+        )),
+    }
+}
+
+/// True for a full 40-hex-char commit SHA (vs. a tag or short ref).
+fn is_full_commit_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Confirm the checked-out HEAD matches the pinned commit SHA.
+fn verify_rev(head: &str, requested: &str) -> Result<(), InstallError> {
+    if head.eq_ignore_ascii_case(requested) {
+        Ok(())
+    } else {
+        Err(InstallError::SourceRevMismatch {
+            requested: requested.to_string(),
+            got: head.to_string(),
+        })
+    }
+}
+
 /// Merge b into a. Keys in b override a.
 fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {
     if let (Some(a_obj), Some(b_obj)) = (a.as_object_mut(), b.as_object()) {
@@ -377,26 +470,52 @@ fn install_stdio(server: &serde_json::Value, install_dir: &Path) -> Result<(), I
         .and_then(|u| u.as_str())
         .ok_or(InstallError::InvalidRegistry)?;
     let path = source.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let rev = source
+        .get("rev")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let temp = std::env::temp_dir().join(format!("dmcp-clone-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).map_err(InstallError::CreateDir)?;
 
+    let temp_str = temp.to_str().ok_or(InstallError::InvalidRegistry)?;
+    // With a pinned rev, fetch full history (blobless to stay cheap) so any
+    // commit is reachable for checkout; otherwise take the fast shallow path.
+    let clone_args: Vec<&str> = if rev.is_some() {
+        vec!["clone", "--filter=blob:none", url, temp_str]
+    } else {
+        vec!["clone", "--depth", "1", "--filter=blob:none", url, temp_str]
+    };
     let status = Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            "--filter=blob:none",
-            url,
-            temp.to_str().unwrap(),
-        ])
+        .args(&clone_args)
         .status()
         .map_err(InstallError::GitFailed)?;
     if !status.success() {
         return Err(InstallError::GitFailed(std::io::Error::other(
             "git clone failed",
         )));
+    }
+
+    if let Some(rev) = rev {
+        let checkout = Command::new("git")
+            .args(["-C", temp_str, "checkout", "--detach", rev])
+            .status()
+            .map_err(InstallError::GitFailed)?;
+        if !checkout.success() {
+            return Err(InstallError::SourceCheckoutFailed(rev.to_string()));
+        }
+        // A full commit SHA is a binding pin: confirm HEAD is exactly it, so a
+        // tampered or moved ref cannot substitute different code.
+        if is_full_commit_sha(rev) {
+            let head = Command::new("git")
+                .args(["-C", temp_str, "rev-parse", "HEAD"])
+                .output()
+                .map_err(InstallError::GitFailed)?;
+            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            verify_rev(&head, rev)?;
+        }
     }
 
     let src = if path.is_empty() {
@@ -499,6 +618,9 @@ pub enum InstallError {
     ParseIndex(serde_json::Error),
     WriteIndex(std::io::Error),
     ManifestHashMismatch { expected: String, actual: String },
+    SourceCheckoutFailed(String),
+    SourceRevMismatch { requested: String, got: String },
+    TrustDenied(String),
 }
 
 impl std::fmt::Display for InstallError {
@@ -524,6 +646,17 @@ impl std::fmt::Display for InstallError {
                  (the fetched manifest does not match what the registry recorded)",
                 expected, actual
             ),
+            InstallError::SourceCheckoutFailed(rev) => {
+                write!(f, "Failed to check out pinned source revision {}", rev)
+            }
+            InstallError::SourceRevMismatch { requested, got } => write!(
+                f,
+                "Pinned source revision mismatch: requested {}, got {}",
+                requested, got
+            ),
+            InstallError::TrustDenied(reason) => {
+                write!(f, "Refused by trust policy: {}", reason)
+            }
         }
     }
 }
@@ -720,5 +853,71 @@ mod tests {
         let tampered = br#"{"transports":[{"type":"stdio","command":"evil"}]}"#;
         let err = verify_manifest_hash(tampered, Some(&expected)).unwrap_err();
         assert!(matches!(err, InstallError::ManifestHashMismatch { .. }));
+    }
+
+    #[test]
+    fn trust_status_defaults_to_community() {
+        assert_eq!(trust_status(&serde_json::json!({})), "community");
+        assert_eq!(
+            trust_status(&serde_json::json!({"trustStatus": "official"})),
+            "official"
+        );
+    }
+
+    #[test]
+    fn agent_gate_allows_official_only_when_strict() {
+        assert!(matches!(
+            agent_trust_gate("official", false),
+            TrustGate::Allow
+        ));
+        assert!(matches!(
+            agent_trust_gate("community", false),
+            TrustGate::Deny(_)
+        ));
+        assert!(matches!(
+            agent_trust_gate("community", true),
+            TrustGate::Warn(_)
+        ));
+        // deprecated/removed are never installable by the agent
+        assert!(matches!(
+            agent_trust_gate("deprecated", true),
+            TrustGate::Deny(_)
+        ));
+        assert!(matches!(
+            agent_trust_gate("removed", true),
+            TrustGate::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn cli_gate_warns_on_community_and_refuses_removed() {
+        assert!(matches!(cli_trust_gate("official"), TrustGate::Allow));
+        assert!(matches!(cli_trust_gate("community"), TrustGate::Warn(_)));
+        assert!(matches!(cli_trust_gate("deprecated"), TrustGate::Warn(_)));
+        assert!(matches!(cli_trust_gate("removed"), TrustGate::Deny(_)));
+    }
+
+    #[test]
+    fn full_commit_sha_is_recognized() {
+        assert!(is_full_commit_sha(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        ));
+        assert!(!is_full_commit_sha("v1.2.3")); // tag
+        assert!(!is_full_commit_sha("a1b2c3d")); // short
+        assert!(!is_full_commit_sha(
+            "z1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        )); // non-hex
+    }
+
+    #[test]
+    fn pinned_rev_mismatch_is_rejected() {
+        let want = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+        assert!(verify_rev(want, want).is_ok());
+        assert!(verify_rev(&want.to_uppercase(), want).is_ok()); // case-insensitive
+        let got = "0000000000000000000000000000000000000000";
+        assert!(matches!(
+            verify_rev(got, want).unwrap_err(),
+            InstallError::SourceRevMismatch { .. }
+        ));
     }
 }

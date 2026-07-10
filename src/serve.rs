@@ -153,7 +153,9 @@ impl DmcpServer {
         }
     }
 
-    #[tool(description = "Install an MCP server from registry by ID")]
+    #[tool(
+        description = "Install an MCP server by ID from a configured registry. Installs official-tier servers by default; community-tier requires DMCP_AGENT_ALLOW_COMMUNITY."
+    )]
     async fn install_server(
         &self,
         params: Parameters<InstallParams>,
@@ -161,6 +163,21 @@ impl DmcpServer {
         let p = params.0;
         match crate::fetch_server_from_registry(&self.paths, &p.id) {
             Ok(server) => {
+                // Agent trust gate: the autonomous path installs official-tier
+                // only unless a human-controlled env var opens it (TRUST-MODEL §2.2).
+                let status = crate::install::trust_status(&server).to_string();
+                let allow_community = crate::install::agent_allow_community_from_env();
+                let mut notice = String::new();
+                match crate::install::agent_trust_gate(&status, allow_community) {
+                    crate::install::TrustGate::Deny(reason) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Refused to install {}: {}",
+                            p.id, reason
+                        ))]));
+                    }
+                    crate::install::TrustGate::Warn(msg) => notice = format!(" ({})", msg),
+                    crate::install::TrustGate::Allow => {}
+                }
                 let scope = if p.system {
                     crate::discovery::Scope::System
                 } else {
@@ -169,8 +186,8 @@ impl DmcpServer {
                 match crate::install::install(&self.paths, &p.id, scope, Some(server), !p.no_setup)
                 {
                     Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Installed {}",
-                        p.id
+                        "Installed {}{}",
+                        p.id, notice
                     ))])),
                     Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
                 }
