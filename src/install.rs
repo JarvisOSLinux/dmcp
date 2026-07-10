@@ -188,13 +188,35 @@ pub fn fetch_server_from_registry(
                 .filter(|s| s.starts_with("http"))
             {
                 let manifest_url = manifest_url.to_string();
+                // The registry entry binds this manifest to an exact content
+                // hash. Capture it now, before the merge below overwrites
+                // `server` with the manifest contents.
+                let expected_manifest_hash = server
+                    .get("integrity")
+                    .and_then(|i| i.get("manifestSha256"))
+                    .and_then(|h| h.as_str())
+                    .filter(|h| !h.is_empty())
+                    .map(|h| h.to_string());
+
                 let manifest_resp = client
                     .get(&manifest_url)
                     .send()
                     .map_err(InstallError::FetchFailed)?;
                 if manifest_resp.status().is_success() {
+                    // Hash the raw bytes exactly as fetched, before any parse
+                    // or merge, so the digest matches what the registry
+                    // recorded (sync_registry.py hashes the raw manifest file).
+                    let raw = manifest_resp.bytes().map_err(InstallError::FetchFailed)?;
+                    verify_manifest_hash(&raw, expected_manifest_hash.as_deref())?;
+                    if expected_manifest_hash.is_none() {
+                        eprintln!(
+                            "[warn] {}: registry entry has no integrity.manifestSha256; \
+                             installing an unverified manifest",
+                            id
+                        );
+                    }
                     let mut manifest: serde_json::Value =
-                        manifest_resp.json().map_err(InstallError::FetchFailed)?;
+                        serde_json::from_slice(&raw).map_err(|_| InstallError::InvalidRegistry)?;
                     // Merge: registry entry overrides manifest (for scope, keywords, etc.)
                     merge_json(&mut manifest, &server);
                     server = manifest;
@@ -314,6 +336,25 @@ fn deliver_setup_script(server: &serde_json::Value, install_dir: &Path) -> Deliv
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+/// Verify fetched manifest bytes against the SHA-256 the registry recorded.
+///
+/// `expected == None` means the entry carries no `integrity.manifestSha256`;
+/// the manifest is installed unverified (the caller warns). `Some(hash)` is a
+/// binding commitment: a mismatch aborts the install so a tampered manifest
+/// (altered command/args/source/scope) cannot land undetected.
+fn verify_manifest_hash(raw: &[u8], expected: Option<&str>) -> Result<(), InstallError> {
+    if let Some(expected) = expected {
+        let actual = format!("{:x}", Sha256::digest(raw));
+        if actual != expected {
+            return Err(InstallError::ManifestHashMismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Merge b into a. Keys in b override a.
 fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {
@@ -457,6 +498,7 @@ pub enum InstallError {
     SetupFailed(String),
     ParseIndex(serde_json::Error),
     WriteIndex(std::io::Error),
+    ManifestHashMismatch { expected: String, actual: String },
 }
 
 impl std::fmt::Display for InstallError {
@@ -476,6 +518,12 @@ impl std::fmt::Display for InstallError {
             InstallError::SetupFailed(s) => write!(f, "Setup failed: {}", s),
             InstallError::ParseIndex(e) => write!(f, "Failed to parse index: {}", e),
             InstallError::WriteIndex(e) => write!(f, "Failed to write index: {}", e),
+            InstallError::ManifestHashMismatch { expected, actual } => write!(
+                f,
+                "Manifest integrity check failed: expected SHA-256 {}, got {} \
+                 (the fetched manifest does not match what the registry recorded)",
+                expected, actual
+            ),
         }
     }
 }
@@ -636,4 +684,41 @@ fn doy_to_md(doy: u32) -> (u32, u32) {
         d -= dim;
     }
     (12, 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_hash_matches_recorded_digest() {
+        let raw = br#"{"version":"1.0","scope":"user"}"#;
+        let expected = format!("{:x}", Sha256::digest(raw));
+        assert!(verify_manifest_hash(raw, Some(&expected)).is_ok());
+    }
+
+    #[test]
+    fn manifest_hash_mismatch_is_rejected() {
+        let raw = br#"{"version":"1.0"}"#;
+        let wrong = "0".repeat(64);
+        let err = verify_manifest_hash(raw, Some(&wrong)).unwrap_err();
+        assert!(matches!(err, InstallError::ManifestHashMismatch { .. }));
+    }
+
+    #[test]
+    fn absent_hash_installs_unverified() {
+        let raw = br#"{"version":"1.0"}"#;
+        assert!(verify_manifest_hash(raw, None).is_ok());
+    }
+
+    #[test]
+    fn single_byte_tamper_is_detected() {
+        // A manifest reviewed with command "safe" must not install if the
+        // bytes served have been swapped to "evil".
+        let reviewed = br#"{"transports":[{"type":"stdio","command":"safe"}]}"#;
+        let expected = format!("{:x}", Sha256::digest(reviewed));
+        let tampered = br#"{"transports":[{"type":"stdio","command":"evil"}]}"#;
+        let err = verify_manifest_hash(tampered, Some(&expected)).unwrap_err();
+        assert!(matches!(err, InstallError::ManifestHashMismatch { .. }));
+    }
 }
