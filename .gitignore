@@ -29,8 +29,10 @@ node_modules/
 *.log
 
 # makepkg artifacts
+# NOTE: do NOT ignore src/ — that is the Rust source directory. makepkg's build
+# src/ collides with it, so run makepkg from a clean/separate checkout.
 *.tar.gz
-src/
+*.pkg.tar.zst
 pkg/
 
 # OS
