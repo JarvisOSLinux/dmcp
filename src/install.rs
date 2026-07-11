@@ -376,9 +376,11 @@ pub fn trust_status(server: &serde_json::Value) -> &str {
         .unwrap_or("community")
 }
 
-/// Whether the agent path may install community-tier servers. The transitional
-/// default is permissive so installs work before any server is promoted to
-/// `official`; set `DMCP_AGENT_ALLOW_COMMUNITY=0` to enforce official-only.
+/// Whether the agent path may install community-tier servers. Default is
+/// permissive by policy: every registry entry is PR-vetted, so `community` is
+/// reviewed-but-not-maintainer-endorsed, not unvetted, and the agent may install
+/// it. A deployment can set `DMCP_AGENT_ALLOW_COMMUNITY=0` to opt into
+/// official-only as a hardening posture. See mcp-registry TRUST-MODEL.md §2.2.
 pub fn agent_allow_community_from_env() -> bool {
     match std::env::var("DMCP_AGENT_ALLOW_COMMUNITY") {
         Ok(v) => !matches!(
@@ -390,9 +392,12 @@ pub fn agent_allow_community_from_env() -> bool {
 }
 
 /// Policy for the autonomous-agent path (`dmcp serve`). The agent inherits the
-/// human's configured sources and, by policy, installs `official`-tier servers
-/// only — unless a human-controlled config opens the gate to `community`.
-/// `deprecated`/`removed` servers are never installable by the agent.
+/// human's configured sources and installs both `official` and (by default)
+/// `community` entries from them — the confinement to human-configured sources,
+/// not a tier allowlist, is the boundary. `community` installs carry a
+/// not-maintainer-reviewed warning; `DMCP_AGENT_ALLOW_COMMUNITY=0` narrows the
+/// agent to official-only. `deprecated`/`removed` servers are never installable
+/// by the agent.
 pub fn agent_trust_gate(status: &str, allow_community: bool) -> TrustGate {
     match status {
         "official" => TrustGate::Allow,
