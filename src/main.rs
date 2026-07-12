@@ -697,7 +697,15 @@ fn main() {
             let args_val = args.as_deref().and_then(|s| serde_json::from_str(s).ok());
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
-                Ok(result) => println!("{}", call::format_call_result(&result)),
+                Ok(result) => {
+                    println!("{}", call::format_call_result(&result));
+                    // Signal a tool-reported error via the exit code, out-of-band
+                    // from the output stream, so a caller (e.g. dispatch) reads
+                    // status structurally instead of sniffing the output text.
+                    if call::call_is_error(&result) {
+                        std::process::exit(2);
+                    }
+                }
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);

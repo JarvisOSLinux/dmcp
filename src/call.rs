@@ -245,7 +245,12 @@ async fn list_tools_remote(url: &str) -> Result<Vec<rmcp::model::Tool>, CallErro
     Ok(tools.tools)
 }
 
-/// Format CallToolResult for display.
+/// Format CallToolResult content for display.
+///
+/// Error status is deliberately NOT encoded in this string. A tool-reported
+/// error is signalled out-of-band via a non-zero process exit code (see the
+/// `Call` command handler), never a sentinel inside the output — otherwise tool
+/// output containing that sentinel could spoof the call's status.
 pub fn format_call_result(result: &CallToolResult) -> String {
     let mut out = String::new();
     for c in &result.content {
@@ -253,8 +258,35 @@ pub fn format_call_result(result: &CallToolResult) -> String {
             out.push_str(&t.text);
         }
     }
-    if result.is_error.unwrap_or(false) {
-        out.push_str("\n(Error)");
-    }
     out
+}
+
+/// Whether a tool call reported an error via rmcp's structured `is_error` flag.
+pub fn call_is_error(result: &CallToolResult) -> bool {
+    result.is_error.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::Content;
+
+    #[test]
+    fn success_result_is_plain_output_with_no_error_status() {
+        let ok = CallToolResult::success(vec![Content::text("hello")]);
+        assert_eq!(format_call_result(&ok), "hello");
+        assert!(!call_is_error(&ok));
+    }
+
+    #[test]
+    fn error_result_omits_the_sentinel_and_is_flagged_structurally() {
+        let err = CallToolResult::error(vec![Content::text("boom")]);
+        // The output stream is the tool's content only — no "(Error)" sentinel
+        // that tool output could otherwise forge.
+        let out = format_call_result(&err);
+        assert_eq!(out, "boom");
+        assert!(!out.contains("(Error)"));
+        // The error is carried structurally instead (surfaced via exit code).
+        assert!(call_is_error(&err));
+    }
 }
