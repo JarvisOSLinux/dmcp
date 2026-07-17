@@ -34,13 +34,13 @@ impl Paths {
         );
         let system_sources = resolve_path(
             "MCP_SYSTEM_SOURCES_PATH",
-            Some(PathBuf::from("/etc/mcp/sources.list")),
+            Some(system_sources_default()),
             "/etc/mcp/sources.list",
             &env_defaults,
         );
         let system_install_dir = resolve_path(
             "MCP_SYSTEM_INSTALL_DIR",
-            Some(PathBuf::from("/usr/share/mcp/installed/")),
+            Some(system_install_dir_default()),
             "/usr/share/mcp/installed/",
             &env_defaults,
         );
@@ -112,7 +112,63 @@ fn resolve_path(
     xdg_default.unwrap_or_else(|| expand_tilde(fallback))
 }
 
+/// Per-OS default system sources path. Linux: `/etc/mcp/sources.list`. macOS:
+/// under `/Library/Application Support` (not `/usr/share`, which is SIP-sealed
+/// on macOS 13+). Windows: under `%ProgramData%`.
+#[cfg(target_os = "linux")]
+fn system_sources_default() -> PathBuf {
+    PathBuf::from("/etc/mcp/sources.list")
+}
+
+#[cfg(target_os = "macos")]
+fn system_sources_default() -> PathBuf {
+    PathBuf::from("/Library/Application Support/mcp/sources.list")
+}
+
+#[cfg(target_os = "windows")]
+fn system_sources_default() -> PathBuf {
+    program_data_dir().join("mcp").join("sources.list")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn system_sources_default() -> PathBuf {
+    PathBuf::from("/etc/mcp/sources.list")
+}
+
+/// Per-OS default system install dir. See [`system_sources_default`] for the
+/// macOS SIP rationale.
+#[cfg(target_os = "linux")]
+fn system_install_dir_default() -> PathBuf {
+    PathBuf::from("/usr/share/mcp/installed/")
+}
+
+#[cfg(target_os = "macos")]
+fn system_install_dir_default() -> PathBuf {
+    PathBuf::from("/Library/Application Support/mcp/installed/")
+}
+
+#[cfg(target_os = "windows")]
+fn system_install_dir_default() -> PathBuf {
+    program_data_dir().join("mcp").join("installed")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn system_install_dir_default() -> PathBuf {
+    PathBuf::from("/usr/share/mcp/installed/")
+}
+
+#[cfg(target_os = "windows")]
+fn program_data_dir() -> PathBuf {
+    std::env::var("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"))
+}
+
 /// Load default values from .env.example. Searches: cwd, XDG_CONFIG_HOME/mcp, /etc/dmcp.
+///
+/// Linux-only: on macOS/Windows a stray `.env.example` in the cwd (e.g. a git
+/// checkout) would silently shadow the real per-OS system paths above.
+#[cfg(target_os = "linux")]
 fn load_env_example_defaults() -> HashMap<String, String> {
     let candidates = [
         std::env::current_dir().ok().map(|p| p.join(".env.example")),
@@ -126,6 +182,11 @@ fn load_env_example_defaults() -> HashMap<String, String> {
             }
         }
     }
+    HashMap::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_env_example_defaults() -> HashMap<String, String> {
     HashMap::new()
 }
 
