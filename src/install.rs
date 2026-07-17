@@ -6,7 +6,7 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 use crate::discovery;
-use crate::elevation::is_elevated;
+use crate::elevation::{remove_dir_elevated, write_file_elevated};
 use crate::paths::Paths;
 use crate::setup;
 use crate::sources::list_sources;
@@ -582,23 +582,8 @@ pub fn update_index_add(
 
     let output = serde_json::to_string_pretty(&index).map_err(InstallError::Serialize)?;
 
-    if scope == crate::discovery::Scope::System && is_elevated() {
-        std::fs::write(&index_path, output).map_err(InstallError::WriteIndex)?;
-    } else if scope == crate::discovery::Scope::System {
-        let temp = std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
-        std::fs::write(&temp, &output).map_err(InstallError::WriteIndex)?;
-        let status = Command::new("pkexec")
-            .arg("cp")
-            .arg(&temp)
-            .arg(&index_path)
-            .status()
-            .map_err(InstallError::WriteIndex)?;
-        let _ = std::fs::remove_file(&temp);
-        if !status.success() {
-            return Err(InstallError::WriteIndex(std::io::Error::other(
-                "pkexec cp failed",
-            )));
-        }
+    if scope == crate::discovery::Scope::System {
+        write_file_elevated(&index_path, output.as_bytes()).map_err(InstallError::WriteIndex)?;
     } else {
         std::fs::write(&index_path, output).map_err(InstallError::WriteIndex)?;
     }
@@ -674,20 +659,8 @@ pub fn uninstall(paths: &Paths, id: &str) -> Result<(), UninstallError> {
         discovery::get_uninstall_info(paths, id).ok_or(UninstallError::ServerNotFound)?;
 
     // Remove install directory
-    if scope == crate::discovery::Scope::System && is_elevated() {
-        std::fs::remove_dir_all(&install_dir).map_err(UninstallError::RmFailed)?;
-    } else if scope == crate::discovery::Scope::System {
-        let status = Command::new("pkexec")
-            .arg("rm")
-            .arg("-rf")
-            .arg(&install_dir)
-            .status()
-            .map_err(UninstallError::RmFailed)?;
-        if !status.success() {
-            return Err(UninstallError::RmFailed(std::io::Error::other(
-                "pkexec rm -rf failed",
-            )));
-        }
+    if scope == crate::discovery::Scope::System {
+        remove_dir_elevated(&install_dir).map_err(UninstallError::RmFailed)?;
     } else {
         std::fs::remove_dir_all(&install_dir).map_err(UninstallError::RmFailed)?;
     }
@@ -725,23 +698,8 @@ fn update_index_remove(
     index["updated"] = serde_json::Value::String(rfc3339_now());
     let output = serde_json::to_string_pretty(&index).map_err(UninstallError::SerializeIndex)?;
 
-    if scope == crate::discovery::Scope::System && is_elevated() {
-        std::fs::write(index_path, output).map_err(UninstallError::WriteIndex)?;
-    } else if scope == crate::discovery::Scope::System {
-        let temp = std::env::temp_dir().join(format!("dmcp-index-{}.json", std::process::id()));
-        std::fs::write(&temp, &output).map_err(UninstallError::WriteIndex)?;
-        let status = Command::new("pkexec")
-            .arg("cp")
-            .arg(&temp)
-            .arg(index_path)
-            .status()
-            .map_err(UninstallError::WriteIndex)?;
-        let _ = std::fs::remove_file(&temp);
-        if !status.success() {
-            return Err(UninstallError::WriteIndex(std::io::Error::other(
-                "pkexec cp failed",
-            )));
-        }
+    if scope == crate::discovery::Scope::System {
+        write_file_elevated(index_path, output.as_bytes()).map_err(UninstallError::WriteIndex)?;
     } else {
         std::fs::write(index_path, output).map_err(UninstallError::WriteIndex)?;
     }
