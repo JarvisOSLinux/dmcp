@@ -21,10 +21,13 @@
     org.jarvisos.dmcp.run-system-server
     Launch a system-scoped MCP server binary with root privileges.
 
-    This action is invoked by `dmcp run <id>` when the target server is
-    installed in system scope (/usr/share/mcp/installed/).  Because dmcp
-    itself runs as an unprivileged user, pkexec is used to re-execute
-    the server command with root credentials.
+    This action is invoked by `dmcp run <id>` and by `dmcp call <id> <tool>`
+    when the target server is installed in system scope
+    (/usr/share/mcp/installed/) with a stdio transport.  Because pkexec maps a
+    program to a polkit action by its executable path, this single action
+    governs every privileged re-execution of /usr/bin/dmcp.  Because dmcp itself
+    runs as an unprivileged user, pkexec is used to re-execute it — and thus the
+    server command, and the tools it invokes — with root credentials.
 
     allow_any:       not authorised — remote/batch sessions must not
                      silently gain root for arbitrary server binaries.
@@ -39,8 +42,8 @@
     session owner.
   -->
   <action id="org.jarvisos.dmcp.run-system-server">
-    <description>Run a system-scoped MCP server</description>
-    <message>Authentication is required to start a system-wide MCP server.</message>
+    <description>Run or invoke a system-scoped MCP server</description>
+    <message>Authentication is required to run a system-wide MCP server.</message>
     <icon_name>applications-system</icon_name>
     <defaults>
       <allow_any>no</allow_any>
