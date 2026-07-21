@@ -9,7 +9,8 @@ use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
 use tokio::process::Command;
 
-use crate::discovery::{get_manifest_path, get_server};
+use crate::discovery::{get_manifest_path, get_server, Scope};
+use crate::elevation::{is_elevated, re_exec_with_pkexec};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 use crate::run::config_to_env;
@@ -41,6 +42,34 @@ impl std::fmt::Display for CallError {
 }
 
 impl std::error::Error for CallError {}
+
+/// True when invoking a tool requires re-executing dmcp as root: the target is a
+/// system-scoped stdio server (its process — and therefore every command it
+/// runs — must be privileged) and we are not already elevated. User-scope
+/// servers and remote (SSE/WebSocket) transports never elevate.
+fn needs_system_elevation(scope: Scope, transports: Option<&[Transport]>, elevated: bool) -> bool {
+    let first = transports.and_then(|t| t.first());
+    !elevated && scope == Scope::System && matches!(first, Some(Transport::Stdio { .. }))
+}
+
+/// Elevate a `dmcp call` on a system-scoped stdio server to root, mirroring
+/// `dmcp run`: re-exec via pkexec so polkit authorizes it under
+/// `org.jarvisos.dmcp.run-system-server`. Without this, a system server's tools
+/// execute as the invoking user (e.g. `pacman` -> "you cannot perform this
+/// operation unless you are root"), defeating the point of system scope (#33).
+///
+/// Call this from the `Call` command handler *before* the async runtime, so the
+/// re-exec replaces the whole one-shot invocation; the elevated dmcp then spawns
+/// the server as root and its stdout (the tool result) flows back to the caller.
+/// Introspection (`list_tools`) is intentionally left unprivileged — it doesn't
+/// run commands and the daemon calls it constantly.
+pub fn elevate_call_for_system_scope(paths: &Paths, id: &str) {
+    if let Some((manifest, scope)) = get_server(paths, id) {
+        if needs_system_elevation(scope, manifest.transports.as_deref(), is_elevated()) {
+            re_exec_with_pkexec();
+        }
+    }
+}
 
 /// Call a tool on an installed MCP server.
 pub async fn call_tool(
@@ -270,6 +299,39 @@ pub fn call_is_error(result: &CallToolResult) -> bool {
 mod tests {
     use super::*;
     use rmcp::model::Content;
+
+    fn stdio() -> Vec<Transport> {
+        vec![Transport::Stdio {
+            command: "srv".into(),
+            args: None,
+            description: None,
+        }]
+    }
+
+    #[test]
+    fn system_stdio_elevates_when_not_root() {
+        assert!(needs_system_elevation(Scope::System, Some(&stdio()), false));
+    }
+
+    #[test]
+    fn already_root_does_not_re_elevate() {
+        // Guards against a pkexec re-exec loop: once elevated, never again.
+        assert!(!needs_system_elevation(Scope::System, Some(&stdio()), true));
+    }
+
+    #[test]
+    fn user_scope_never_elevates() {
+        assert!(!needs_system_elevation(Scope::User, Some(&stdio()), false));
+    }
+
+    #[test]
+    fn remote_system_server_does_not_elevate() {
+        let sse = vec![Transport::Sse {
+            url: "http://example".into(),
+            description: None,
+        }];
+        assert!(!needs_system_elevation(Scope::System, Some(&sse), false));
+    }
 
     #[test]
     fn success_result_is_plain_output_with_no_error_status() {

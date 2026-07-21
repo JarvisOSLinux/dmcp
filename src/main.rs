@@ -694,6 +694,9 @@ fn main() {
             }
         }
         Commands::Call { id, tool, args } => {
+            // A system-scoped stdio server's tools must run as root; re-exec via
+            // pkexec/polkit before any work, mirroring `dmcp run` (#33).
+            call::elevate_call_for_system_scope(&paths, &id);
             let args_val = args.as_deref().and_then(|s| serde_json::from_str(s).ok());
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
