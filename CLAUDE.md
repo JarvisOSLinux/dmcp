@@ -36,7 +36,7 @@ manage MCP servers through the MCP protocol.
 
 ```
 src/
-├── main.rs           CLI entry point (~1100 lines, all subcommands)
+├── main.rs           CLI entry point (all subcommands)
 ├── lib.rs            Library root
 ├── paths.rs          XDG-compliant path resolution (user/system scopes)
 ├── discovery.rs      List servers, fetch manifests, load indices
@@ -44,6 +44,7 @@ src/
 ├── browse.rs         Fetch registries, search by keyword
 ├── install.rs        Install/uninstall from registries or URLs
 ├── connect.rs        Add remote servers (manifest URL or raw endpoint)
+├── doc_comments.rs   Extract @mcp.tool docstrings from Python servers (description fallback for the search index)
 ├── config.rs         Per-server config get/set
 ├── run.rs            Spawn stdio servers, print SSE/WS URLs
 ├── setup.rs          Execute setup scripts
@@ -53,14 +54,19 @@ src/
 ├── sync_index.rs     Sync local indices with installed servers
 ├── vector_index.rs   Semantic search with embeddings
 ├── models.rs         Core data structures (Index, Manifest, Transport)
-├── elevation.rs      pkexec wrapper for system-scope operations
+├── elevation.rs      Privilege elevation for system scope (Linux: pkexec/polkit; macOS: sudo/osascript)
 └── transport.rs      Transport extraction from manifests
 ```
 
 ### Dual-Scope Design
 
 - **User scope**: `~/.local/share/mcp/`, `~/.config/mcp/` — no root required
-- **System scope**: `/usr/share/mcp/`, `/etc/mcp/` — root via pkexec
+- **System scope**: `/usr/share/mcp/`, `/etc/mcp/` — root via pkexec (Linux)
+
+All paths are env-var-overridable before the XDG defaults apply
+(`MCP_USER_SOURCES_PATH`, `MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`,
+`MCP_SYSTEM_INSTALL_DIR`, `MCP_VECTOR_INDEX_DIR`), loaded from `.env` via
+dotenvy.
 
 ### Server Types
 
@@ -87,6 +93,8 @@ dmcp run <id>                      # Run a server
 dmcp tools <id>                    # List tools on a server
 dmcp call <id> <tool> --args '{}'  # Call a tool
 dmcp serve                         # Run dmcp as MCP server
+dmcp sync-index                    # Cache registry embeddings locally
+dmcp browse --vector '[...]'       # Semantic search against the local index
 ```
 
 ## Specs & Docs
@@ -100,3 +108,7 @@ dmcp serve                         # Run dmcp as MCP server
 - `cargo fmt` + `cargo clippy` clean before pushing
 - Commit messages: imperative mood
 - No comments explaining what code does; only non-obvious WHY
+
+## Changelog — corrected claims
+
+*2026-07-22:* `doc_comments.rs` added to the tree; elevation described per-OS; env-var path overrides documented; semantic-search commands added to Key Commands; stale line count dropped.

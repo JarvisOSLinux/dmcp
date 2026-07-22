@@ -1,8 +1,8 @@
 # MCP System Integration Spec
 
-This document specifies the layout, formats, and expected behavior of a system-level MCP (Model Context Protocol) server manager. It is intended as a reference for implementing a standalone package (e.g. `dmcp`, `libmcp`, or `mcp-manager`) that discovers, manages, and invokes MCP servers installed on the system.
+This document specifies the layout, formats, and expected behavior of a system-level MCP (Model Context Protocol) server manager.
 
-**Status:** Specification only. Implementation is separate.
+**Status:** Implemented by dmcp (this repo, `src/`). This document specifies the on-disk layout and formats that dmcp implements.
 
 ---
 
@@ -20,6 +20,16 @@ A system package should provide:
 3. **Config resolution** — Read and merge config from manifests
 4. **Path abstraction** — Single API for user vs system scope and precedence
 
+System-scope operations (install, remove, and spawning system-scoped stdio
+servers — including `dmcp call`) require elevation; on Linux dmcp re-executes
+itself via pkexec under the polkit action `org.jarvisos.dmcp.run-system-server`
+(see `policy/org.jarvisos.dmcp.policy`), on macOS via sudo/osascript.
+
+**Beyond this spec**, the implementation also provides tool invocation
+(`dmcp tools` / `dmcp call`), MCP-server mode (`dmcp serve`), remote connect
+(`dmcp connect`), and semantic vector search (`dmcp sync-index`,
+`dmcp browse --vector`) — see `MCP-REGISTRY-GUIDE.md` and `docs/LLM-INTEGRATION.md`.
+
 ---
 
 ## 2. Paths (XDG Conventions)
@@ -33,7 +43,7 @@ All paths follow XDG Base Directory Specification where applicable.
 | User | `$XDG_CONFIG_HOME/mcp/sources.list` | Default: `~/.config/mcp/sources.list` |
 | System | `/etc/mcp/sources.list` | Admin-managed |
 
-**Priority:** User sources are read first, then system. Both are merged; duplicates are deduplicated (user wins).
+**Priority:** User sources are listed first, then system. Entries are **not** deduplicated across scopes; the same registry URL in both scopes is fetched from both, and server entries may appear multiple times in browse output.
 
 ### 2.2 Installed Servers (Data)
 
@@ -46,13 +56,18 @@ Default for `$XDG_DATA_HOME`: `~/.local/share`.
 
 **Load order:** User index first, then system. If the same `id` appears in both, implementation may choose user over system (user override).
 
-### 2.3 Registry Cache (Optional)
+### 2.3 Vector Index (Semantic Search)
 
 | Path | Purpose |
 |------|---------|
-| `$XDG_CACHE_HOME/discover/mcp-registries/` | Cached registry JSON files (Discover-specific) |
+| `$XDG_DATA_HOME/mcp/vector_index/index.json` | Cached registry embeddings for `dmcp browse --vector` (populated by `dmcp sync-index`) |
 
-A generic MCP manager may use `$XDG_CACHE_HOME/mcp/registries/` or similar.
+Registries themselves are fetched live on each browse/install — there is no
+registry JSON cache.
+
+**Env overrides:** all paths are overridable via `MCP_USER_SOURCES_PATH`,
+`MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`, `MCP_SYSTEM_INSTALL_DIR`,
+and `MCP_VECTOR_INDEX_DIR` (loaded from `.env` via dotenvy).
 
 ---
 
@@ -86,17 +101,21 @@ A registry is a JSON file fetched from a URL. Structure:
 
 | Field | Type | Description |
 |-------|------|--------------|
-| `version` | string | Format version (use `"1.0"`) |
-| `updated` | string | ISO 8601 timestamp |
-| `servers` | array | Array of server entry objects |
+| `version` | string | Format version (use `"1.0"`; not validated) |
+| `updated` | string | ISO 8601 timestamp (not validated) |
+| `servers` | array or object | Array of server entries, **or** an id-keyed object map (the JARVIS mcp-registry uses the map form) |
 
 ### 4.1 Server Entry (Registry)
 
 Each server object in `servers`:
 
-**Required:** `id`, `name`, `summary`, `version`, `transports`, `source` (for stdio)
+**Required:** `id`, `name`, `summary`, `version`, and either inline `transports` + `source` (for stdio) **or** a `manifest` URL pointing to the server's `manifest.json` (the form the JARVIS mcp-registry uses — transports/source are then fetched from the manifest).
 
-**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`
+**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`)
+
+**Integrity:** at install, dmcp verifies the fetched manifest's raw bytes
+against `integrity.manifestSha256` (hard failure on mismatch) and setup
+scripts against `setupScriptSha256` before running them.
 
 **Icon:** Freedesktop icon name (e.g. `"utilities-terminal"`) or URL to image (e.g. `https://example.com/logo.png`).
 
@@ -118,13 +137,13 @@ Each server object in `servers`:
 
 | Field | Type | Description |
 |-------|------|--------------|
-| `servers` | object | Map of server `id` → `{ "location": "<absolute path to manifest.json>" }` |
+| `servers` | object | Map of server `id` → `{ "location": "<absolute path to manifest.json>", "keywords": [...] }` — `keywords` optional (used for search); `manifest` is accepted as a read alias for `location` |
 
 ---
 
 ## 6. Manifest Format
 
-Each installed server has `manifest.json` in its install directory. The manifest is the full server metadata plus runtime config. MCP servers read their configuration from this file.
+Each installed server has `manifest.json` in its install directory. The manifest is the full server metadata plus runtime config. At spawn time, dmcp injects the manifest's `config` map into the server process as environment variables (key names used verbatim).
 
 Structure matches the registry server entry, plus:
 
@@ -209,10 +228,20 @@ Structure matches the registry server entry, plus:
 }
 ```
 
-- `config` holds user-provided values; optional properties get `default` if not set
-- MCP servers read `manifest.json` to get their config
+- `config` holds user-provided values (defaults are not auto-applied)
+- dmcp injects each `config` key/value into the server's environment at spawn
 
-### 6.4 Scope
+### 6.4 Setup Script
+
+Manifests may carry `setupScript` (a filename inside the server folder for
+local servers, or a URL for remote servers). dmcp records the related fields
+`setupScriptPath`, `setupScriptRunAt`, `setupScriptVersion`, and
+`setupScriptStatus` in the installed manifest. Scripts run with `sh` in the
+install directory and receive `MCP_INSTALL_DIR` plus `MCP_CONFIG_<KEY>`
+(uppercased, `-`/`.` → `_`) for each config key. Registry-referenced setup
+scripts are verified against `integrity.setupScriptSha256` before running.
+
+### 6.5 Scope
 
 - `"scope": "user"` (default) → `$XDG_DATA_HOME/mcp/installed/<id>/`
 - `"scope": "system"` → `/usr/share/mcp/installed/<id>/`
@@ -252,9 +281,8 @@ A reference implementation should provide at least:
 
 - `spawn_server(id)` — Start the stdio process for a server
   - Working directory: install dir
-  - Environment: inherit + any env vars from manifest (if specified)
+  - Environment: inherit from parent, plus each key/value in the manifest `config` object injected as an environment variable (key name used verbatim, e.g. `BRAVE_API_KEY`)
   - Command + args from primary transport
-  - Config available to server via manifest.json in cwd
 
 ### 8.3 Config
 
@@ -279,9 +307,9 @@ When spawning a stdio server:
 3. Get primary transport (first in `transports` array) with `type == "stdio"`
 4. `cwd` = `installDir` from manifest (or dir containing manifest.json)
 5. Execute `command` with `args`
-6. Server reads `manifest.json` from cwd for config
+6. Config is delivered via environment variables (the manifest `config` map, keys verbatim)
 
-Environment: Inherit from parent. Future: support `env` in manifest for overrides.
+Environment: inherit from parent, plus the injected config variables.
 
 ---
 
@@ -293,14 +321,16 @@ For robustness, an implementation may support:
 2. **Legacy index:** If `servers` is an array of full objects instead of id→location map, parse and optionally migrate
 3. **Unknown servers:** Log and optionally surface; do not silently drop
 
-See `backward_compatibility.md` in this backend for details.
-
 ---
 
 ## 11. References
 
-- **KDE Discover MCP Backend:** This repo (`libdiscover/backends/MCPBackend/`)
 - **MCP Registry Guide:** `MCP-REGISTRY-GUIDE.md` — registry format, transports, scope
-- **Backward Compatibility:** `backward_compatibility.md` — migration strategy
 - **XDG Base Directory:** https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
 - **Model Context Protocol:** https://modelcontextprotocol.io/
+
+---
+
+## Changelog — corrected claims
+
+*2026-07-22:* status corrected — this spec is implemented by dmcp (this repo); config delivery documented as env-var injection (servers do not read manifest.json); sources are not deduplicated across scopes; registry `servers` accepts array or id-keyed map, with manifest-referenced entries, `trustStatus`, and SHA-256 `integrity` verification documented; elevation (pkexec/polkit on Linux, sudo/osascript on macOS) and the vector index documented; env-var path overrides listed; index entries carry `keywords` with `manifest` as a read alias for `location`; setup-script fields documented; Discover-specific cache and `libdiscover`/`backward_compatibility.md` references removed; tool invocation / serve / connect / semantic search noted as beyond-spec capabilities.
