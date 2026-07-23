@@ -156,8 +156,8 @@ Copy the policy file to the polkit actions directory:
 sudo install -m 644 policy/org.jarvisos.dmcp.policy /usr/share/polkit-1/actions/
 ```
 
-(This repo's PKGBUILD does not install the policy file yet — install it
-manually as above, or via the jarvisos distro packaging.)  The companion JS rules
+On Arch-based systems the PKGBUILD installs the policy file automatically;
+the manual copy above is only needed for non-packaged installs.  The companion JS rules
 in `packages/polkit/org.jarvisos.jarvis.rules` can be extended to grant `YES` for
 members of the `jarvis-elevated` group, removing the password prompt for trusted
 service accounts.
@@ -192,4 +192,4 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 
 ## Changelog — corrected claims
 
-*2026-07-22:* commands table completed (count, sync-index, embedding-spec, index-server; browse vector-search flags); project tree completed (call, serve, orchestrator, sync_index, vector_index, doc_comments); status list updated to the implemented surface; elevation notes cover `dmcp call` (#33) and per-OS behavior; PKGBUILD policy-install claim corrected.
+*2026-07-22:* commands table completed (count, sync-index, embedding-spec, index-server; browse vector-search flags); project tree completed (call, serve, orchestrator, sync_index, vector_index, doc_comments); status list updated to the implemented surface; elevation notes cover `dmcp call` (#33) and per-OS behavior; PKGBUILD now installs the polkit policy file (manual copy only needed for non-packaged installs).
