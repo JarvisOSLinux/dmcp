@@ -59,7 +59,7 @@ The LLM does not need separate documentation. It learns from the tool metadata a
 |------|-------------|
 | `list_servers` | List installed MCP servers (user/system scope) |
 | `get_server_info` | Get detailed info for a server by ID |
-| `install_server` | Install a server from registry |
+| `install_server` | Install a server from a configured registry (trust-gated: `deprecated`/`removed` servers are always refused for the agent; community-tier installs are flagged as not maintainer-reviewed) |
 | `uninstall_server` | Uninstall a server |
 | `set_config` | Set a config value for a server |
 | `list_server_tools` | List tools available on an MCP server |
@@ -101,3 +101,7 @@ If `dmcp` is not in PATH, use the full path in the config:
   "args": ["serve"]
 }
 ```
+
+## Changelog — corrected claims
+
+*2026-07-22:* `install_server` description notes the agent trust gate (deprecated/removed refused, community tier flagged).
