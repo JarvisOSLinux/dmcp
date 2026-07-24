@@ -2,6 +2,7 @@
 //!
 //! Discovers, manages, and invokes MCP servers at user and system scope.
 
+pub mod broker;
 pub mod browse;
 pub mod call;
 pub mod config;

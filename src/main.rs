@@ -179,7 +179,23 @@ enum Commands {
         /// Tool arguments as JSON (e.g. '{"key":"value"}')
         #[arg(long)]
         args: Option<String>,
+
+        /// Keep the server alive across calls under this session id (stateful,
+        /// user-scope servers only). Routes the call through the broker so
+        /// in-process state (a browser, a REPL) survives between calls.
+        #[arg(long)]
+        session: Option<String>,
     },
+
+    /// Manage live server sessions (broker-backed stateful servers)
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
+    /// Run the session broker in the foreground (internal; auto-started on demand)
+    #[command(hide = true)]
+    Broker,
 
     /// Run dmcp as an MCP server (for LLM integration)
     Serve,
@@ -282,6 +298,29 @@ enum ConfigAction {
         /// Config value
         value: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List live sessions (session id, server, scope, age, idle)
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Close a session's server(s). Idempotent (exit 0 even if nothing is open).
+    Close {
+        /// Session id to close
+        session: String,
+
+        /// Close only this server within the session (default: all)
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Close sessions idle beyond the TTL now
+    Gc,
 }
 
 #[derive(Subcommand)]
@@ -825,26 +864,90 @@ fn main() {
                 }
             }
         }
-        Commands::Call { id, tool, args } => {
-            // A system-scoped stdio server's tools must run as root; re-exec via
-            // pkexec/polkit before any work, mirroring `dmcp run` (#33).
-            call::elevate_call_for_system_scope(&paths, &id);
+        Commands::Call {
+            id,
+            tool,
+            args,
+            session,
+        } => {
             let args_val = args.as_deref().and_then(|s| serde_json::from_str(s).ok());
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
-                Ok(result) => {
-                    println!("{}", call::format_call_result(&result));
-                    // Signal a tool-reported error via the exit code, out-of-band
-                    // from the output stream, so a caller (e.g. dispatch) reads
-                    // status structurally instead of sniffing the output text.
-                    if call::call_is_error(&result) {
-                        std::process::exit(2);
+            if let Some(session_id) = session {
+                // Session path: forward to the broker, which keeps the server's
+                // process alive across calls. Gated on stateful + user scope; the
+                // output shape (and exit-2-on-tool-error) matches the one-shot
+                // path so callers can't tell the difference on success.
+                match dmcp::broker::session_call(&paths, &id, &tool, args_val, &session_id) {
+                    Ok(result) => {
+                        println!("{}", result.content);
+                        if result.is_error {
+                            std::process::exit(2);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // One-shot path (unchanged): a system-scoped stdio server's tools
+                // must run as root; re-exec via pkexec/polkit before any work,
+                // mirroring `dmcp run` (#33).
+                call::elevate_call_for_system_scope(&paths, &id);
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
+                    Ok(result) => {
+                        println!("{}", call::format_call_result(&result));
+                        // Signal a tool-reported error via the exit code, out-of-band
+                        // from the output stream, so a caller (e.g. dispatch) reads
+                        // status structurally instead of sniffing the output text.
+                        if call::call_is_error(&result) {
+                            std::process::exit(2);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::Session { action } => match action {
+            SessionAction::List { json } => match dmcp::broker::session_list(&paths) {
+                Ok(sessions) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
+                    } else if sessions.is_empty() {
+                        println!("No active sessions.");
+                    } else {
+                        print_session_table(&sessions);
                     }
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
+            },
+            SessionAction::Close { session, id } => {
+                match dmcp::broker::session_close(&paths, &session, id.as_deref()) {
+                    Ok(n) => println!("Closed {} session server(s).", n),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            SessionAction::Gc => match dmcp::broker::session_gc(&paths) {
+                Ok(n) => println!("Closed {} idle session server(s).", n),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+        },
+        Commands::Broker => {
+            if let Err(e) = dmcp::broker::run_broker_foreground(&paths) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
         }
         Commands::Serve => {
@@ -1294,6 +1397,20 @@ fn print_list_table(servers: &[dmcp::ServerInfo]) {
         println!("{}Scope:     {}", INDENT, scope);
         println!("{}Manifest: {}", INDENT, s.manifest_path);
         println!();
+    }
+}
+
+fn print_session_table(sessions: &[dmcp::broker::SessionListItem]) {
+    println!(
+        "{:<16} {:<8} {:>8} {:>8} SERVER",
+        "SESSION", "SCOPE", "AGE(s)", "IDLE(s)"
+    );
+    println!("{}", "-".repeat(80));
+    for s in sessions {
+        println!(
+            "{:<16} {:<8} {:>8} {:>8} {}",
+            s.session_id, s.scope, s.age_secs, s.idle_secs, s.server_id
+        );
     }
 }
 
