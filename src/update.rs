@@ -256,10 +256,8 @@ fn local_path_from_url(url: &str) -> Option<PathBuf> {
         let path = if rest.starts_with('/') {
             rest.to_string()
         } else {
-            match rest.find('/') {
-                Some(i) => rest[i..].to_string(),
-                None => return None,
-            }
+            let i = rest.find('/')?;
+            rest[i..].to_string()
         };
         return Some(PathBuf::from(path));
     }
