@@ -54,6 +54,7 @@ cargo install --path .   # Install to ~/.cargo/bin
 | `dmcp browse [url] [--user] [--system] [-k keyword...] [--vector JSON \| --vectors JSON] [--top-k N] [--min-score F] [--json]` | Browse servers in registries (keyword filter or semantic vector search against the local index; transport fetched from manifest when registry omits it) |
 | `dmcp install <id or url> [--system] [--no-setup]` | Install from registry (by ID) or from manifest/endpoint URL |
 | `dmcp uninstall <id>` | Remove installed server |
+| `dmcp update <id> \| --all [--check] [--json]` | Refresh installed servers whose registry manifest hash has drifted (detects same-version fixes; `--check` reports without changing; `--json` requires `--check`) |
 | `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
 | `dmcp tools <id> [--json]` | List tools on a server |
 | `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |

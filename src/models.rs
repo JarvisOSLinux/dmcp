@@ -68,6 +68,12 @@ pub struct Manifest {
     /// in `config` and injects them as env vars — it does not validate against this schema.
     #[serde(default)]
     pub configurable_properties: Vec<ConfigurableProperty>,
+    /// When true, the server holds state in-process across tool calls (a browser,
+    /// a REPL, a DB connection), so a fresh process per call would lose it. Such
+    /// servers are eligible for session-scoped (`--session`) calls kept alive by
+    /// the broker. Absent or false means stateless — the default one-shot path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stateful: Option<bool>,
 }
 
 /// One user-facing configuration field declared by a server manifest.

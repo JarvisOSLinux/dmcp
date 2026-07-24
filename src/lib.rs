@@ -2,6 +2,7 @@
 //!
 //! Discovers, manages, and invokes MCP servers at user and system scope.
 
+pub mod broker;
 pub mod browse;
 pub mod call;
 pub mod config;
@@ -19,6 +20,7 @@ pub mod setup;
 pub mod sources;
 pub mod sync_index;
 pub mod transport;
+pub mod update;
 pub mod vector_index;
 
 pub use browse::{
@@ -37,4 +39,5 @@ pub use run::run;
 pub use setup::run_setup;
 pub use sources::{add_source, list_sources, remove_source, SourceScope, SourcesError};
 pub use sync_index::{sync_index, SyncResult};
+pub use update::{assess_servers, refresh_install, AssessedServer, DriftReport, UpdateError};
 pub use vector_index::{EmbeddingSpec, SearchResult, VectorEntry, VectorIndex};

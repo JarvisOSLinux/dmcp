@@ -29,6 +29,15 @@ pub struct RegistryServer {
     /// Search keywords for discovery.
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// For an installed server, whether the local copy has drifted from this
+    /// entry's manifest hash. `None` when not installed or the entry records no
+    /// integrity hash; populated by the browse command, not the fetch itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_available: Option<bool>,
+    /// Registry-recorded manifest hash, used to compute `update_available`.
+    /// Internal to the browse command; never serialized.
+    #[serde(skip)]
+    pub registry_manifest_sha256: Option<String>,
 }
 
 /// Fetch and list servers from a specific registry URL.
@@ -177,6 +186,13 @@ fn fetch_registry(
             })
             .unwrap_or_default();
 
+        let registry_manifest_sha256 = server
+            .get("integrity")
+            .and_then(|i| i.get("manifestSha256"))
+            .and_then(|h| h.as_str())
+            .filter(|h| !h.is_empty())
+            .map(String::from);
+
         result.push(RegistryServer {
             id,
             name,
@@ -186,6 +202,8 @@ fn fetch_registry(
             source: url.to_string(),
             installed: false,
             keywords,
+            update_available: None,
+            registry_manifest_sha256,
         });
     }
 

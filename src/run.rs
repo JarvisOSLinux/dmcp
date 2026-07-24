@@ -19,10 +19,9 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::discovery::{get_manifest_path, get_server, Scope};
+use crate::discovery::{get_server, Scope};
 use crate::elevation::{is_elevated, re_exec_with_pkexec};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
@@ -101,13 +100,7 @@ fn run_stdio(
     command: &str,
     args: Option<&[String]>,
 ) -> Result<(), RunError> {
-    let install_dir = manifest
-        .install_dir
-        .as_deref()
-        .map(Path::new)
-        .filter(|p| p.is_absolute())
-        .map(|p| p.to_path_buf())
-        .or_else(|| get_manifest_path(paths, id).and_then(|p| p.parent().map(|p| p.to_path_buf())))
+    let install_dir = crate::call::resolve_stdio_install_dir(paths, manifest, id)
         .ok_or(RunError::NoStdioTransport)?;
 
     let env = config_to_env(&manifest.config);

@@ -85,6 +85,29 @@ enum Commands {
         id: String,
     },
 
+    /// Update installed servers whose registry manifest has drifted
+    ///
+    /// Drift is detected by manifest hash, not version: a same-version fix or a
+    /// security republish still changes the hash. Updating re-runs the install
+    /// flow (overwrite, hash-verify, re-clone, re-run setup) under the same
+    /// trust gates as install.
+    Update {
+        /// Server ID to update (omit and pass --all to update every server)
+        id: Option<String>,
+
+        /// Update all installed servers that have drifted
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+
+        /// Report drift without changing anything
+        #[arg(long)]
+        check: bool,
+
+        /// Output the drift report as JSON (requires --check)
+        #[arg(long, requires = "check")]
+        json: bool,
+    },
+
     /// Run an MCP server (stdio: spawn and relay; SSE/WebSocket: print connection URL)
     Run {
         /// Server ID to run
@@ -156,7 +179,23 @@ enum Commands {
         /// Tool arguments as JSON (e.g. '{"key":"value"}')
         #[arg(long)]
         args: Option<String>,
+
+        /// Keep the server alive across calls under this session id (stateful,
+        /// user-scope servers only). Routes the call through the broker so
+        /// in-process state (a browser, a REPL) survives between calls.
+        #[arg(long)]
+        session: Option<String>,
     },
+
+    /// Manage live server sessions (broker-backed stateful servers)
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
+    /// Run the session broker in the foreground (internal; auto-started on demand)
+    #[command(hide = true)]
+    Broker,
 
     /// Run dmcp as an MCP server (for LLM integration)
     Serve,
@@ -259,6 +298,29 @@ enum ConfigAction {
         /// Config value
         value: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List live sessions (session id, server, scope, age, idle)
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Close a session's server(s). Idempotent (exit 0 even if nothing is open).
+    Close {
+        /// Session id to close
+        session: String,
+
+        /// Close only this server within the session (default: all)
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Close sessions idle beyond the TTL now
+    Gc,
 }
 
 #[derive(Subcommand)]
@@ -567,6 +629,115 @@ fn main() {
                 }
             }
         }
+        Commands::Update {
+            id,
+            all,
+            check,
+            json,
+        } => {
+            if !all && id.is_none() {
+                eprintln!("Error: specify a server id or --all");
+                std::process::exit(1);
+            }
+
+            let ids: Vec<String> = if all {
+                list_servers(&paths, true, true, false)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect()
+            } else {
+                vec![id.clone().unwrap()]
+            };
+
+            if ids.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No MCP servers installed.");
+                }
+                return;
+            }
+
+            let assessed = match dmcp::update::assess_servers(&paths, &ids) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if check {
+                if json {
+                    let reports: Vec<&dmcp::update::DriftReport> =
+                        assessed.iter().map(|a| &a.report).collect();
+                    println!("{}", serde_json::to_string_pretty(&reports).unwrap());
+                } else {
+                    print_drift_check(&assessed);
+                }
+                return;
+            }
+
+            // Apply mode.
+            let mut had_error = false;
+            for a in &assessed {
+                let id = &a.report.id;
+                if !a.in_registry {
+                    println!(
+                        "{}: not found in any registry; local copy left unchanged",
+                        id
+                    );
+                    continue;
+                }
+                if a.revoked {
+                    // A removed server is a security revocation: never refresh.
+                    // Match the install gate's UX (advise, don't act silently).
+                    println!(
+                        "{}: REVOKED upstream (removed from registry); not refreshed",
+                        id
+                    );
+                    println!("  run `dmcp uninstall {}` to remove it", id);
+                    continue;
+                }
+                if !a.report.update_available {
+                    println!("{}: up to date", id);
+                    continue;
+                }
+
+                match dmcp::update::trust_gate_for_update(&a.report.trust_status) {
+                    Ok(Some(msg)) => eprintln!("[warn] {}", msg),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Error: refusing to update {}: {}", id, e);
+                        had_error = true;
+                        continue;
+                    }
+                }
+
+                if a.scope == dmcp::discovery::Scope::System && !is_elevated() {
+                    if all {
+                        // Re-execing the whole batch as root would rewrite
+                        // user-scope trees with root ownership; skip and advise.
+                        eprintln!(
+                            "[warn] {}: system-scope update needs elevation; run `dmcp update {}`",
+                            id, id
+                        );
+                        continue;
+                    }
+                    re_exec_with_pkexec();
+                }
+
+                match dmcp::update::refresh_install(&paths, id, a.scope) {
+                    Ok(()) => println!("{}: updated", id),
+                    Err(e) => {
+                        eprintln!("Error updating {}: {}", id, e);
+                        had_error = true;
+                    }
+                }
+            }
+            if had_error {
+                std::process::exit(1);
+            }
+        }
         Commands::Connect {
             url,
             id,
@@ -693,26 +864,90 @@ fn main() {
                 }
             }
         }
-        Commands::Call { id, tool, args } => {
-            // A system-scoped stdio server's tools must run as root; re-exec via
-            // pkexec/polkit before any work, mirroring `dmcp run` (#33).
-            call::elevate_call_for_system_scope(&paths, &id);
+        Commands::Call {
+            id,
+            tool,
+            args,
+            session,
+        } => {
             let args_val = args.as_deref().and_then(|s| serde_json::from_str(s).ok());
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
-                Ok(result) => {
-                    println!("{}", call::format_call_result(&result));
-                    // Signal a tool-reported error via the exit code, out-of-band
-                    // from the output stream, so a caller (e.g. dispatch) reads
-                    // status structurally instead of sniffing the output text.
-                    if call::call_is_error(&result) {
-                        std::process::exit(2);
+            if let Some(session_id) = session {
+                // Session path: forward to the broker, which keeps the server's
+                // process alive across calls. Gated on stateful + user scope; the
+                // output shape (and exit-2-on-tool-error) matches the one-shot
+                // path so callers can't tell the difference on success.
+                match dmcp::broker::session_call(&paths, &id, &tool, args_val, &session_id) {
+                    Ok(result) => {
+                        println!("{}", result.content);
+                        if result.is_error {
+                            std::process::exit(2);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // One-shot path (unchanged): a system-scoped stdio server's tools
+                // must run as root; re-exec via pkexec/polkit before any work,
+                // mirroring `dmcp run` (#33).
+                call::elevate_call_for_system_scope(&paths, &id);
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
+                    Ok(result) => {
+                        println!("{}", call::format_call_result(&result));
+                        // Signal a tool-reported error via the exit code, out-of-band
+                        // from the output stream, so a caller (e.g. dispatch) reads
+                        // status structurally instead of sniffing the output text.
+                        if call::call_is_error(&result) {
+                            std::process::exit(2);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::Session { action } => match action {
+            SessionAction::List { json } => match dmcp::broker::session_list(&paths) {
+                Ok(sessions) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
+                    } else if sessions.is_empty() {
+                        println!("No active sessions.");
+                    } else {
+                        print_session_table(&sessions);
                     }
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
+            },
+            SessionAction::Close { session, id } => {
+                match dmcp::broker::session_close(&paths, &session, id.as_deref()) {
+                    Ok(n) => println!("Closed {} session server(s).", n),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            SessionAction::Gc => match dmcp::broker::session_gc(&paths) {
+                Ok(n) => println!("Closed {} idle session server(s).", n),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+        },
+        Commands::Broker => {
+            if let Err(e) = dmcp::broker::run_broker_foreground(&paths) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
         }
         Commands::Serve => {
@@ -826,14 +1061,30 @@ fn main() {
             } else {
                 (user || !system, system || !user)
             };
+            let installed = list_servers(&paths, include_user, include_system, false);
+            let installed_hashes: std::collections::HashMap<String, Option<String>> = installed
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        dmcp::update::read_installed_hash(std::path::Path::new(&s.manifest_path)),
+                    )
+                })
+                .collect();
             let installed_ids: std::collections::HashSet<String> =
-                list_servers(&paths, include_user, include_system, false)
-                    .into_iter()
-                    .map(|s| s.id)
-                    .collect();
+                installed.into_iter().map(|s| s.id).collect();
 
             for s in &mut servers {
                 s.installed = installed_ids.contains(&s.id);
+                // Flag drift only for installed servers whose registry entry
+                // records a manifest hash to compare against.
+                if s.installed {
+                    if let Some(reg) = s.registry_manifest_sha256.clone() {
+                        let inst = installed_hashes.get(&s.id).cloned().flatten();
+                        s.update_available =
+                            Some(dmcp::update::is_drifted(inst.as_deref(), Some(&reg)));
+                    }
+                }
             }
             servers = filter_servers_by_keywords(servers, &keyword);
             servers.sort_by(|a, b| match (a.installed, b.installed) {
@@ -1149,6 +1400,20 @@ fn print_list_table(servers: &[dmcp::ServerInfo]) {
     }
 }
 
+fn print_session_table(sessions: &[dmcp::broker::SessionListItem]) {
+    println!(
+        "{:<16} {:<8} {:>8} {:>8} SERVER",
+        "SESSION", "SCOPE", "AGE(s)", "IDLE(s)"
+    );
+    println!("{}", "-".repeat(80));
+    for s in sessions {
+        println!(
+            "{:<16} {:<8} {:>8} {:>8} {}",
+            s.session_id, s.scope, s.age_secs, s.idle_secs, s.server_id
+        );
+    }
+}
+
 fn print_vector_results(results: &[dmcp::SearchResult]) {
     const INDENT: &str = "        ";
     for r in results {
@@ -1183,12 +1448,48 @@ fn print_vector_results(results: &[dmcp::SearchResult]) {
     }
 }
 
+fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
+    let mut actionable = false;
+    for a in assessed {
+        let id = &a.report.id;
+        if !a.in_registry {
+            println!("{}: not in registry", id);
+        } else if a.revoked {
+            println!(
+                "{}: REVOKED (removed from registry) — uninstall advised",
+                id
+            );
+            actionable = true;
+        } else if a.report.update_available {
+            println!("{}: update available", id);
+            println!(
+                "        installed: {}",
+                a.report.installed_hash.as_deref().unwrap_or("(none)")
+            );
+            println!(
+                "        registry:  {}",
+                a.report.registry_hash.as_deref().unwrap_or("(none)")
+            );
+            actionable = true;
+        } else {
+            println!("{}: up to date", id);
+        }
+    }
+    if !actionable {
+        println!("All installed servers are up to date.");
+    }
+}
+
 fn print_browse_table(servers: &[dmcp::RegistryServer]) {
     const INDENT: &str = "        ";
 
     for s in servers {
         let status = if s.installed {
-            "INSTALLED"
+            if s.update_available == Some(true) {
+                "INSTALLED (update available)"
+            } else {
+                "INSTALLED"
+            }
         } else {
             "NOT INSTALLED"
         };
