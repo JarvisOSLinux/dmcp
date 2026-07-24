@@ -305,7 +305,9 @@ pub fn session_call(
 pub fn session_list(_paths: &Paths) -> Result<Vec<SessionListItem>, SessionError> {
     #[cfg(unix)]
     {
-        let sock = broker_socket_path();
+        let dir = broker_dir();
+        verify_existing_broker_dir(&dir)?;
+        let sock = dir.join("broker.sock");
         if !ping(&sock) {
             return Ok(Vec::new());
         }
@@ -327,7 +329,9 @@ pub fn session_close(
 ) -> Result<usize, SessionError> {
     #[cfg(unix)]
     {
-        let sock = broker_socket_path();
+        let dir = broker_dir();
+        verify_existing_broker_dir(&dir)?;
+        let sock = dir.join("broker.sock");
         if !ping(&sock) {
             return Ok(0);
         }
@@ -351,7 +355,9 @@ pub fn session_close(
 pub fn session_gc(_paths: &Paths) -> Result<usize, SessionError> {
     #[cfg(unix)]
     {
-        let sock = broker_socket_path();
+        let dir = broker_dir();
+        verify_existing_broker_dir(&dir)?;
+        let sock = dir.join("broker.sock");
         if !ping(&sock) {
             return Ok(0);
         }
@@ -438,12 +444,64 @@ fn ensure_broker_dir(dir: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Verify a *pre-existing* broker dir is safe to trust before connecting to a
+/// socket inside it, WITHOUT creating anything. It must be owned by the current
+/// uid and not accessible to group/other (mode 0700). A missing dir is not an
+/// error — the caller decides whether to create it (spawn path) or treat it as
+/// "no broker" (list/close/gc).
+///
+/// `ensure_broker_dir` runs this check only on the spawn path, so a *live*
+/// socket answering ping would otherwise be trusted with no ownership check
+/// (`ensure_broker_running` returns early on a good ping). In the `/tmp`
+/// fallback (`XDG_RUNTIME_DIR` unset) that lets a co-resident attacker plant a
+/// socket we'd hand our tool args — possibly secrets — and read a forged reply
+/// from. Refusing a foreign-owned or world-accessible dir before any connect
+/// closes that hijack window: a uid we don't own cannot create the socket
+/// inside a 0700 dir we do own.
+#[cfg(unix)]
+fn verify_existing_broker_dir(dir: &Path) -> Result<(), SessionError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = match std::fs::metadata(dir) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if !meta.is_dir() {
+        return Err(SessionError::Socket(format!(
+            "{} exists but is not a directory",
+            dir.display()
+        )));
+    }
+    let uid = current_uid();
+    if meta.uid() != uid {
+        return Err(SessionError::Socket(format!(
+            "refusing to use {}: owned by uid {}, not {}",
+            dir.display(),
+            meta.uid(),
+            uid
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(SessionError::Socket(format!(
+            "refusing to use {}: mode {:o} allows group/other access (expected 0700)",
+            dir.display(),
+            mode
+        )));
+    }
+    Ok(())
+}
+
 /// Ensure a broker is live: probe, and if absent auto-start `<self> broker`
 /// detached, then poll for readiness up to 5s.
 #[cfg(unix)]
 fn ensure_broker_running(dir: &Path, sock: &Path) -> Result<(), SessionError> {
     use std::time::{Duration, Instant};
 
+    // Verify ownership/mode BEFORE trusting a pre-existing live socket: the
+    // fast-path `ping` connects and forwards our request, so an attacker-owned
+    // socket must be rejected here, not only when we spawn (contract §4).
+    verify_existing_broker_dir(dir)?;
     if ping(sock) {
         return Ok(());
     }
@@ -520,7 +578,7 @@ mod server {
     use std::time::{Duration, Instant};
 
     use rmcp::model::CallToolRequestParams;
-    use rmcp::service::RunningService;
+    use rmcp::service::{RunningService, ServiceError};
     use rmcp::transport::TokioChildProcess;
     use rmcp::{RoleClient, ServiceExt};
     use tokio::sync::Mutex as AsyncMutex;
@@ -574,6 +632,33 @@ mod server {
         Duration::from_secs(secs)
     }
 
+    /// Bound on spawn + `initialize`. A stateful server that blocks before
+    /// completing the MCP handshake (downloading a browser on first run,
+    /// waiting on a missing credential, reading stdin) would otherwise wedge
+    /// the per-session lock forever, leak its child, and block broker
+    /// idle-exit. On expiry the serve future is dropped, and rmcp's
+    /// `ChildWithCleanup` kills the spawned child.
+    fn spawn_timeout_from_env() -> Duration {
+        let secs = std::env::var("DMCP_SESSION_SPAWN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(30);
+        Duration::from_secs(secs)
+    }
+
+    /// Optional bound on a single in-session tool call. Disabled by default
+    /// (`0`/unset) so a legitimately long-running tool call is never severed;
+    /// operators who want a mid-session hang to be reaped rather than wedge the
+    /// slot can set it.
+    fn call_timeout_from_env() -> Option<Duration> {
+        std::env::var("DMCP_SESSION_CALL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs)
+    }
+
     impl Broker {
         fn get_or_create(&self, key: &Key) -> Entry {
             let mut map = self.sessions.lock().unwrap();
@@ -624,8 +709,14 @@ mod server {
         /// Spawn + initialize a fresh rmcp client for `id`, reusing the one-shot
         /// path's manifest→transport / install-dir / env resolution.
         async fn spawn_client(&self, id: &str) -> Result<Client, String> {
-            let (manifest, _scope) =
+            let (manifest, scope) =
                 get_server(&self.paths, id).ok_or_else(|| format!("Server not found: {}", id))?;
+            // Re-enforce the CLI gate at the socket trust boundary: the broker
+            // must independently guarantee the contract §4 "stateful +
+            // user-scope only" invariant, not merely trust that the thin client
+            // already checked. A raw request over the socket for a stateless or
+            // system-scope id must be refused here, never spawned.
+            session_gate(scope, manifest.stateful)?;
             let transports = manifest
                 .transports
                 .as_deref()
@@ -650,8 +741,23 @@ mod server {
                 args.as_deref(),
             )
             .map_err(|e| e.to_string())?;
+            // `TokioChildProcess::new` spawns the child immediately; `serve`
+            // then blocks on the MCP `initialize` handshake. Bound that await:
+            // on timeout the serve future (owning `transport`) is dropped, and
+            // rmcp's `ChildWithCleanup` Drop kills the just-spawned child so it
+            // cannot leak.
             let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
-            let client = ().serve(transport).await.map_err(|e| e.to_string())?;
+            let spawn_timeout = spawn_timeout_from_env();
+            let client = match tokio::time::timeout(spawn_timeout, ().serve(transport)).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(_) => {
+                    return Err(format!(
+                        "server did not initialize within {}s",
+                        spawn_timeout.as_secs()
+                    ))
+                }
+            };
             Ok(client)
         }
 
@@ -695,35 +801,69 @@ mod server {
                     .clone()
                     .and_then(|v| v.as_object().cloned())
                     .unwrap_or_default();
-                let result = {
+                // Outer `Err` = the call exceeded the optional per-call timeout
+                // (unresponsive child); inner `Ok(Err)` = the call completed but
+                // the server returned an error — which must be classified, not
+                // blanket-treated as session loss.
+                let call_result = {
                     let client = slot.client.as_ref().unwrap();
-                    client
-                        .call_tool(CallToolRequestParams {
-                            meta: None,
-                            name: tool.clone().into(),
-                            arguments: if args_obj.is_empty() {
-                                None
-                            } else {
-                                Some(args_obj)
-                            },
-                            task: None,
-                        })
-                        .await
+                    let fut = client.call_tool(CallToolRequestParams {
+                        meta: None,
+                        name: tool.clone().into(),
+                        arguments: if args_obj.is_empty() {
+                            None
+                        } else {
+                            Some(args_obj)
+                        },
+                        task: None,
+                    });
+                    match call_timeout_from_env() {
+                        Some(t) => tokio::time::timeout(t, fut).await,
+                        None => Ok(fut.await),
+                    }
                 };
 
-                return match result {
-                    Ok(res) => {
+                return match call_result {
+                    Ok(Ok(res)) => {
                         slot.last_used = Instant::now();
                         BrokerResponse::call_ok(
                             crate::call::format_call_result(&res),
                             crate::call::call_is_error(&res),
                         )
                     }
-                    Err(e) => {
-                        // A transport/protocol failure on an established session
-                        // means the child is gone. Evict and report the loss —
-                        // never an empty success the caller would mistake for a
-                        // real page.
+                    Ok(Err(e)) => match &e {
+                        // A JSON-RPC error returned by a still-live child (an
+                        // unknown tool, invalid params, method-not-found) is a
+                        // recoverable request failure, not session loss: the
+                        // child is healthy and its in-process state intact. Keep
+                        // the session alive and surface the error exactly as the
+                        // one-shot path does (a tool-call failure, nonzero exit)
+                        // — never "session lost", which would wrongly tear the
+                        // live child down and reset it to `about:blank` (#36).
+                        ServiceError::McpError(_) => {
+                            slot.last_used = Instant::now();
+                            BrokerResponse::err(format!("tool call failed: {}", e))
+                        }
+                        // Genuine transport/connection loss: the child is gone.
+                        // `ServiceError` is `#[non_exhaustive]`, so any
+                        // unclassified failure lands here too — default to the
+                        // conservative evict-and-report path so a real loss can
+                        // never masquerade as an empty success (contract §4).
+                        _ => {
+                            if let Some(c) = slot.client.take() {
+                                let _ = c.cancel().await;
+                            }
+                            slot.removed = true;
+                            drop(slot);
+                            self.remove_entry(&key, &entry);
+                            self.update_empty();
+                            BrokerResponse::err(format!("session lost: {}", e))
+                        }
+                    },
+                    Err(_elapsed) => {
+                        // The call exceeded DMCP_SESSION_CALL_TIMEOUT_SECS: the
+                        // child is unresponsive. Evict it rather than let the
+                        // per-session lock wedge indefinitely.
                         if let Some(c) = slot.client.take() {
                             let _ = c.cancel().await;
                         }
@@ -731,7 +871,7 @@ mod server {
                         drop(slot);
                         self.remove_entry(&key, &entry);
                         self.update_empty();
-                        BrokerResponse::err(format!("session lost: {}", e))
+                        BrokerResponse::err("session lost: tool call timed out".to_string())
                     }
                 };
             }
@@ -946,8 +1086,15 @@ mod server {
                     tokio::time::sleep(interval).await;
                     broker.sweep().await;
                     if broker.should_exit(idle) {
-                        broker.shutdown.notify_waiters();
-                        break;
+                        // `notify_one` stores a permit, so a `Notified` future
+                        // the accept loop recreates *after* this signal still
+                        // consumes it (unlike `notify_waiters`, which drops the
+                        // wakeup when no waiter is registered). And the sweeper
+                        // keeps looping rather than breaking: if a single wakeup
+                        // is still lost to the accept/notify race, the next tick
+                        // re-signals — so one missed wakeup can neither strand
+                        // the broker nor kill periodic TTL reaping.
+                        broker.shutdown.notify_one();
                     }
                 }
             })

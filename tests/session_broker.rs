@@ -72,6 +72,8 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 struct TestEnv {
     root: PathBuf,
     ttl_secs: Option<u64>,
+    hang_on_init: bool,
+    spawn_timeout_secs: Option<u64>,
 }
 
 impl TestEnv {
@@ -85,11 +87,25 @@ impl TestEnv {
         TestEnv {
             root,
             ttl_secs: None,
+            hang_on_init: false,
+            spawn_timeout_secs: None,
         }
     }
 
     fn with_ttl(mut self, secs: u64) -> Self {
         self.ttl_secs = Some(secs);
+        self
+    }
+
+    /// Make the fake server block forever on `initialize` (via the fixture's
+    /// `FAKE_HANG_ON_INIT` env, inherited broker → child).
+    fn with_hang_on_init(mut self) -> Self {
+        self.hang_on_init = true;
+        self
+    }
+
+    fn with_spawn_timeout(mut self, secs: u64) -> Self {
+        self.spawn_timeout_secs = Some(secs);
         self
     }
 
@@ -159,6 +175,12 @@ impl TestEnv {
                 self.ttl_secs.unwrap_or(30).to_string(),
             )
             .current_dir(&self.root);
+        if self.hang_on_init {
+            c.env("FAKE_HANG_ON_INIT", "1");
+        }
+        if let Some(secs) = self.spawn_timeout_secs {
+            c.env("DMCP_SESSION_SPAWN_TIMEOUT_SECS", secs.to_string());
+        }
         c
     }
 
@@ -174,6 +196,51 @@ impl TestEnv {
             .args(["call", id, tool])
             .output()
             .expect("run dmcp call")
+    }
+
+    /// Like `call_session`, but fails loudly if the call does not return within
+    /// `max` instead of hanging the whole test binary. Proves the broker bounds
+    /// a server that never completes `initialize`.
+    fn call_session_bounded(&self, id: &str, tool: &str, session: &str, max: Duration) -> Output {
+        let mut child = self
+            .cmd()
+            .args(["call", id, tool, "--session", session])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dmcp call --session");
+        let deadline = Instant::now() + max;
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                return child.wait_with_output().expect("collect output");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "dmcp call --session did not return within {:?}; \
+                     spawn/initialize timeout not enforced",
+                    max
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Send a raw NDJSON request straight to the broker socket, bypassing the
+    /// thin client's gate. Used to prove the broker re-enforces the gate itself.
+    fn raw_request(&self, line: &str) -> serde_json::Value {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let stream = UnixStream::connect(self.socket_path()).expect("connect broker socket");
+        let mut w = stream.try_clone().expect("clone socket");
+        w.write_all(line.as_bytes()).expect("write request");
+        w.write_all(b"\n").expect("write newline");
+        w.flush().ok();
+        let mut r = BufReader::new(stream);
+        let mut resp = String::new();
+        r.read_line(&mut resp).expect("read response");
+        serde_json::from_str(resp.trim()).expect("valid json response")
     }
 
     fn session_close(&self, session: &str) {
@@ -456,4 +523,198 @@ fn oneshot_path_is_unaffected_by_session_support() {
         !env.socket_path().exists(),
         "the one-shot path must never start the broker"
     );
+}
+
+/// Finding #1: a JSON-RPC error from a *still-live* child (an unknown tool) is a
+/// recoverable protocol error, not session loss. The session survives — stable
+/// pid, monotonic counter — and the failure is reported as a tool/protocol
+/// error, never "session lost" (which would tear a real browser down to
+/// about:blank, the exact #36 regression).
+#[test]
+fn protocol_error_keeps_session_alive() {
+    if !python3_available() {
+        eprintln!("skipping protocol_error_keeps_session_alive: python3 not found");
+        return;
+    }
+    let env = TestEnv::new();
+    env.install("com.test.fake", "user", true);
+
+    assert_eq!(
+        stdout_trimmed(&env.call_session("com.test.fake", "counter", "S1")),
+        "1"
+    );
+    let pid_before = stdout_trimmed(&env.call_session("com.test.fake", "pid", "S1"));
+
+    let bad = env.call_session("com.test.fake", "does_not_exist", "S1");
+    assert!(!bad.status.success(), "an unknown tool must fail");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(
+        !combined.contains("session lost"),
+        "a protocol error must not be reported as session loss, got: {}",
+        combined
+    );
+
+    // The child survived with its in-process state intact: same pid, and the
+    // counter continues from 1 (was not reset by a fresh spawn).
+    let pid_after = stdout_trimmed(&env.call_session("com.test.fake", "pid", "S1"));
+    assert_eq!(
+        pid_before, pid_after,
+        "the child must survive a protocol error (no fresh spawn / about:blank reset)"
+    );
+    assert_eq!(
+        stdout_trimmed(&env.call_session("com.test.fake", "counter", "S1")),
+        "2",
+        "the in-process counter must persist across a protocol error"
+    );
+
+    env.session_close("S1");
+}
+
+/// Finding #2: a server that blocks before completing `initialize` must not
+/// wedge the session forever. The broker bounds spawn+initialize, so the call
+/// returns promptly with a clear start failure instead of hanging (and rmcp's
+/// ChildWithCleanup reaps the stuck child when the timed-out serve future is
+/// dropped).
+#[test]
+fn spawn_hang_times_out_without_wedging() {
+    if !python3_available() {
+        eprintln!("skipping spawn_hang_times_out_without_wedging: python3 not found");
+        return;
+    }
+    let env = TestEnv::new().with_hang_on_init().with_spawn_timeout(2);
+    env.install("com.test.hang", "user", true);
+
+    let out = env.call_session_bounded("com.test.hang", "pid", "S1", Duration::from_secs(20));
+    assert!(
+        !out.status.success(),
+        "a server that never initializes must not report success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to start") || stderr.contains("did not initialize"),
+        "error must name a startup failure, got: {}",
+        stderr
+    );
+}
+
+/// Finding #3: the broker actually idle-exits (removes its socket) after its
+/// idle window, proving the shutdown signal reaches the accept loop. A lost
+/// wakeup would strand the broker with a live socket forever.
+#[test]
+fn broker_idle_exits_and_removes_socket() {
+    if !python3_available() {
+        eprintln!("skipping broker_idle_exits_and_removes_socket: python3 not found");
+        return;
+    }
+    let env = TestEnv::new().with_ttl(2);
+    env.install("com.test.fake", "user", true);
+
+    assert!(
+        env.call_session("com.test.fake", "pid", "S1")
+            .status
+            .success(),
+        "the establishing call should succeed"
+    );
+    assert!(
+        env.socket_path().exists(),
+        "the broker socket should exist after a call"
+    );
+
+    // TTL (2s) sweeps the idle session; the broker then idle-exits
+    // DMCP_BROKER_IDLE_EXIT_SECS (5s) after going empty.
+    assert!(
+        wait_until(Duration::from_secs(30), || !env.socket_path().exists()),
+        "the broker must idle-exit and remove its socket"
+    );
+}
+
+/// Finding #4: a broker directory that is not private to the current uid is
+/// refused before any socket inside it is trusted, closing the /tmp cross-user
+/// socket-hijack window. A test can't chown to a foreign uid, so this exercises
+/// the mode arm of the same ownership+mode check (a world/group-accessible dir).
+#[test]
+fn world_accessible_broker_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+
+    // Pre-create the broker dir group/other-accessible, as an attacker planting
+    // a socket in a shared /tmp would leave it.
+    let dir = env.root.join("run/dmcp");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    // `session list` would otherwise connect to whatever socket answers here;
+    // it must refuse the unsafe dir first.
+    let out = env.cmd().args(["session", "list"]).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "session list must refuse an unsafe broker dir"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to use") && stderr.contains("0700"),
+        "error must explain the unsafe-dir refusal, got: {}",
+        stderr
+    );
+}
+
+/// Finding #5: the broker re-enforces the stateful + user-scope gate itself, so
+/// a raw socket request for a system-scope or stateless id is refused even
+/// though it bypasses the thin client's gate — the socket is the trust boundary.
+#[test]
+fn broker_reenforces_gate_on_raw_socket_request() {
+    if !python3_available() {
+        eprintln!("skipping broker_reenforces_gate_on_raw_socket_request: python3 not found");
+        return;
+    }
+    let env = TestEnv::new();
+    env.install("com.test.fake", "user", true); // stateful user: starts the broker
+    env.install("com.test.sysfake", "system", true); // system scope
+    env.install("com.test.stateless", "user", false); // stateless user
+
+    // Start the broker with a legitimate call.
+    assert_eq!(
+        stdout_trimmed(&env.call_session("com.test.fake", "counter", "S1")),
+        "1"
+    );
+
+    // A system-scope id sent raw over the socket must be refused by the broker.
+    let sys =
+        env.raw_request(r#"{"op":"call","id":"com.test.sysfake","session":"S1","tool":"pid"}"#);
+    assert_eq!(
+        sys["ok"],
+        serde_json::json!(false),
+        "broker must refuse a system-scope session, got: {}",
+        sys
+    );
+    assert!(
+        sys["error"].as_str().unwrap_or("").contains("system-scope"),
+        "broker gate error must explain the scope restriction, got: {}",
+        sys
+    );
+
+    // A stateless id sent raw over the socket must be refused too.
+    let stateless = env
+        .raw_request(r#"{"op":"call","id":"com.test.stateless","session":"S1","tool":"counter"}"#);
+    assert_eq!(
+        stateless["ok"],
+        serde_json::json!(false),
+        "broker must refuse a stateless session, got: {}",
+        stateless
+    );
+    assert!(
+        stateless["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("stateful"),
+        "broker gate error must explain the stateful requirement, got: {}",
+        stateless
+    );
+
+    env.session_close("S1");
 }
