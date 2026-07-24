@@ -63,6 +63,7 @@ pub fn install(
     }
 
     let manifest_path = install_dir.join("manifest.json");
+    let mut setup_failure: Option<String> = None;
 
     if run_setup {
         // --- setupScript delivery from registry ---
@@ -105,9 +106,14 @@ pub fn install(
                 }
                 Err(e) => {
                     manifest["setupScriptStatus"] = serde_json::json!(format!("failed: {}", e));
+                    setup_failure = Some(e.to_string());
                 }
             }
-            // Install succeeds even if setup fails; user can retry via dmcp setup
+            // The manifest and index are still written on setup failure so the
+            // install is retryable via `dmcp setup`, but the failure is returned
+            // below: a server whose setup did not run is usually unlaunchable
+            // (missing venv, missing deps), and reporting success would hand the
+            // caller a broken install that only fails later at connect time.
         } else {
             manifest["setupScriptStatus"] = serde_json::json!(deliver_label);
         }
@@ -127,6 +133,14 @@ pub fn install(
         })
         .unwrap_or_default();
     update_index_add(paths, id, &manifest_path, scope, &keywords)?;
+
+    if let Some(detail) = setup_failure {
+        return Err(InstallError::SetupFailed(format!(
+            "{} (the server is installed but likely unlaunchable; \
+             fix the cause and re-run `dmcp setup {}`)",
+            detail, id
+        )));
+    }
 
     Ok(())
 }
@@ -785,6 +799,132 @@ fn doy_to_md(doy: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Temp tree removed on drop; keeps the install tree off the real XDG paths.
+    struct TempTree {
+        root: std::path::PathBuf,
+    }
+
+    impl TempTree {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let root = std::env::temp_dir().join(format!(
+                "dmcp-install-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            TempTree { root }
+        }
+
+        fn paths(&self) -> Paths {
+            Paths {
+                user_sources: self.root.join("user/sources.list"),
+                user_install_dir: self.root.join("user/installed"),
+                system_sources: self.root.join("system/sources.list"),
+                system_install_dir: self.root.join("system/installed"),
+                vector_index_dir: self.root.join("vector"),
+            }
+        }
+
+        /// Write an executable script and return its absolute path. `run_setup`
+        /// joins the install dir with the reference, and joining an absolute
+        /// path yields it unchanged — so the script survives the install dir
+        /// being wiped and recreated.
+        fn script(&self, name: &str, body: &str) -> String {
+            let path = self.root.join(name);
+            std::fs::write(&path, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path.to_string_lossy().to_string()
+        }
+    }
+
+    /// An sse-transport entry installs without a git clone or a registry fetch,
+    /// so the setup-script outcome is the only thing under test.
+    fn remote_server(setup_script: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "test.server",
+            "version": "1.0.0",
+            "scope": "user",
+            "transports": [{ "type": "sse", "url": "https://example.invalid/sse" }],
+            "setupScript": setup_script,
+        })
+    }
+
+    #[test]
+    fn setup_failure_is_reported_not_swallowed() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("fail.sh", "#!/bin/sh\necho boom >&2\nexit 3\n");
+
+        let err = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server(&script)),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, InstallError::SetupFailed(_)),
+            "a failing setup script must surface as an error, got {:?}",
+            err
+        );
+        assert!(err.to_string().contains("dmcp setup test.server"));
+    }
+
+    #[test]
+    fn setup_failure_still_leaves_a_retryable_install() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("fail.sh", "#!/bin/sh\nexit 1\n");
+
+        let _ = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server(&script)),
+            true,
+        );
+
+        // The manifest is deliberately kept so `dmcp setup <id>` can retry.
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(manifest["setupScriptStatus"]
+            .as_str()
+            .unwrap()
+            .starts_with("failed:"));
+    }
+
+    #[test]
+    fn successful_setup_installs_cleanly() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server(&script)),
+            true,
+        )
+        .expect("a setup script that exits 0 must install cleanly");
+
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["setupScriptStatus"], "ok");
+    }
 
     #[test]
     fn manifest_hash_matches_recorded_digest() {
