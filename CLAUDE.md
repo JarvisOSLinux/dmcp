@@ -43,6 +43,7 @@ src/
 ├── sources.rs        Registry source URL management (sources.list)
 ├── browse.rs         Fetch registries, search by keyword
 ├── install.rs        Install/uninstall from registries or URLs
+├── update.rs         Hash-drift detection + `dmcp update` (reuses the install flow + trust gates)
 ├── connect.rs        Add remote servers (manifest URL or raw endpoint)
 ├── doc_comments.rs   Extract @mcp.tool docstrings from Python servers (description fallback for the search index)
 ├── config.rs         Per-server config get/set
@@ -89,6 +90,7 @@ cargo fmt --check
 dmcp list                          # List installed servers
 dmcp browse                        # Browse registries
 dmcp install <id>                  # Install from registry
+dmcp update <id> | --all [--check] # Refresh servers whose registry manifest hash drifted
 dmcp run <id>                      # Run a server
 dmcp tools <id>                    # List tools on a server
 dmcp call <id> <tool> --args '{}'  # Call a tool
@@ -112,3 +114,5 @@ dmcp browse --vector '[...]'       # Semantic search against the local index
 ## Changelog — corrected claims
 
 *2026-07-22:* `doc_comments.rs` added to the tree; elevation described per-OS; env-var path overrides documented; semantic-search commands added to Key Commands; stale line count dropped.
+
+*2026-07-24:* `update.rs` added — hash-drift detection and the `dmcp update` subcommand (single id / `--all`, `--check`, `--json`); reuses the install flow and trust gates. `browse` now surfaces `update_available` for drifted installed servers.

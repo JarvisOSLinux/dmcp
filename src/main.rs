@@ -85,6 +85,29 @@ enum Commands {
         id: String,
     },
 
+    /// Update installed servers whose registry manifest has drifted
+    ///
+    /// Drift is detected by manifest hash, not version: a same-version fix or a
+    /// security republish still changes the hash. Updating re-runs the install
+    /// flow (overwrite, hash-verify, re-clone, re-run setup) under the same
+    /// trust gates as install.
+    Update {
+        /// Server ID to update (omit and pass --all to update every server)
+        id: Option<String>,
+
+        /// Update all installed servers that have drifted
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+
+        /// Report drift without changing anything
+        #[arg(long)]
+        check: bool,
+
+        /// Output the drift report as JSON (requires --check)
+        #[arg(long, requires = "check")]
+        json: bool,
+    },
+
     /// Run an MCP server (stdio: spawn and relay; SSE/WebSocket: print connection URL)
     Run {
         /// Server ID to run
@@ -567,6 +590,115 @@ fn main() {
                 }
             }
         }
+        Commands::Update {
+            id,
+            all,
+            check,
+            json,
+        } => {
+            if !all && id.is_none() {
+                eprintln!("Error: specify a server id or --all");
+                std::process::exit(1);
+            }
+
+            let ids: Vec<String> = if all {
+                list_servers(&paths, true, true, false)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect()
+            } else {
+                vec![id.clone().unwrap()]
+            };
+
+            if ids.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No MCP servers installed.");
+                }
+                return;
+            }
+
+            let assessed = match dmcp::update::assess_servers(&paths, &ids) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if check {
+                if json {
+                    let reports: Vec<&dmcp::update::DriftReport> =
+                        assessed.iter().map(|a| &a.report).collect();
+                    println!("{}", serde_json::to_string_pretty(&reports).unwrap());
+                } else {
+                    print_drift_check(&assessed);
+                }
+                return;
+            }
+
+            // Apply mode.
+            let mut had_error = false;
+            for a in &assessed {
+                let id = &a.report.id;
+                if !a.in_registry {
+                    println!(
+                        "{}: not found in any registry; local copy left unchanged",
+                        id
+                    );
+                    continue;
+                }
+                if a.revoked {
+                    // A removed server is a security revocation: never refresh.
+                    // Match the install gate's UX (advise, don't act silently).
+                    println!(
+                        "{}: REVOKED upstream (removed from registry); not refreshed",
+                        id
+                    );
+                    println!("  run `dmcp uninstall {}` to remove it", id);
+                    continue;
+                }
+                if !a.report.update_available {
+                    println!("{}: up to date", id);
+                    continue;
+                }
+
+                match dmcp::update::trust_gate_for_update(&a.report.trust_status) {
+                    Ok(Some(msg)) => eprintln!("[warn] {}", msg),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Error: refusing to update {}: {}", id, e);
+                        had_error = true;
+                        continue;
+                    }
+                }
+
+                if a.scope == dmcp::discovery::Scope::System && !is_elevated() {
+                    if all {
+                        // Re-execing the whole batch as root would rewrite
+                        // user-scope trees with root ownership; skip and advise.
+                        eprintln!(
+                            "[warn] {}: system-scope update needs elevation; run `dmcp update {}`",
+                            id, id
+                        );
+                        continue;
+                    }
+                    re_exec_with_pkexec();
+                }
+
+                match dmcp::update::refresh_install(&paths, id, a.scope) {
+                    Ok(()) => println!("{}: updated", id),
+                    Err(e) => {
+                        eprintln!("Error updating {}: {}", id, e);
+                        had_error = true;
+                    }
+                }
+            }
+            if had_error {
+                std::process::exit(1);
+            }
+        }
         Commands::Connect {
             url,
             id,
@@ -826,14 +958,30 @@ fn main() {
             } else {
                 (user || !system, system || !user)
             };
+            let installed = list_servers(&paths, include_user, include_system, false);
+            let installed_hashes: std::collections::HashMap<String, Option<String>> = installed
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        dmcp::update::read_installed_hash(std::path::Path::new(&s.manifest_path)),
+                    )
+                })
+                .collect();
             let installed_ids: std::collections::HashSet<String> =
-                list_servers(&paths, include_user, include_system, false)
-                    .into_iter()
-                    .map(|s| s.id)
-                    .collect();
+                installed.into_iter().map(|s| s.id).collect();
 
             for s in &mut servers {
                 s.installed = installed_ids.contains(&s.id);
+                // Flag drift only for installed servers whose registry entry
+                // records a manifest hash to compare against.
+                if s.installed {
+                    if let Some(reg) = s.registry_manifest_sha256.clone() {
+                        let inst = installed_hashes.get(&s.id).cloned().flatten();
+                        s.update_available =
+                            Some(dmcp::update::is_drifted(inst.as_deref(), Some(&reg)));
+                    }
+                }
             }
             servers = filter_servers_by_keywords(servers, &keyword);
             servers.sort_by(|a, b| match (a.installed, b.installed) {
@@ -1183,12 +1331,48 @@ fn print_vector_results(results: &[dmcp::SearchResult]) {
     }
 }
 
+fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
+    let mut actionable = false;
+    for a in assessed {
+        let id = &a.report.id;
+        if !a.in_registry {
+            println!("{}: not in registry", id);
+        } else if a.revoked {
+            println!(
+                "{}: REVOKED (removed from registry) — uninstall advised",
+                id
+            );
+            actionable = true;
+        } else if a.report.update_available {
+            println!("{}: update available", id);
+            println!(
+                "        installed: {}",
+                a.report.installed_hash.as_deref().unwrap_or("(none)")
+            );
+            println!(
+                "        registry:  {}",
+                a.report.registry_hash.as_deref().unwrap_or("(none)")
+            );
+            actionable = true;
+        } else {
+            println!("{}: up to date", id);
+        }
+    }
+    if !actionable {
+        println!("All installed servers are up to date.");
+    }
+}
+
 fn print_browse_table(servers: &[dmcp::RegistryServer]) {
     const INDENT: &str = "        ";
 
     for s in servers {
         let status = if s.installed {
-            "INSTALLED"
+            if s.update_available == Some(true) {
+                "INSTALLED (update available)"
+            } else {
+                "INSTALLED"
+            }
         } else {
             "NOT INSTALLED"
         };
