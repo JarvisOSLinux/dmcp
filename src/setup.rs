@@ -2,10 +2,21 @@
 //!
 //! Setup scripts can install dependencies, configure the environment, or (for remote servers)
 //! prepare connection info. They run with MCP_CONFIG_* and MCP_INSTALL_DIR in the environment.
+//!
+//! A server that installs on more than one platform needs more than one setup
+//! script: `setupScript` is the POSIX one, `setupScriptWindows` (`setup.ps1`)
+//! the Windows one, and the host decides which runs.
+//!
+//! On Unix the interpreter is `sh` — except when the script's shebang asks for
+//! bash. `/bin/sh` is dash on Debian and Ubuntu, and dash has no `pipefail`, no
+//! arrays and no `[[ ]]`; a `#!/usr/bin/env bash` script fed to it dies on a
+//! line that reads as correct. Honouring the shebang is what makes a setup
+//! script behave the same way `./setup.sh` would.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
@@ -33,6 +44,26 @@ impl std::fmt::Display for SetupError {
 
 impl std::error::Error for SetupError {}
 
+/// Which of a manifest's two setup-script fields runs on `host`.
+///
+/// Windows prefers `setupScriptWindows`; falling back to the POSIX field there
+/// is deliberate — a server that ships only `setup.sh` then fails loudly at
+/// install instead of silently skipping setup and failing later at launch, when
+/// nothing points back at the missing dependencies.
+pub fn script_for_host<'a>(
+    host: &str,
+    windows: Option<&'a str>,
+    posix: Option<&'a str>,
+) -> Option<&'a str> {
+    let windows = windows.filter(|s| !s.is_empty());
+    let posix = posix.filter(|s| !s.is_empty());
+    if host == "windows" {
+        windows.or(posix)
+    } else {
+        posix
+    }
+}
+
 /// Run the setup script for a server.
 ///
 /// - `setup_script`: Path (relative to install_dir) or URL (http/https)
@@ -57,9 +88,14 @@ pub fn run_setup(
     };
 
     let env = build_env(install_dir, config);
+    let (program, args) = script_command(
+        crate::platform::host_platform(),
+        &script_path,
+        read_shebang(&script_path).as_deref(),
+    );
 
-    let status = Command::new("sh")
-        .arg(&script_path)
+    let status = Command::new(program)
+        .args(args)
         .current_dir(install_dir)
         .envs(env)
         .status()
@@ -72,6 +108,80 @@ pub fn run_setup(
     }
 
     Ok(())
+}
+
+/// Program and arguments that execute `script` on `host`.
+///
+/// Windows has no POSIX shell to fall back on, so the script goes through
+/// PowerShell. `-NoProfile` keeps an operator's profile out of an install, and
+/// `-ExecutionPolicy Bypass` is required because a registry-delivered script is
+/// unsigned — its integrity comes from the SHA-256 the registry recorded and
+/// dmcp verified before writing it, not from Authenticode. A `.ps1` is run the
+/// same way anywhere, since nothing else can interpret it.
+///
+/// Everywhere else the script is a shell script, run by the shell it asks for.
+fn script_command(host: &str, script: &Path, shebang: Option<&str>) -> (OsString, Vec<OsString>) {
+    let is_powershell = host == "windows"
+        || script
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("ps1"));
+    if is_powershell {
+        (
+            OsString::from("powershell.exe"),
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                script.into(),
+            ],
+        )
+    } else {
+        (OsString::from(unix_shell(shebang)), vec![script.into()])
+    }
+}
+
+/// The Unix shell for a script: `sh` unless its shebang asks for bash. Only
+/// bash is special-cased — it is the one shell whose absence turns working
+/// scripts into syntax errors on the distributions where `/bin/sh` is dash.
+fn unix_shell(shebang: Option<&str>) -> &'static str {
+    match shebang.and_then(shebang_interpreter) {
+        Some("bash") => "bash",
+        _ => "sh",
+    }
+}
+
+/// The interpreter a shebang line names: `#!/bin/bash -e`, `#!/usr/bin/bash`
+/// and `#!/usr/bin/env bash` all yield `bash`.
+fn shebang_interpreter(line: &str) -> Option<&str> {
+    let mut words = line.strip_prefix("#!")?.split_whitespace();
+    let program = basename(words.next()?);
+    if program == "env" {
+        // `env` may be handed options (`-S`) and VAR=value assignments before
+        // the program name.
+        words
+            .find(|w| !w.starts_with('-') && !w.contains('='))
+            .map(basename)
+    } else {
+        Some(program)
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// A script's shebang line, if it has one. Only the first line is read: a
+/// setup script can be arbitrarily large and none of the rest is our business.
+fn read_shebang(path: &Path) -> Option<String> {
+    let mut head = [0u8; 256];
+    let read = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let head = &head[..read];
+    if !head.starts_with(b"#!") {
+        return None;
+    }
+    let end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    Some(String::from_utf8_lossy(&head[..end]).trim_end().to_string())
 }
 
 fn build_env(
@@ -113,8 +223,233 @@ fn fetch_script(url: &str) -> Result<std::path::PathBuf, SetupError> {
         .bytes()
         .map_err(|e| SetupError::FetchFailed(e.to_string()))?;
 
-    let temp = std::env::temp_dir().join(format!("dmcp-setup-{}.sh", std::process::id()));
+    // Keep the extension: PowerShell refuses to `-File` anything but a .ps1.
+    let ext = if url.ends_with(".ps1") { "ps1" } else { "sh" };
+    let temp = std::env::temp_dir().join(format!("dmcp-setup-{}.{}", std::process::id(), ext));
     std::fs::write(&temp, &body).map_err(|e| SetupError::FetchFailed(e.to_string()))?;
 
     Ok(temp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A directory of scripts, removed on drop.
+    struct ScriptDir {
+        root: std::path::PathBuf,
+    }
+
+    impl ScriptDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let root =
+                std::env::temp_dir().join(format!("dmcp-setup-test-{}-{}", std::process::id(), n));
+            std::fs::create_dir_all(&root).unwrap();
+            ScriptDir { root }
+        }
+
+        fn write(&self, name: &str, body: &str) -> std::path::PathBuf {
+            let path = self.root.join(name);
+            std::fs::write(&path, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        }
+    }
+
+    impl Drop for ScriptDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn program_for(host: &str, name: &str, shebang: Option<&str>) -> String {
+        let (program, _) = script_command(host, Path::new(name), shebang);
+        program.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn windows_runs_the_powershell_script_through_powershell() {
+        let (program, args) = script_command("windows", Path::new("/srv/setup.ps1"), None);
+        assert_eq!(program.to_string_lossy(), "powershell.exe");
+        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                "/srv/setup.ps1".into(),
+            ]
+        );
+    }
+
+    /// Nothing but PowerShell can interpret a .ps1, so the extension decides
+    /// even where the host does not.
+    #[test]
+    fn a_powershell_script_is_never_handed_to_a_posix_shell() {
+        assert_eq!(
+            program_for("linux", "/srv/setup.ps1", None),
+            "powershell.exe"
+        );
+        assert_eq!(
+            program_for("darwin", "/srv/SETUP.PS1", None),
+            "powershell.exe"
+        );
+    }
+
+    #[test]
+    fn posix_hosts_run_shell_scripts_with_sh_by_default() {
+        for host in ["linux", "darwin", "freebsd"] {
+            assert_eq!(
+                program_for(host, "/srv/setup.sh", None),
+                "sh",
+                "host {host}"
+            );
+            assert_eq!(
+                program_for(host, "/srv/setup.sh", Some("#!/bin/sh")),
+                "sh",
+                "host {host}"
+            );
+        }
+    }
+
+    /// The latent bug this closes: a bash script run by `sh` is run by dash on
+    /// Debian and Ubuntu, where `pipefail`, arrays and `[[ ]]` are hard errors.
+    #[test]
+    fn a_bash_shebang_is_honored_instead_of_sh() {
+        for shebang in [
+            "#!/usr/bin/env bash",
+            "#!/bin/bash",
+            "#!/usr/bin/bash",
+            "#!/bin/bash -e",
+            "#!/usr/bin/env -S bash -e",
+            "#!/usr/bin/env FOO=1 bash",
+        ] {
+            assert_eq!(
+                program_for("linux", "/srv/setup.sh", Some(shebang)),
+                "bash",
+                "shebang {shebang}"
+            );
+        }
+    }
+
+    #[test]
+    fn shebangs_naming_other_interpreters_still_get_sh() {
+        // Unchanged behavior: only the bash/sh distinction is being fixed.
+        for shebang in [
+            "#!/usr/bin/env python3",
+            "#!/bin/zsh",
+            "not a shebang",
+            "#!",
+        ] {
+            assert_eq!(
+                program_for("linux", "/srv/setup.sh", Some(shebang)),
+                "sh",
+                "shebang {shebang}"
+            );
+        }
+    }
+
+    #[test]
+    fn shebang_is_read_from_the_scripts_first_line_only() {
+        let dir = ScriptDir::new();
+        let path = dir.write("s.sh", "#!/usr/bin/env bash\n#!/bin/sh\necho hi\n");
+        assert_eq!(read_shebang(&path).as_deref(), Some("#!/usr/bin/env bash"));
+
+        let plain = dir.write("plain.sh", "echo hi\n");
+        assert_eq!(read_shebang(&plain), None);
+
+        let bare = dir.write("bare.sh", "#!/bin/bash");
+        assert_eq!(read_shebang(&bare).as_deref(), Some("#!/bin/bash"));
+    }
+
+    /// End to end on this host: a script that only bash can execute runs
+    /// because it declares bash. Under the old always-`sh` invocation this
+    /// fails wherever /bin/sh is dash.
+    #[cfg(unix)]
+    #[test]
+    fn a_bash_only_script_runs_to_completion() {
+        let dir = ScriptDir::new();
+        let marker = dir.root.join("ran");
+        let script = dir.write(
+            "bash-only.sh",
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 set -o pipefail\n\
+                 words=(alpha beta gamma)\n\
+                 [[ ${{#words[@]}} -eq 3 ]] || exit 1\n\
+                 printf '%s' \"${{words[1]}}\" > {}\n",
+                marker.display()
+            ),
+        );
+
+        run_setup(
+            script.to_string_lossy().as_ref(),
+            &dir.root,
+            &Default::default(),
+        )
+        .expect("a script declaring bash must be run by bash");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "beta");
+    }
+
+    /// A plain POSIX script is untouched by the change.
+    #[cfg(unix)]
+    #[test]
+    fn a_posix_script_still_runs_and_still_reports_failure() {
+        let dir = ScriptDir::new();
+        let ok = dir.write("ok.sh", "#!/bin/sh\nexit 0\n");
+        run_setup(
+            ok.to_string_lossy().as_ref(),
+            &dir.root,
+            &Default::default(),
+        )
+        .unwrap();
+
+        let bad = dir.write("bad.sh", "#!/bin/sh\nexit 7\n");
+        let err = run_setup(
+            bad.to_string_lossy().as_ref(),
+            &dir.root,
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SetupError::SetupFailed(7)));
+    }
+
+    #[test]
+    fn the_host_picks_which_script_runs() {
+        assert_eq!(
+            script_for_host("windows", Some("setup.ps1"), Some("setup.sh")),
+            Some("setup.ps1")
+        );
+        for host in ["linux", "darwin"] {
+            assert_eq!(
+                script_for_host(host, Some("setup.ps1"), Some("setup.sh")),
+                Some("setup.sh"),
+                "host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_windows_host_falls_back_to_the_posix_script() {
+        // Loud failure at install beats a silently skipped setup that only
+        // surfaces later as a server that will not start.
+        assert_eq!(
+            script_for_host("windows", None, Some("setup.sh")),
+            Some("setup.sh")
+        );
+        // A Windows-only script is not something a POSIX host tries to run.
+        assert_eq!(script_for_host("linux", Some("setup.ps1"), None), None);
+        assert_eq!(script_for_host("linux", None, None), None);
+        assert_eq!(script_for_host("windows", Some(""), Some("")), None);
+    }
 }

@@ -54,7 +54,13 @@ pub fn install(
         .ok_or(InstallError::InvalidRegistry)?;
 
     let first_transport = transports.first().ok_or(InstallError::InvalidRegistry)?;
-    let transport_type = first_transport
+    // Whether there is a repo to clone depends on the transport this host would
+    // actually launch: a manifest may pair a stdio launch line for one platform
+    // with a remote endpoint for another. When no transport is declared for this
+    // host the first entry still decides, exactly as before — refusing an
+    // unvouched host is the platform gate's job above, not this line's.
+    let selected_transport = crate::transport::select_json(transports).unwrap_or(first_transport);
+    let transport_type = selected_transport
         .get("type")
         .and_then(|t| t.as_str())
         .unwrap_or("");
@@ -79,24 +85,31 @@ pub fn install(
 
     if run_setup {
         // --- setupScript delivery from registry ---
-        // The script lives in the registry repo (servers/<id>/setup.sh), not in
-        // the cloned server repo. fetch_server_from_registry set setupScriptUrl
-        // when integrity.setupScriptSha256 is present; we download, verify, and
-        // write setup.sh here so the run_setup block below finds it locally.
-        let (script_delivered, deliver_label) = match deliver_setup_script(&server, &install_dir) {
-            DeliverStatus::Downloaded => (true, "ok".to_string()),
-            s => (false, s.label()),
-        };
+        // The script lives in the registry repo (servers/<id>/setup.sh, or
+        // setup.ps1 on Windows), not in the cloned server repo.
+        // fetch_server_from_registry set the URL when the matching integrity
+        // hash is present; we download, verify, and write it here so the
+        // run_setup block below finds it locally.
+        let spec = host_setup_script(crate::platform::host_platform());
+        let (script_delivered, deliver_label) =
+            match deliver_setup_script(&server, &install_dir, spec) {
+                DeliverStatus::Downloaded => (true, "ok".to_string()),
+                s => (false, s.label()),
+            };
         if script_delivered {
-            manifest["setupScript"] = serde_json::json!("setup.sh");
+            manifest[spec.manifest_key] = serde_json::json!(spec.file_name);
         }
 
         // --- run setup script ---
-        if let Some(setup_script_ref) = manifest
-            .get("setupScript")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(setup_script_ref) = crate::setup::script_for_host(
+            crate::platform::host_platform(),
+            manifest
+                .get(WINDOWS_SETUP.manifest_key)
+                .and_then(|v| v.as_str()),
+            manifest
+                .get(POSIX_SETUP.manifest_key)
+                .and_then(|v| v.as_str()),
+        ) {
             // Clone to owned String to end the immutable borrow on `manifest`
             // before the mutable index assignments below.
             let setup_script = setup_script_ref.to_string();
@@ -249,22 +262,7 @@ pub fn fetch_server_from_registry(
                 }
             }
 
-            // Derive setup script URL from the manifest URL when the registry
-            // supplies an integrity hash. The script lives alongside the
-            // manifest in the registry repo: .../servers/<id>/setup.sh
-            let has_setup_hash = server
-                .get("integrity")
-                .and_then(|i| i.get("setupScriptSha256"))
-                .and_then(|h| h.as_str())
-                .filter(|h| !h.is_empty())
-                .is_some();
-            if has_setup_hash {
-                if let Some(manifest_url) = server.get("manifest").and_then(|m| m.as_str()) {
-                    if let Some(base) = manifest_url.strip_suffix("manifest.json") {
-                        server["setupScriptUrl"] = serde_json::json!(format!("{}setup.sh", base));
-                    }
-                }
-            }
+            attach_setup_script_urls(&mut server);
 
             return Ok(server);
         }
@@ -276,6 +274,74 @@ pub fn fetch_server_from_registry(
 // ---------------------------------------------------------------------------
 // Setup script delivery
 // ---------------------------------------------------------------------------
+
+/// Where one platform's setup script lives in a registry entry: the manifest
+/// field that names it, the URL derived for it, the integrity hash that binds
+/// its bytes, and the filename it is delivered as.
+///
+/// The two platforms share this one table so they cannot drift into different
+/// rules. A per-platform script is not a hash-verification hole: whichever
+/// script this host runs, it got here through the same download-verify-write
+/// gate below.
+#[derive(Clone, Copy)]
+struct SetupScriptSpec {
+    manifest_key: &'static str,
+    url_key: &'static str,
+    integrity_key: &'static str,
+    file_name: &'static str,
+}
+
+const POSIX_SETUP: SetupScriptSpec = SetupScriptSpec {
+    manifest_key: "setupScript",
+    url_key: "setupScriptUrl",
+    integrity_key: "setupScriptSha256",
+    file_name: "setup.sh",
+};
+
+const WINDOWS_SETUP: SetupScriptSpec = SetupScriptSpec {
+    manifest_key: "setupScriptWindows",
+    url_key: "setupScriptWindowsUrl",
+    integrity_key: "setupScriptWindowsSha256",
+    file_name: "setup.ps1",
+};
+
+/// The setup script a given host installs.
+fn host_setup_script(host: &str) -> SetupScriptSpec {
+    if host == "windows" {
+        WINDOWS_SETUP
+    } else {
+        POSIX_SETUP
+    }
+}
+
+/// Derive the registry-hosted setup script URLs for an entry — one per platform
+/// variant, each only when the registry recorded a hash to verify it against.
+/// The scripts sit beside the manifest in the registry repo
+/// (`.../servers/<id>/setup.sh`, `.../servers/<id>/setup.ps1`).
+///
+/// Both are derived regardless of host so this stays a property of the entry;
+/// which one is downloaded and run is decided at install time.
+fn attach_setup_script_urls(server: &mut serde_json::Value) {
+    let Some(base) = server
+        .get("manifest")
+        .and_then(|m| m.as_str())
+        .and_then(|url| url.strip_suffix("manifest.json"))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    for spec in [POSIX_SETUP, WINDOWS_SETUP] {
+        let has_hash = server
+            .get("integrity")
+            .and_then(|i| i.get(spec.integrity_key))
+            .and_then(|h| h.as_str())
+            .filter(|h| !h.is_empty())
+            .is_some();
+        if has_hash {
+            server[spec.url_key] = serde_json::json!(format!("{}{}", base, spec.file_name));
+        }
+    }
+}
 
 enum DeliverStatus {
     Downloaded,
@@ -299,18 +365,22 @@ impl DeliverStatus {
     }
 }
 
-/// Download the registry-hosted setup script, SHA-256 verify it, and write it
-/// to `install_dir/setup.sh`. Returns the delivery outcome so the caller can
+/// Download this host's registry-hosted setup script, SHA-256 verify it, and
+/// write it into the install dir. Returns the delivery outcome so the caller can
 /// set `setupScriptStatus` in the manifest accordingly.
-fn deliver_setup_script(server: &serde_json::Value, install_dir: &Path) -> DeliverStatus {
-    let url = match server.get("setupScriptUrl").and_then(|u| u.as_str()) {
+fn deliver_setup_script(
+    server: &serde_json::Value,
+    install_dir: &Path,
+    spec: SetupScriptSpec,
+) -> DeliverStatus {
+    let url = match server.get(spec.url_key).and_then(|u| u.as_str()) {
         Some(u) => u.to_string(),
         None => return DeliverStatus::SkippedNoScript,
     };
 
     let expected_hash = match server
         .get("integrity")
-        .and_then(|i| i.get("setupScriptSha256"))
+        .and_then(|i| i.get(spec.integrity_key))
         .and_then(|h| h.as_str())
         .filter(|h| !h.is_empty())
     {
@@ -338,14 +408,20 @@ fn deliver_setup_script(server: &serde_json::Value, install_dir: &Path) -> Deliv
         Err(e) => return DeliverStatus::SkippedDownloadFailed(e.to_string()),
     };
 
-    // Verify SHA-256 against the registry-supplied hash
-    let actual_hash = format!("{:x}", Sha256::digest(&content));
+    accept_setup_script(&content, &expected_hash, &install_dir.join(spec.file_name))
+}
+
+/// The verification gate every delivered setup script passes: the bytes are
+/// written only if they hash to what the registry recorded. Split from the
+/// download so the gate itself is exercised without a network, and so both
+/// platform variants provably share it.
+fn accept_setup_script(content: &[u8], expected_hash: &str, dest: &Path) -> DeliverStatus {
+    let actual_hash = format!("{:x}", Sha256::digest(content));
     if actual_hash != expected_hash {
         return DeliverStatus::SkippedHashMismatch;
     }
 
-    let dest = install_dir.join("setup.sh");
-    if let Err(e) = std::fs::write(&dest, &content) {
+    if let Err(e) = std::fs::write(dest, content) {
         return DeliverStatus::SkippedWriteFailed(e.to_string());
     }
 
@@ -353,7 +429,7 @@ fn deliver_setup_script(server: &serde_json::Value, install_dir: &Path) -> Deliv
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
     }
 
     DeliverStatus::Downloaded
@@ -1107,6 +1183,162 @@ mod tests {
             false,
         )
         .expect("an entry vouching for this host installs without the override");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-platform setup scripts (#42)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn each_host_installs_its_own_setup_script() {
+        let windows = host_setup_script("windows");
+        assert_eq!(windows.manifest_key, "setupScriptWindows");
+        assert_eq!(windows.integrity_key, "setupScriptWindowsSha256");
+        assert_eq!(windows.file_name, "setup.ps1");
+
+        for host in ["linux", "darwin", "freebsd"] {
+            let posix = host_setup_script(host);
+            assert_eq!(posix.manifest_key, "setupScript", "host {host}");
+            assert_eq!(posix.integrity_key, "setupScriptSha256", "host {host}");
+            assert_eq!(posix.file_name, "setup.sh", "host {host}");
+        }
+    }
+
+    /// Both scripts sit beside the manifest in the registry repo, and each URL
+    /// appears only when there is a hash to verify it against — an unverifiable
+    /// script is not fetched at all.
+    #[test]
+    fn setup_script_urls_are_derived_per_platform_only_when_hashed() {
+        let base = "https://raw.example.invalid/servers/test.server/";
+        let mut server = serde_json::json!({
+            "manifest": format!("{}manifest.json", base),
+            "integrity": {
+                "setupScriptSha256": "aa",
+                "setupScriptWindowsSha256": "bb",
+            },
+        });
+        attach_setup_script_urls(&mut server);
+        assert_eq!(server["setupScriptUrl"], format!("{}setup.sh", base));
+        assert_eq!(
+            server["setupScriptWindowsUrl"],
+            format!("{}setup.ps1", base)
+        );
+
+        let mut posix_only = serde_json::json!({
+            "manifest": format!("{}manifest.json", base),
+            "integrity": { "setupScriptSha256": "aa" },
+        });
+        attach_setup_script_urls(&mut posix_only);
+        assert_eq!(posix_only["setupScriptUrl"], format!("{}setup.sh", base));
+        assert!(posix_only.get("setupScriptWindowsUrl").is_none());
+
+        let mut unhashed = serde_json::json!({
+            "manifest": format!("{}manifest.json", base),
+            "integrity": { "setupScriptSha256": "", "setupScriptWindowsSha256": "" },
+        });
+        attach_setup_script_urls(&mut unhashed);
+        assert!(unhashed.get("setupScriptUrl").is_none());
+        assert!(unhashed.get("setupScriptWindowsUrl").is_none());
+    }
+
+    /// The Windows script goes through the same gate as the POSIX one: bytes
+    /// that do not match the registry's SHA-256 are never written, so a
+    /// per-platform script cannot become a hash-verification hole.
+    #[test]
+    fn a_setup_script_is_written_only_when_its_hash_matches() {
+        let tree = TempTree::new();
+        for spec in [POSIX_SETUP, WINDOWS_SETUP] {
+            let content = format!("# {}\n", spec.file_name).into_bytes();
+            let expected = format!("{:x}", Sha256::digest(&content));
+            let dest = tree.root.join(spec.file_name);
+
+            let status = accept_setup_script(&content, &expected, &dest);
+            assert!(
+                matches!(status, DeliverStatus::Downloaded),
+                "{} with a matching hash must be delivered",
+                spec.file_name
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), content);
+
+            std::fs::remove_file(&dest).unwrap();
+            let tampered = b"# rm -rf /\n";
+            let status = accept_setup_script(tampered, &expected, &dest);
+            assert!(
+                matches!(status, DeliverStatus::SkippedHashMismatch),
+                "{} whose bytes changed must be refused",
+                spec.file_name
+            );
+            assert!(
+                !dest.exists(),
+                "{} must not be written when the hash mismatches",
+                spec.file_name
+            );
+        }
+    }
+
+    /// A single-byte edit to a delivered script is caught, the same way it is
+    /// for a manifest.
+    #[test]
+    fn a_tampered_windows_script_is_rejected() {
+        let tree = TempTree::new();
+        let reviewed = b"Install-Module -Name Safe\n";
+        let expected = format!("{:x}", Sha256::digest(reviewed));
+        let tampered = b"Install-Module -Name Evil\n";
+        let dest = tree.root.join("setup.ps1");
+        assert!(matches!(
+            accept_setup_script(tampered, &expected, &dest),
+            DeliverStatus::SkippedHashMismatch
+        ));
+        assert!(!dest.exists());
+    }
+
+    /// A manifest carrying both scripts runs exactly the one for this host.
+    #[test]
+    fn install_runs_only_this_hosts_setup_script() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let posix_ran = tree.root.join("posix-ran");
+        let posix = tree.script(
+            "setup.sh",
+            &format!("#!/bin/sh\ntouch {}\n", posix_ran.display()),
+        );
+        let windows = tree.script("setup.ps1", "exit 0\n");
+
+        let mut server = remote_server(&posix);
+        server[WINDOWS_SETUP.manifest_key] = serde_json::json!(windows);
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(server),
+            true,
+            false,
+        )
+        .expect("install with both setup scripts");
+
+        assert_eq!(
+            posix_ran.exists(),
+            crate::platform::host_platform() != "windows",
+            "the POSIX script must run on POSIX hosts and only there"
+        );
+    }
+
+    /// An entry that only carries the Windows script delivers nothing on a
+    /// POSIX host — and an install with no script at all is unchanged.
+    #[test]
+    fn a_windows_only_script_is_not_delivered_to_a_posix_host() {
+        let tree = TempTree::new();
+        let server = serde_json::json!({
+            "setupScriptWindowsUrl": "https://example.invalid/setup.ps1",
+            "integrity": { "setupScriptWindowsSha256": "aa" },
+        });
+        assert!(matches!(
+            deliver_setup_script(&server, &tree.root, POSIX_SETUP),
+            DeliverStatus::SkippedNoScript
+        ));
+        assert!(!tree.root.join("setup.sh").exists());
+        assert!(!tree.root.join("setup.ps1").exists());
     }
 
     #[test]

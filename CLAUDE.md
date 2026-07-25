@@ -58,7 +58,7 @@ src/
 ├── models.rs         Core data structures (Index, Manifest, Transport)
 ├── platform.rs       Host platform identity + the registry `platforms` gate
 ├── elevation.rs      Privilege elevation for system scope (Linux: pkexec/polkit; macOS: sudo/osascript)
-└── transport.rs      Transport extraction from manifests
+└── transport.rs      Per-host transport selection + transport-type extraction
 ```
 
 ### Dual-Scope Design
@@ -129,6 +129,17 @@ entries (`unsupported_on_host`, plus `platforms`, in the table and `--json` — 
 `update --check --json` rows carry the same state. The agent path (`dmcp serve`)
 has no override. An absent field is unrestricted: today's behavior, unchanged.
 
+A **transport** may declare `platforms` too — one server entry, one launch line
+per OS (`python3` vs `python`). `src/transport.rs::select` is the only selection
+path: it returns the first transport the host is in (absent matches every host)
+and otherwise errors naming the declared platforms, never falling through to
+entry zero. Every spawn site goes through it — one-shot `call`, `tools`, `run`,
+the session broker — plus the install clone/remote decision and the listing
+surfaces. Setup scripts split the same way: `setupScript` (POSIX) vs
+`setupScriptWindows` (`setup.ps1`, run through PowerShell), both delivered
+through the one SHA-256 gate in `install.rs`. On Unix the script's shebang
+decides `sh` vs `bash`.
+
 ## Specs & Docs
 
 - `MCP-SYSTEM-SPEC.md` — Full path/format specification
@@ -146,6 +157,8 @@ has no override. An absent field is unrestricted: today's behavior, unchanged.
 *2026-07-22:* `doc_comments.rs` added to the tree; elevation described per-OS; env-var path overrides documented; semantic-search commands added to Key Commands; stale line count dropped.
 
 *2026-07-24:* `update.rs` added — hash-drift detection and the `dmcp update` subcommand (single id / `--all`, `--check`, `--json`); reuses the install flow and trust gates. `browse` now surfaces `update_available` for drifted installed servers.
+
+*2026-07-25:* per-transport `platforms` (#42). `Transport::platforms()` plus `transport::select` / `select_for_host` (host injectable) — the single selection path used by `call`, `list_tools`, `run`, the broker, `install`'s transport-type read, and the `list`/`browse` displays; `CallError::NoTransportForHost` / `RunError::NoTransportForHost` carry the refusal. `Manifest.setup_script_windows` + `SetupScriptSpec` in `install.rs` (POSIX/Windows share one download-verify-write gate, `integrity.setupScriptWindowsSha256`); `setup.rs` chooses PowerShell for `.ps1`/Windows and honours a bash shebang instead of always invoking `sh`.
 
 *2026-07-25:* `platform.rs` added — host detection (`macos` → `darwin`) and the registry `platforms` gate (#41). `Manifest.platforms`; `install`/`update` refuse an unvouched host before any clone or setup, with `--ignore-platform` on both; `RegistryServer` (browse) and `DriftReport` (`update --check --json`) carry `platforms` + `unsupported_on_host`. `install::install` and `update::refresh_install` take an `ignore_platform` argument; the `dmcp serve` agent path passes `false`.
 

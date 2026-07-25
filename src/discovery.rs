@@ -108,10 +108,13 @@ fn load_from_scope(base: &Path, scope: Scope, debug: bool) -> Option<Vec<ServerI
             }
         };
 
+        // Report the transport this host would launch. Falling back to the first
+        // entry keeps the listing informative for a server declared only for
+        // other platforms, rather than blanking it out to "unknown".
         let transport_type = manifest
             .transports
             .as_ref()
-            .and_then(|t| t.first())
+            .and_then(|t| crate::transport::select(Some(t)).ok().or_else(|| t.first()))
             .map(transport_type_name)
             .unwrap_or_else(|| "unknown".to_string());
 

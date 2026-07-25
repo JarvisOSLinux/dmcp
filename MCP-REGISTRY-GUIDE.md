@@ -75,14 +75,20 @@ pointing to the server's `manifest.json`, plus an `integrity` object:
   "keywords": ["..."],
   "trustStatus": "community",
   "manifest": "https://.../servers/<id>/manifest.json",
-  "integrity": { "manifestSha256": "...", "setupScriptSha256": "..." }
+  "integrity": {
+    "manifestSha256": "...",
+    "setupScriptSha256": "...",
+    "setupScriptWindowsSha256": "..."
+  }
 }
 ```
 
 At install, dmcp fetches the manifest and **verifies its raw bytes against
 `integrity.manifestSha256`** (hard failure on mismatch); setup scripts are
-verified against `setupScriptSha256` before running. Hashes are recomputed by
-registry CI (`scripts/sync_registry.py`), never hand-edited.
+verified before running — `setup.sh` against `setupScriptSha256`, `setup.ps1`
+against `setupScriptWindowsSha256`. Whichever script this host runs passes the
+same gate: a per-platform script is not a way around verification. Hashes are
+recomputed by registry CI (`scripts/sync_registry.py`), never hand-edited.
 
 ### Trust status
 
@@ -137,7 +143,8 @@ refused, and `community` installs are flagged as not maintainer-reviewed. See
 | `changelog`          | string | Changelog text.                                                 |
 | `scope`              | string | `"user"` (default) or `"system"`. See Scope below.              |
 | `platforms`          | array  | Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`. Omit for unrestricted. See Platforms below. |
-| `setupScript`        | string | For local servers: filename of a bash script inside the server folder (e.g. `"setup.sh"`). For remote servers: URL to download the script. See Setup Script below. |
+| `setupScript`        | string | For local servers: filename of a shell script inside the server folder (e.g. `"setup.sh"`). For remote servers: URL to download the script. See Setup Script below. |
+| `setupScriptWindows` | string | Windows counterpart of `setupScript` (e.g. `"setup.ps1"`), run through PowerShell. Omit when the server has no Windows setup. |
 
 ### Setup Script
 
@@ -147,8 +154,10 @@ The setup script runs in the server’s **install directory** (where `manifest.j
 **Remote servers (SSE/WebSocket):** There is no clone; the install directory only contains `manifest.json`. Provide a URL in `setupScript`; dmcp downloads the script (verifying `integrity.setupScriptSha256` when the registry provides it). The script runs locally with `sh` and receives the same `MCP_INSTALL_DIR`/`MCP_CONFIG_<KEY>` environment. 
 - **Install flow**: Clone/download first, then run setup automatically. If the setup script fails, the install still succeeds; the main action button becomes "Run Setup" so the user can retry.
 - **Re-run**: If setup failed or was skipped, the main action button shows "Run Setup" instead of "Copy ID".
-- **Execution**: The script runs with `bash` in the install directory. For system scope, it runs with elevated privileges.
-- **Storage**: The manifest stores `setupScript` (filename or URL), `setupScriptPath` (local path), `setupScriptVersion`, and `setupScriptRunAt` (last run timestamp).
+- **Execution**: The script runs in the install directory. For system scope, it runs with elevated privileges.
+- **Interpreter**: `sh`, unless the script's shebang names bash (`#!/usr/bin/env bash`, `#!/bin/bash`) — then bash. Write the shebang if the script uses `set -o pipefail`, arrays or `[[ ]]`: `/bin/sh` is dash on Debian and Ubuntu and those are hard errors there.
+- **Windows**: on a Windows host dmcp runs `setupScriptWindows` (e.g. `setup.ps1`) through PowerShell (`-NoProfile -ExecutionPolicy Bypass -File`), falling back to `setupScript` when no Windows script is declared. On every other host `setupScript` is the only one considered.
+- **Storage**: The manifest stores `setupScript` / `setupScriptWindows` (filename or URL), `setupScriptPath` (local path), `setupScriptVersion`, and `setupScriptRunAt` (last run timestamp).
 
 Example (local server):
 
@@ -201,6 +210,7 @@ Runs as a local process. The `command` and `args` are executed from the project 
 | `command`     | string | Executable (e.g. `python3`, `node`).          |
 | `args`        | array  | Arguments, relative to project root.          |
 | `description` | string | Optional description of this entrypoint.       |
+| `platforms`   | array  | Platforms this entrypoint is for (`"linux"`, `"darwin"`, `"windows"`). Omit to match every host. See Per-transport platforms below. |
 
 ### sse (Server-Sent Events)
 
@@ -222,6 +232,31 @@ Remote endpoint. No local installation.
   "wsUrl": "wss://api.example.com/mcp/ws"
 }
 ```
+
+### Per-transport platforms
+
+One capability is one server, but the line that starts it is not the same
+everywhere: `python3` vs `python`, `.venv/bin/x` vs `.venv\Scripts\x.exe`. Each
+transport may therefore declare its own `platforms`, using the same three-value
+vocabulary as the top-level field:
+
+```json
+"transports": [
+  { "type": "stdio", "command": "python3", "args": ["server.py"], "platforms": ["linux", "darwin"] },
+  { "type": "stdio", "command": "python",  "args": ["server.py"], "platforms": ["windows"] }
+]
+```
+
+dmcp launches the **first transport whose `platforms` include the host**; a
+transport that declares nothing matches every host, so single-entry manifests
+are unaffected. Order matters: an entry without `platforms` is a catch-all, so
+platform-specific entries belong before it.
+
+If no transport covers the host, `dmcp call`, `dmcp tools`, `dmcp run` and
+session calls all fail with a message naming the platforms the server *does*
+declare, rather than spawning a command written for another OS. This is
+per-transport dispatch, not a second trust decision — the top-level `platforms`
+list is what decides whether the server may be installed here at all.
 
 ### Legacy Format (unsupported)
 
@@ -273,6 +308,9 @@ nothing and counts as unsupported.
   it to verify the server on a new OS, then PR that platform into the entry.
 - `dmcp browse` marks excluded entries in the table and sets `unsupported_on_host`
   in `--json`, and `dmcp update --check --json` rows carry the same state.
+- Individual transports may narrow further (see Per-transport platforms): the
+  top-level list says where the server may be installed, a transport's list says
+  which launch line runs there.
 
 It is coverage, not aspiration: list a platform once the server has been vetted
 there, so the field stays a fact a user can trust. One capability is one server —
@@ -454,7 +492,7 @@ When a user clicks Install on your server:
 2. `configurableProperties` are stored as metadata; wrapper UIs (e.g. JARVIS) may prompt for them — dmcp itself does not.
 3. If `scope` is `"system"`, the user authenticates via polkit (password prompt for pkexec).
 4. A dedicated directory is created at `<base>/mcp/installed/<id>/`.
-5. For **local servers** (stdio): `git clone` fetches the repo, then the project root (`source.path` or repo root) is extracted into the install dir. The transport's `command` + `args` run from that directory.
+5. For **local servers** (stdio): `git clone` fetches the repo, then the project root (`source.path` or repo root) is extracted into the install dir. The transport's `command` + `args` run from that directory. Which transport that is follows the host when the manifest declares per-transport `platforms`.
 6. For **remote servers** (SSE/WebSocket): the manifest with the connection details is written as-is — no local clone and no endpoint probe.
 7. A manifest is written to `<installDir>/manifest.json` with full metadata and config; the `config` map is injected as environment variables when the server is spawned.
 8. The index at `<base>/mcp/installed/index.json` is updated: top-level `{"servers": {...}, "version": "1.0", "updated": <RFC3339>}` with per-entry `{"location": "<path>/manifest.json", "keywords": ["..."]}` (`manifest` is accepted as a read alias for `location`). The index stores pointers plus keywords for search; full metadata lives in each manifest.
@@ -495,6 +533,12 @@ Removal is a simple `rm -rf <installDir>`. All files are self-contained. For sys
 - **Provide a `bugUrl`.** Wrapper UIs can surface it as a "Report Bug" link.
 
 ## Changelog — corrected claims
+
+*2026-07-25:* per-transport `platforms`, `setupScriptWindows` and
+`integrity.setupScriptWindowsSha256` documented (#42); the setup-script
+interpreter corrected — it is `sh`, or bash when the shebang says so, or
+PowerShell for the Windows script, never unconditionally `bash` as this guide
+previously claimed.
 
 *2026-07-25:* `platforms` documented (#41) — the vetted-platform list, the pre-clone install/update refusal, `--ignore-platform`, and the browse marking; the install steps now start with the platform gate.
 

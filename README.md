@@ -121,6 +121,31 @@ into the registry entry so everyone gets it.
 An entry without `platforms` is unrestricted: pre-`platforms` manifests and
 third-party registries install exactly as before.
 
+### Per-transport launch lines
+
+A server keeps one entry even where its launch line differs — `python3` here,
+`python` there. Each entry in `transports` may carry its own `platforms`, and
+dmcp launches the first transport the host is in; a transport that declares
+nothing matches every host, so existing manifests are untouched.
+
+```json
+"transports": [
+  { "type": "stdio", "command": "python3", "args": ["server.py"], "platforms": ["linux", "darwin"] },
+  { "type": "stdio", "command": "python",  "args": ["server.py"], "platforms": ["windows"] }
+]
+```
+
+Selection happens at every spawn site — `call`, `tools`, `run` and session calls
+— so they cannot disagree about which command starts the server. When no
+transport covers the host, the command fails naming the platforms the manifest
+declares, instead of spawning something written for another OS.
+
+Setup scripts follow the same idea: `setupScript` is the POSIX one,
+`setupScriptWindows` (e.g. `setup.ps1`) the Windows one, run through PowerShell.
+Whichever script the host runs is SHA-256 verified against the registry's
+`integrity` entry first. On Unix a `#!/usr/bin/env bash` shebang is honoured
+rather than forcing every script through `sh`.
+
 ## System-scoped servers
 
 System-scoped MCP servers are installed under `/usr/share/mcp/installed/` and are
@@ -210,5 +235,7 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 ## Changelog — corrected claims
 
 *2026-07-22:* commands table completed (count, sync-index, embedding-spec, index-server; browse vector-search flags); project tree completed (call, serve, orchestrator, sync_index, vector_index, doc_comments); status list updated to the implemented surface; elevation notes cover `dmcp call` (#33) and per-OS behavior; PKGBUILD now installs the polkit policy file (manual copy only needed for non-packaged installs).
+
+*2026-07-25:* per-transport `platforms` selects the launch line at every spawn site (#42); `setupScriptWindows` runs through PowerShell on Windows, hash-verified like the POSIX script; a bash shebang is honoured instead of always invoking `sh`.
 
 *2026-07-25:* registry `platforms` is enforced (#41) — install/update refuse a host the registry does not vouch for, `--ignore-platform` overrides, and browse marks unsupported entries; commands table updated with the new flags.

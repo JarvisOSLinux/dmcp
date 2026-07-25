@@ -46,6 +46,10 @@ pub struct Manifest {
     /// Filename (local) or URL (remote). Run at install to prepare environment.
     #[serde(default)]
     pub setup_script: Option<String>,
+    /// Windows counterpart of `setup_script` (e.g. `setup.ps1`), run through
+    /// PowerShell. Absent means the POSIX script is all there is.
+    #[serde(default)]
+    pub setup_script_windows: Option<String>,
     /// Local path after install (written by dmcp).
     #[serde(default)]
     pub setup_script_path: Option<String>,
@@ -111,11 +115,18 @@ pub enum Transport {
         args: Option<Vec<String>>,
         #[serde(default)]
         description: Option<String>,
+        /// Platforms this launch line is for: `"linux"`, `"darwin"`, `"windows"`.
+        /// Absent matches every host, which is what keeps every pre-`platforms`
+        /// manifest launching exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platforms: Option<Vec<String>>,
     },
     Sse {
         url: String,
         #[serde(default)]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platforms: Option<Vec<String>>,
     },
     #[serde(rename = "websocket")]
     WebSocket {
@@ -123,5 +134,30 @@ pub enum Transport {
         ws_url: String,
         #[serde(default)]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platforms: Option<Vec<String>>,
     },
+}
+
+impl Transport {
+    /// Platforms this transport is declared for; `None` is unrestricted.
+    pub fn platforms(&self) -> Option<&[String]> {
+        match self {
+            Transport::Stdio { platforms, .. }
+            | Transport::Sse { platforms, .. }
+            | Transport::WebSocket { platforms, .. } => platforms.as_deref(),
+        }
+    }
+}
+
+impl Manifest {
+    /// The setup script to run on `host`: the Windows variant when there is one,
+    /// the POSIX field otherwise. See `crate::setup::script_for_host`.
+    pub fn setup_script_for_host(&self, host: &str) -> Option<&str> {
+        crate::setup::script_for_host(
+            host,
+            self.setup_script_windows.as_deref(),
+            self.setup_script.as_deref(),
+        )
+    }
 }

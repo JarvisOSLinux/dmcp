@@ -176,10 +176,13 @@ fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> R
             .to_string()
     };
 
+    // The transport this host would launch, so the column matches what an
+    // install here actually starts; the first entry still stands in when the
+    // list declares nothing for this host.
     let transport = server
         .get("transports")
         .and_then(|t| t.as_array())
-        .and_then(|a| a.first())
+        .and_then(|a| crate::transport::select_json(a).ok().or_else(|| a.first()))
         .and_then(|t| t.get("type").and_then(|x| x.as_str()))
         .map(String::from)
         .unwrap_or_else(|| "?".to_string());

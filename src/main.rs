@@ -803,7 +803,7 @@ fn main() {
         Commands::Setup { id } => {
             match get_server(&paths, &id) {
                 Some((manifest, _)) => {
-                    let setup_script = manifest.setup_script.as_deref().filter(|s| !s.is_empty());
+                    let setup_script = manifest.setup_script_for_host(dmcp::host_platform());
                     match setup_script {
                         Some(script) => {
                             let install_dir = manifest
@@ -1403,6 +1403,9 @@ fn print_info_output(manifest: &dmcp::Manifest, scope_str: &str) {
     }
     if let Some(ref s) = manifest.setup_script {
         println!("{}Setup:      {}", INDENT, s);
+    }
+    if let Some(ref s) = manifest.setup_script_windows {
+        println!("{}Setup (windows): {}", INDENT, s);
     }
 }
 
