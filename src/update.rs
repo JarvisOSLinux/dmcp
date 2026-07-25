@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::discovery::{self, Scope};
 use crate::install::{self, cli_trust_gate, fetch_server_from_registry, InstallError, TrustGate};
 use crate::paths::Paths;
-use crate::platform;
+use crate::platform::{self, PlatformDecl};
 use crate::sources::list_sources;
 
 /// Machine-readable drift record for one installed server. Field names are the
@@ -33,6 +33,21 @@ pub struct DriftReport {
     /// `update_available`: the drift is real either way, but applying it needs
     /// `--ignore-platform`, and the daemon's drift view has to show that.
     pub unsupported_on_host: bool,
+    /// The entry declares `platforms`, but not readably. Unsupported here for
+    /// that reason rather than for naming other platforms. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub platforms_malformed: bool,
+}
+
+impl DriftReport {
+    /// The refusal to report when this row cannot be applied on this host.
+    pub fn platform_refusal(&self) -> platform::UnsupportedHost {
+        if self.platforms_malformed {
+            platform::UnsupportedHost::malformed()
+        } else {
+            platform::UnsupportedHost::new(self.platforms.clone().unwrap_or_default())
+        }
+    }
 }
 
 /// The subset of a registry entry needed to assess drift for one server.
@@ -40,7 +55,7 @@ pub struct DriftReport {
 pub struct RegistryEntryInfo {
     pub manifest_sha256: Option<String>,
     pub trust_status: String,
-    pub platforms: Option<Vec<String>>,
+    pub platforms: PlatformDecl,
 }
 
 /// An installed server assessed against the live registry.
@@ -100,6 +115,7 @@ pub fn assess(
                 update_available: false,
                 platforms: None,
                 unsupported_on_host: false,
+                platforms_malformed: false,
             },
             revoked: false,
             in_registry: false,
@@ -112,8 +128,7 @@ pub fn assess(
             // trust_status field so the daemon sees the revocation.
             let update_available =
                 !revoked && is_drifted(installed_hash.as_deref(), e.manifest_sha256.as_deref());
-            let unsupported_on_host =
-                !platform::supports_host(e.platforms.as_deref(), platform::host_platform());
+            let unsupported_on_host = !e.platforms.supports(platform::host_platform());
             AssessedServer {
                 report: DriftReport {
                     id: id.to_string(),
@@ -121,8 +136,9 @@ pub fn assess(
                     registry_hash: e.manifest_sha256.clone(),
                     trust_status: e.trust_status.clone(),
                     update_available,
-                    platforms: e.platforms.clone(),
+                    platforms: e.platforms.names().map(<[String]>::to_vec),
                     unsupported_on_host,
+                    platforms_malformed: e.platforms.is_malformed(),
                 },
                 revoked,
                 in_registry: true,
@@ -162,7 +178,7 @@ pub fn parse_registry_entries(registry: &serde_json::Value) -> HashMap<String, R
         let info = RegistryEntryInfo {
             manifest_sha256,
             trust_status,
-            platforms: platform::declared_platforms(&entry),
+            platforms: platform::platform_decl(&entry),
         };
         // First source wins; list_sources yields user scope before system, so a
         // user-configured source shadows a system one for the same id.
@@ -376,7 +392,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "community".into(),
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(a.in_registry);
@@ -391,7 +407,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("same".into()),
             trust_status: "official".into(),
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("same".into()), Some(&entry), Scope::User);
         assert!(!a.report.update_available);
@@ -403,7 +419,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "removed".into(),
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(a.revoked);
@@ -417,7 +433,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "deprecated".into(),
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(!a.revoked);
@@ -441,7 +457,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "official".into(),
-            platforms: Some(vec![platform::foreign_platform().to_string()]),
+            platforms: PlatformDecl::Declared(vec![platform::foreign_platform().to_string()]),
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(a.report.unsupported_on_host);
@@ -459,7 +475,7 @@ mod tests {
         let vouched = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "official".into(),
-            platforms: Some(vec![platform::host_platform().to_string()]),
+            platforms: PlatformDecl::Declared(vec![platform::host_platform().to_string()]),
         };
         assert!(
             !assess("s", Some("old".into()), Some(&vouched), Scope::User)
@@ -470,7 +486,7 @@ mod tests {
         let undeclared = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "official".into(),
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&undeclared), Scope::User);
         assert!(!a.report.unsupported_on_host);
@@ -482,7 +498,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "official".into(),
-            platforms: Some(vec![platform::foreign_platform().to_string()]),
+            platforms: PlatformDecl::Declared(vec![platform::foreign_platform().to_string()]),
         };
         let row =
             serde_json::to_value(assess("s", Some("old".into()), Some(&entry), Scope::User).report)
@@ -498,7 +514,7 @@ mod tests {
         let plain = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "official".into(),
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         };
         let row =
             serde_json::to_value(assess("s", Some("old".into()), Some(&plain), Scope::User).report)
@@ -559,7 +575,7 @@ mod tests {
         assert_eq!(m2["a"].manifest_sha256.as_deref(), Some("h1"));
         // Absent trustStatus defaults to the cautious tier.
         assert_eq!(m2["a"].trust_status, "community");
-        assert_eq!(m2["a"].platforms, None);
+        assert_eq!(m2["a"].platforms, PlatformDecl::Absent);
     }
 
     #[test]
@@ -572,10 +588,37 @@ mod tests {
         });
         let m = parse_registry_entries(&reg);
         assert_eq!(
-            m["a"].platforms.as_deref(),
+            m["a"].platforms.names(),
             Some(["linux".to_string(), "darwin".to_string()].as_slice())
         );
-        assert_eq!(m["b"].platforms, None);
+        assert_eq!(m["b"].platforms, PlatformDecl::Absent);
+    }
+
+    /// A registry entry whose `platforms` cannot be read is unsupported here,
+    /// not unrestricted: `dmcp update` must not refresh a server on a host
+    /// nothing readable ever vouched for.
+    #[test]
+    fn a_malformed_registry_platforms_field_is_refused() {
+        let reg = serde_json::json!({
+            "servers": { "a": {"id": "a", "platforms": platform::host_platform()} }
+        });
+        let m = parse_registry_entries(&reg);
+        assert!(m["a"].platforms.is_malformed());
+
+        let a = assess("a", Some("old".into()), Some(&m["a"]), Scope::User);
+        assert!(a.report.unsupported_on_host);
+        assert!(a.report.platforms_malformed);
+        assert_eq!(a.report.platforms, None);
+
+        let row = serde_json::to_value(&a.report).unwrap();
+        assert_eq!(row["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(row["platforms_malformed"], serde_json::json!(true));
+
+        let msg = a.report.platform_refusal().to_string();
+        assert!(
+            msg.contains("`platforms`") && msg.contains("--ignore-platform"),
+            "the refusal says what is wrong and how to proceed: {msg}"
+        );
     }
 
     // ---- offline fixtures (temp dirs mirror the MCP_USER_* env overrides) --

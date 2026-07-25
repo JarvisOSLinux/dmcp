@@ -314,6 +314,7 @@ pub fn call_is_error(result: &CallToolResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::PlatformDecl;
     use rmcp::model::Content;
 
     fn stdio() -> Vec<Transport> {
@@ -321,7 +322,7 @@ mod tests {
             command: "srv".into(),
             args: None,
             description: None,
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         }]
     }
 
@@ -362,7 +363,7 @@ mod tests {
         let sse = vec![Transport::Sse {
             url: "http://example".into(),
             description: None,
-            platforms: None,
+            platforms: PlatformDecl::Absent,
         }];
         assert!(!needs_system_elevation(
             Scope::System,
@@ -380,13 +381,17 @@ mod tests {
             Transport::Sse {
                 url: "http://example".into(),
                 description: None,
-                platforms: Some(vec![crate::platform::foreign_platform().to_string()]),
+                platforms: PlatformDecl::Declared(vec![
+                    crate::platform::foreign_platform().to_string()
+                ]),
             },
             Transport::Stdio {
                 command: "srv".into(),
                 args: None,
                 description: None,
-                platforms: Some(vec![crate::platform::host_platform().to_string()]),
+                platforms: PlatformDecl::Declared(vec![
+                    crate::platform::host_platform().to_string()
+                ]),
             },
         ];
         assert!(needs_system_elevation(
@@ -404,7 +409,9 @@ mod tests {
             command: "srv".into(),
             args: None,
             description: None,
-            platforms: Some(vec![crate::platform::foreign_platform().to_string()]),
+            platforms: PlatformDecl::Declared(
+                vec![crate::platform::foreign_platform().to_string()],
+            ),
         }];
         assert!(selected(&transports).is_none());
         assert!(!needs_system_elevation(
@@ -422,7 +429,9 @@ mod tests {
             command: "srv".into(),
             args: None,
             description: None,
-            platforms: Some(vec![crate::platform::foreign_platform().to_string()]),
+            platforms: PlatformDecl::Declared(
+                vec![crate::platform::foreign_platform().to_string()],
+            ),
         }];
         let err: CallError = crate::transport::select(Some(&transports))
             .unwrap_err()

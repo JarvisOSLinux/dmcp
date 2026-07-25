@@ -762,11 +762,15 @@ pub fn uninstall(paths: &Paths, id: &str) -> Result<(), UninstallError> {
     let (manifest_path, install_dir, scope) =
         discovery::get_uninstall_info(paths, id).ok_or(UninstallError::ServerNotFound)?;
 
-    // Remove install directory
+    // Remove install directory. An already-absent directory is not a failure:
+    // the index entry is the thing that would otherwise be left behind, naming
+    // a server no command can act on.
     if scope == crate::discovery::Scope::System {
         remove_dir_elevated(&install_dir).map_err(UninstallError::RmFailed)?;
-    } else {
-        std::fs::remove_dir_all(&install_dir).map_err(UninstallError::RmFailed)?;
+    } else if let Err(e) = std::fs::remove_dir_all(&install_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(UninstallError::RmFailed(e));
+        }
     }
 
     // Update index - remove the entry
@@ -1163,6 +1167,50 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         assert!(manifest.get("platforms").is_none());
+    }
+
+    /// The shape that used to strand a server on disk: a manifest field dmcp
+    /// cannot read. `platforms` no longer sinks the parse, and even a manifest
+    /// that is unreadable for some other reason stays removable, because
+    /// uninstall reads the index rather than the manifest.
+    #[test]
+    fn a_server_with_an_unreadable_manifest_is_still_removable() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let mut server = platform_server(None, &script);
+        server["platforms"] = serde_json::json!("windows");
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(server),
+            true,
+            true,
+        )
+        .expect("--ignore-platform installs the entry as written");
+
+        // The malformed field survives to disk and still parses back.
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(raw.contains(r#""platforms": "windows""#));
+        let typed: crate::models::Manifest = serde_json::from_str(&raw).unwrap();
+        assert!(typed.platforms.is_malformed());
+        assert!(
+            discovery::get_server(&paths, "test.server").is_some(),
+            "the server stays visible to every command"
+        );
+
+        // And an outright unparseable manifest is still removable.
+        std::fs::write(&manifest_path, "{not json").unwrap();
+        uninstall(&paths, "test.server").expect("uninstall must not need a readable manifest");
+        assert!(!paths.user_install_dir().join("test.server").exists());
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.user_install_dir().join("index.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(index["servers"].get("test.server").is_none());
     }
 
     #[test]

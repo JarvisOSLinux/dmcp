@@ -122,23 +122,40 @@ the one-shot path is untouched. See `src/broker.rs`.
 A registry entry may declare `platforms` — `"linux"` | `"darwin"` | `"windows"` —
 the platforms the registry has vetted the server on. `src/platform.rs` is the one
 place that maps the host (`std::env::consts::OS`, `macos` → `darwin`) and reads the
-field; `install` and `update` refuse an excluded host **before** any clone or setup
-(non-zero exit), `--ignore-platform` overrides on both, and `browse` marks such
-entries (`unsupported_on_host`, plus `platforms`, in the table and `--json` — the
+field; `install` (by id **and** by manifest URL), `connect` and `update` refuse an
+excluded host **before** any directory, clone or setup (non-zero exit),
+`--ignore-platform` overrides on all three, and `browse` marks such entries
+(`unsupported_on_host`, plus `platforms`, in the table and `--json` — the
 `--json` shape is what reaches the agent through JARVIS's `search_servers`).
 `update --check --json` rows carry the same state. The agent path (`dmcp serve`)
-has no override. An absent field is unrestricted: today's behavior, unchanged.
+has no override. `dmcp install <id>` refuses ahead of the pkexec re-exec, so an
+unvouched host never costs a polkit prompt; `install()` gates again for library
+callers.
+
+`platform::PlatformDecl` is the one reading of the field, for raw JSON and for
+the typed `Manifest`/`Transport` alike: **Absent** (key missing, `null`, or a
+list that trims to nothing) is unrestricted — today's behavior, unchanged;
+**Malformed** (anything that is not an array of platform names) covers no host,
+because a gate that cannot parse its input must not conclude "no restriction";
+**Declared** is the list. Deserializing never fails, so a slip in this field
+cannot make a manifest unloadable and strand an installed server that `list`,
+`info` and `uninstall` can no longer see. Uninstall reads the index rather than
+the manifest for the same reason.
 
 A **transport** may declare `platforms` too — one server entry, one launch line
 per OS (`python3` vs `python`). `src/transport.rs::select` is the only selection
-path: it returns the first transport the host is in (absent matches every host)
-and otherwise errors naming the declared platforms, never falling through to
-entry zero. Every spawn site goes through it — one-shot `call`, `tools`, `run`,
-the session broker — plus the install clone/remote decision and the listing
-surfaces. Setup scripts split the same way: `setupScript` (POSIX) vs
-`setupScriptWindows` (`setup.ps1`, run through PowerShell), both delivered
-through the one SHA-256 gate in `install.rs`. On Unix the script's shebang
-decides `sh` vs `bash`.
+path: it returns the first transport the host is in (absent matches every host,
+malformed matches none) and otherwise errors naming the declared platforms,
+never falling through to entry zero. Every spawn site goes through it — one-shot
+`call`, `tools`, `run`, the session broker — plus the install clone/remote
+decision. The listing surfaces (`browse`, `list`) fall back to entry zero on
+purpose: they describe a server, they do not start it, so a foreign-only server
+still shows the transport it would launch elsewhere instead of `?`. Setup
+scripts split the same way: `setupScript` (POSIX) vs `setupScriptWindows`
+(`setup.ps1`, run through PowerShell), chosen by `setup::script_for_host` at all
+three call sites (`install`, `connect`, `dmcp setup`) and delivered through the
+one SHA-256 gate in `install.rs`. On Unix the script's shebang decides `sh` vs
+`bash`, with `sh` as the announced fallback where bash is not installed.
 
 ## Specs & Docs
 
@@ -153,6 +170,8 @@ decides `sh` vs `bash`.
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-25:* `platform::PlatformDecl` — one three-state reading (absent / malformed / declared) shared by the raw-JSON and typed views; `Manifest.platforms` and `Transport.platforms` deserialize through it and never fail. `connect` takes `ignore_platform` and gates the fetched manifest, so `dmcp install <url>` and `dmcp connect --ignore-platform` behave like the by-id path; `Commands::Install` refuses before the elevation prompt; `connect` selects its setup script with `setup::script_for_host`; `setup::run_setup` falls back from `bash` to `sh` and names the interpreter it failed to spawn.
 
 *2026-07-22:* `doc_comments.rs` added to the tree; elevation described per-OS; env-var path overrides documented; semantic-search commands added to Key Commands; stale line count dropped.
 

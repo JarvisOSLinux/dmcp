@@ -17,18 +17,29 @@
 use std::path::Path;
 
 use crate::models::Transport;
-use crate::platform::{declared_platforms, host_platform, supports_host};
+use crate::platform::{host_platform, platform_decl, PlatformDecl};
 
 /// Transports exist, but every one of them is declared for other platforms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoTransportForHost {
     pub host: String,
-    /// The platforms the server's transports are declared for.
+    /// The platforms the server's transports are declared for. Empty when no
+    /// transport declared a readable list at all.
     pub platforms: Vec<String>,
 }
 
 impl std::fmt::Display for NoTransportForHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.platforms.is_empty() {
+            // Naming nothing ("declares transports for ") tells the operator
+            // nothing; say what is actually wrong with the manifest instead.
+            return write!(
+                f,
+                "no transport for this host: this host is {}, and no transport \
+                 declares a readable `platforms` list",
+                self.host
+            );
+        }
         write!(
             f,
             "no transport for this host: this host is {}, the server declares \
@@ -65,20 +76,20 @@ impl std::error::Error for SelectError {}
 fn select_by<'a, T>(
     transports: &'a [T],
     host: &str,
-    declared: impl Fn(&'a T) -> Option<Vec<String>>,
+    declared: impl Fn(&'a T) -> PlatformDecl,
 ) -> Result<&'a T, SelectError> {
     if transports.is_empty() {
         return Err(SelectError::Missing);
     }
     let mut available: Vec<String> = Vec::new();
     for transport in transports {
-        let platforms = declared(transport);
-        if supports_host(platforms.as_deref(), host) {
+        let decl = declared(transport);
+        if decl.supports(host) {
             return Ok(transport);
         }
-        for p in platforms.into_iter().flatten() {
-            if !available.iter().any(|a| a.eq_ignore_ascii_case(&p)) {
-                available.push(p);
+        for p in decl.names().unwrap_or_default() {
+            if !available.iter().any(|a| a.eq_ignore_ascii_case(p)) {
+                available.push(p.clone());
             }
         }
     }
@@ -95,7 +106,7 @@ pub fn select_for_host<'a>(
     host: &str,
 ) -> Result<&'a Transport, SelectError> {
     let transports = transports.ok_or(SelectError::Missing)?;
-    select_by(transports, host, |t| t.platforms().map(<[String]>::to_vec))
+    select_by(transports, host, |t| t.platforms().clone())
 }
 
 /// The transport to launch on this host.
@@ -109,7 +120,7 @@ pub fn select_json_for_host<'a>(
     transports: &'a [serde_json::Value],
     host: &str,
 ) -> Result<&'a serde_json::Value, SelectError> {
-    select_by(transports, host, declared_platforms)
+    select_by(transports, host, platform_decl)
 }
 
 /// Same rule over an unparsed transports array, for this host.
@@ -119,9 +130,15 @@ pub fn select_json(transports: &[serde_json::Value]) -> Result<&serde_json::Valu
 
 /// Extract the transport type this host would use (e.g. "stdio", "sse",
 /// "websocket") from manifest JSON.
+///
+/// Display only: when nothing is declared for this host the first entry still
+/// stands in, so `browse` and `list` describe a server the same way instead of
+/// one of them printing "?". The spawn sites use `select`, which refuses.
 pub fn transport_from_manifest_json(json: &serde_json::Value) -> Option<String> {
     let transports = json.get("transports")?.as_array()?;
-    let selected = select_json(transports).ok()?;
+    let selected = select_json(transports)
+        .ok()
+        .or_else(|| transports.first())?;
     selected
         .get("type")
         .and_then(|t| t.as_str())
@@ -153,11 +170,19 @@ mod tests {
     use super::*;
 
     fn stdio(command: &str, platforms: Option<&[&str]>) -> Transport {
+        let names: Vec<String> = platforms
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         Transport::Stdio {
             command: command.to_string(),
             args: None,
             description: None,
-            platforms: platforms.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            platforms: match platforms {
+                None => PlatformDecl::Absent,
+                Some(_) => PlatformDecl::from_names(&names),
+            },
         }
     }
 
@@ -301,17 +326,120 @@ mod tests {
         assert!(select_json_for_host(&transports, "darwin").is_err());
     }
 
+    /// The two views of one manifest must agree on the inputs where they used
+    /// to differ: an install that reads raw JSON and a spawn that reads the
+    /// typed manifest cannot conclude different things about the same file.
+    #[test]
+    fn the_two_views_agree_on_every_shape_of_the_field() {
+        let cases: Vec<Vec<serde_json::Value>> = vec![
+            // Empty and blank-only lists: unrestricted on both sides.
+            vec![serde_json::json!({"type": "stdio", "command": "a", "platforms": []})],
+            vec![serde_json::json!({"type": "stdio", "command": "a", "platforms": ["", "  "]})],
+            // Malformed: covers no host on both sides, so a foreign-platform
+            // entry can no longer win as a catch-all over a correct one.
+            vec![
+                serde_json::json!({"type": "sse", "url": "https://x.invalid", "platforms": "windows"}),
+                serde_json::json!({"type": "stdio", "command": "py", "platforms": ["linux"]}),
+            ],
+            vec![serde_json::json!({"type": "stdio", "command": "a", "platforms": [123]})],
+            vec![serde_json::json!({"type": "stdio", "command": "a", "platforms": ["linux", 5]})],
+            // And the ordinary shapes.
+            vec![serde_json::json!({"type": "stdio", "command": "a"})],
+            vec![serde_json::json!({"type": "stdio", "command": "a", "platforms": ["windows"]})],
+        ];
+
+        for transports in cases {
+            let typed: Vec<Transport> = transports
+                .iter()
+                .map(|t| serde_json::from_value(t.clone()).expect("every case must parse"))
+                .collect();
+            for host in ["linux", "darwin", "windows"] {
+                let from_json = select_json_for_host(&transports, host);
+                let from_typed = select_for_host(Some(&typed), host);
+                match (from_json, from_typed) {
+                    (Ok(j), Ok(t)) => assert_eq!(
+                        j["type"].as_str().unwrap(),
+                        transport_type_of(t),
+                        "host {host}: the two views picked different transports for {transports:?}"
+                    ),
+                    (Err(j), Err(t)) => assert_eq!(
+                        j.to_string(),
+                        t.to_string(),
+                        "host {host}: the two views refused differently for {transports:?}"
+                    ),
+                    (j, t) => panic!("host {host}: {transports:?} — json {j:?} vs typed {t:?}"),
+                }
+            }
+        }
+    }
+
+    fn transport_type_of(t: &Transport) -> &str {
+        match t {
+            Transport::Stdio { .. } => "stdio",
+            Transport::Sse { .. } => "sse",
+            Transport::WebSocket { .. } => "websocket",
+        }
+    }
+
+    /// An empty list is not "runs nowhere": it reads as absent, exactly as the
+    /// raw-JSON side has always read it, so a serialization slip cannot brick a
+    /// server on every host at once.
+    #[test]
+    fn an_empty_or_blank_list_is_unrestricted_on_the_typed_path() {
+        for json in [
+            r#"{"type":"stdio","command":"x","platforms":[]}"#,
+            r#"{"type":"stdio","command":"x","platforms":["","  "]}"#,
+        ] {
+            let parsed: Transport = serde_json::from_str(json).unwrap();
+            let transports = vec![parsed];
+            for host in ["linux", "darwin", "windows"] {
+                assert!(
+                    select_for_host(Some(&transports), host).is_ok(),
+                    "host {host}: {json}"
+                );
+            }
+        }
+    }
+
+    /// A transport whose `platforms` cannot be read is skipped, not treated as
+    /// a catch-all — otherwise the windows launch line wins on linux.
+    #[test]
+    fn a_malformed_transport_list_matches_nothing() {
+        let transports: Vec<Transport> = serde_json::from_value(serde_json::json!([
+            {"type": "sse", "url": "https://remote.invalid/", "platforms": "windows"},
+            {"type": "stdio", "command": "python3", "platforms": ["linux"]},
+        ]))
+        .unwrap();
+        let selected = select_for_host(Some(&transports), "linux").unwrap();
+        assert_eq!(command_of(selected), "python3");
+
+        let only_malformed: Vec<Transport> = serde_json::from_value(serde_json::json!([
+            {"type": "stdio", "command": "x", "platforms": "windows"},
+        ]))
+        .unwrap();
+        let err = select_for_host(Some(&only_malformed), "linux").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readable"),
+            "the refusal explains the unreadable list instead of naming nothing: {msg}"
+        );
+        assert!(!msg.contains("for  "), "no dangling platform list: {msg}");
+    }
+
     /// Round-trip through serde: the field is read from a manifest and, when
     /// absent, is not written back into one.
     #[test]
     fn platforms_round_trip_through_serde() {
         let json = r#"{"type":"stdio","command":"py","platforms":["windows"]}"#;
         let parsed: Transport = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.platforms(), Some(["windows".to_string()].as_slice()));
+        assert_eq!(
+            parsed.platforms().names(),
+            Some(["windows".to_string()].as_slice())
+        );
         assert!(serde_json::to_string(&parsed).unwrap().contains("windows"));
 
         let bare: Transport = serde_json::from_str(r#"{"type":"stdio","command":"py"}"#).unwrap();
-        assert_eq!(bare.platforms(), None);
+        assert!(bare.platforms().is_absent());
         assert!(
             !serde_json::to_string(&bare).unwrap().contains("platforms"),
             "an absent list must not be written back as null"
@@ -334,6 +462,29 @@ mod tests {
             transport_from_manifest_json(&manifest).as_deref(),
             Some("stdio"),
             "a windows-only endpoint is not what this host would launch"
+        );
+    }
+
+    /// Display falls back to entry zero when nothing covers this host, so
+    /// `browse` reports the same transport `list` does for the same manifest
+    /// instead of a bare "?". Launching it is still refused by `select`.
+    #[test]
+    fn a_server_declared_only_elsewhere_still_reports_its_transport() {
+        let manifest = serde_json::json!({
+            "transports": [{
+                "type": "sse",
+                "url": "https://example.invalid",
+                "platforms": [crate::platform::foreign_platform()],
+            }]
+        });
+        assert_eq!(
+            transport_from_manifest_json(&manifest).as_deref(),
+            Some("sse")
+        );
+        let transports = manifest["transports"].as_array().unwrap();
+        assert!(
+            select_json(transports).is_err(),
+            "the display fallback must not soften the spawn-time refusal"
         );
     }
 }

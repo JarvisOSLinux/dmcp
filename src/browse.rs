@@ -46,6 +46,12 @@ pub struct RegistryServer {
     /// reaches the agent, and an agent that cannot see this would keep proposing
     /// servers that cannot run here.
     pub unsupported_on_host: bool,
+    /// The entry declares `platforms`, but not as an array of platform names.
+    /// Such an entry is unsupported here (it vouches for nothing readable);
+    /// this says why, so the operator can see it is a broken entry rather than
+    /// a foreign one. Omitted for every well-formed entry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub platforms_malformed: bool,
 }
 
 /// Fetch and list servers from a specific registry URL.
@@ -204,7 +210,10 @@ fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> R
         .filter(|h| !h.is_empty())
         .map(String::from);
 
-    let (platforms, unsupported_on_host) = crate::platform::entry_platform_state(server);
+    let decl = crate::platform::platform_decl(server);
+    let unsupported_on_host = !decl.supports(crate::platform::host_platform());
+    let platforms_malformed = decl.is_malformed();
+    let platforms = decl.names().map(<[String]>::to_vec);
 
     RegistryServer {
         id: str_field("id", "?"),
@@ -219,6 +228,7 @@ fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> R
         registry_manifest_sha256,
         platforms,
         unsupported_on_host,
+        platforms_malformed,
     }
 }
 
@@ -310,6 +320,27 @@ mod tests {
         assert_eq!(s.platforms, None);
     }
 
+    /// The `--json` payload is what JARVIS's search_servers hands the agent. An
+    /// entry whose `platforms` cannot be read must never be reported as running
+    /// here — the agent has no way to check for itself.
+    #[test]
+    fn a_malformed_platforms_entry_is_reported_as_unsupported() {
+        for value in [
+            serde_json::json!(host_platform()),
+            serde_json::json!({"linux": true}),
+            serde_json::json!([123]),
+        ] {
+            let s = registry_server_from_entry(&entry(Some(value.clone())), SOURCE);
+            assert!(s.unsupported_on_host, "{value} must be marked unsupported");
+            assert!(s.platforms_malformed, "{value} must be flagged malformed");
+            assert_eq!(s.platforms, None, "there is no readable list to report");
+
+            let json = serde_json::to_value(&s).unwrap();
+            assert_eq!(json["unsupported_on_host"], serde_json::json!(true));
+            assert_eq!(json["platforms_malformed"], serde_json::json!(true));
+        }
+    }
+
     #[test]
     fn json_output_always_carries_the_host_verdict() {
         // This is the payload JARVIS's search_servers hands the agent: the flag
@@ -328,5 +359,23 @@ mod tests {
             plain.get("platforms").is_none(),
             "an undeclared list stays absent rather than becoming an empty one"
         );
+        assert!(
+            plain.get("platforms_malformed").is_none(),
+            "the flag is noise on every well-formed entry"
+        );
+    }
+
+    /// A server declared only for other platforms still reports the transport
+    /// it would launch there, the same way `dmcp list` does for the installed
+    /// copy — one manifest, one answer, whichever surface is asked.
+    #[test]
+    fn a_foreign_only_entry_still_reports_its_transport() {
+        let mut e = entry(Some(serde_json::json!([foreign_platform()])));
+        e["transports"] = serde_json::json!([
+            {"type": "sse", "url": "https://example.invalid", "platforms": [foreign_platform()]}
+        ]);
+        let s = registry_server_from_entry(&e, SOURCE);
+        assert_eq!(s.transport, "sse");
+        assert!(s.unsupported_on_host);
     }
 }

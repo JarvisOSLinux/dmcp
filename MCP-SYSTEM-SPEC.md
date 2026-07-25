@@ -123,7 +123,11 @@ same gate.
 `"linux"`, `"darwin"`, `"windows"`. dmcp maps the host from
 `std::env::consts::OS` (`macos` → `darwin`) and refuses to install or update an
 entry that excludes the host, before any clone or setup script, unless
-`--ignore-platform` is passed. Absent means unrestricted.
+`--ignore-platform` is passed. Absent means unrestricted; so does an empty or
+all-blank list. A value that is present but is not an array of platform names
+vouches for nothing readable and is refused on every host — only absence means
+"no restriction". A manifest carrying such a value still parses; the field, not
+the file, is what fails.
 
 Individual entries in `transports` may carry the same field, selecting the
 launch line for the host (see §9). The top-level list governs installability;
@@ -353,6 +357,8 @@ For robustness, an implementation may support:
 ---
 
 ## Changelog — corrected claims
+
+*2026-07-25:* `platforms` reading rules stated for both fields — absent and empty mean unrestricted, a value that is not an array of platform names is refused on every host, and neither state can make a manifest unparseable.
 
 *2026-07-25:* per-transport `platforms` documented (#42) — host-selected launch line at every spawn site; `setupScriptWindows` / `integrity.setupScriptWindowsSha256`; the setup-script interpreter corrected (`sh`, bash when the shebang asks, PowerShell for the Windows script).
 

@@ -26,7 +26,13 @@ pub enum SetupError {
     NoSetupScript,
     ScriptNotFound(String),
     FetchFailed(String),
-    SpawnFailed(io::Error),
+    /// The interpreter could not be started. It names itself and the script:
+    /// a bare "No such file or directory" points at neither.
+    SpawnFailed {
+        program: String,
+        script: std::path::PathBuf,
+        source: io::Error,
+    },
     SetupFailed(i32),
 }
 
@@ -36,7 +42,17 @@ impl std::fmt::Display for SetupError {
             SetupError::NoSetupScript => write!(f, "No setup script defined"),
             SetupError::ScriptNotFound(path) => write!(f, "Setup script not found: {}", path),
             SetupError::FetchFailed(msg) => write!(f, "Failed to fetch setup script: {}", msg),
-            SetupError::SpawnFailed(e) => write!(f, "Failed to run setup script: {}", e),
+            SetupError::SpawnFailed {
+                program,
+                script,
+                source,
+            } => write!(
+                f,
+                "Failed to run {} with {}: {}",
+                script.display(),
+                program,
+                source
+            ),
             SetupError::SetupFailed(code) => write!(f, "Setup script exited with code {}", code),
         }
     }
@@ -88,46 +104,103 @@ pub fn run_setup(
     };
 
     let env = build_env(install_dir, config);
-    let (program, args) = script_command(
+    let (programs, args) = script_command(
         crate::platform::host_platform(),
         &script_path,
         read_shebang(&script_path).as_deref(),
     );
 
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(install_dir)
-        .envs(env)
-        .status()
-        .map_err(SetupError::SpawnFailed)?;
+    run_script(&programs, &args, &script_path, install_dir, env)
+}
 
-    if let Some(code) = status.code() {
-        if code != 0 {
-            return Err(SetupError::SetupFailed(code));
+/// Run `script` with the first interpreter in `programs` that can be started,
+/// falling through to the next one when an interpreter is simply not installed.
+///
+/// The fallback exists because honouring a `#!/usr/bin/env bash` shebang turned
+/// "bash is nicer here" into "bash is required": most registry setup scripts
+/// carry that shebang while using only POSIX constructs, and they installed
+/// fine on hosts that ship `sh` and no bash. Falling back keeps the dash fix
+/// for every host that has bash and keeps those hosts working. The fallback is
+/// announced, so a script that genuinely needs bash fails with a traceable
+/// cause instead of a mystifying dash syntax error.
+fn run_script(
+    programs: &[OsString],
+    args: &[OsString],
+    script: &Path,
+    install_dir: &Path,
+    env: HashMap<String, OsString>,
+) -> Result<(), SetupError> {
+    let mut first_failure: Option<(OsString, io::Error)> = None;
+    for program in programs {
+        if first_failure.is_some() {
+            eprintln!(
+                "[warn] {}: {} could not be started; falling back to {} — a script \
+                 that needs {} will fail here",
+                script.display(),
+                programs[0].to_string_lossy(),
+                program.to_string_lossy(),
+                programs[0].to_string_lossy(),
+            );
+        }
+        let result = Command::new(program)
+            .args(args)
+            .current_dir(install_dir)
+            .envs(&env)
+            .status();
+        match result {
+            Ok(status) => {
+                if let Some(code) = status.code() {
+                    if code != 0 {
+                        return Err(SetupError::SetupFailed(code));
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                first_failure.get_or_insert((program.clone(), e));
+            }
+            Err(e) => {
+                return Err(SetupError::SpawnFailed {
+                    program: program.to_string_lossy().to_string(),
+                    script: script.to_path_buf(),
+                    source: e,
+                })
+            }
         }
     }
 
-    Ok(())
+    let (program, source) = first_failure.expect("script_command yields an interpreter");
+    Err(SetupError::SpawnFailed {
+        program: program.to_string_lossy().to_string(),
+        script: script.to_path_buf(),
+        source,
+    })
 }
 
-/// Program and arguments that execute `script` on `host`.
+/// Interpreters (preferred first) and arguments that execute `script` on `host`.
 ///
 /// Windows has no POSIX shell to fall back on, so the script goes through
 /// PowerShell. `-NoProfile` keeps an operator's profile out of an install, and
 /// `-ExecutionPolicy Bypass` is required because a registry-delivered script is
 /// unsigned — its integrity comes from the SHA-256 the registry recorded and
 /// dmcp verified before writing it, not from Authenticode. A `.ps1` is run the
-/// same way anywhere, since nothing else can interpret it.
+/// same way anywhere, since nothing else can interpret it — and nothing else
+/// can stand in for it either, so that list has exactly one entry.
 ///
-/// Everywhere else the script is a shell script, run by the shell it asks for.
-fn script_command(host: &str, script: &Path, shebang: Option<&str>) -> (OsString, Vec<OsString>) {
+/// Everywhere else the script is a shell script, run by the shell it asks for,
+/// with `sh` behind it as the shell that has always run these scripts.
+fn script_command(
+    host: &str,
+    script: &Path,
+    shebang: Option<&str>,
+) -> (Vec<OsString>, Vec<OsString>) {
     let is_powershell = host == "windows"
         || script
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("ps1"));
     if is_powershell {
         (
-            OsString::from("powershell.exe"),
+            vec![OsString::from("powershell.exe")],
             vec![
                 OsString::from("-NoProfile"),
                 OsString::from("-ExecutionPolicy"),
@@ -137,17 +210,22 @@ fn script_command(host: &str, script: &Path, shebang: Option<&str>) -> (OsString
             ],
         )
     } else {
-        (OsString::from(unix_shell(shebang)), vec![script.into()])
+        (
+            unix_shells(shebang).iter().map(OsString::from).collect(),
+            vec![script.into()],
+        )
     }
 }
 
-/// The Unix shell for a script: `sh` unless its shebang asks for bash. Only
-/// bash is special-cased — it is the one shell whose absence turns working
-/// scripts into syntax errors on the distributions where `/bin/sh` is dash.
-fn unix_shell(shebang: Option<&str>) -> &'static str {
+/// The Unix shells for a script, preferred first: `sh` unless its shebang asks
+/// for bash, in which case bash with `sh` behind it. Only bash is special-cased
+/// — it is the one shell whose absence turns working scripts into syntax errors
+/// on the distributions where `/bin/sh` is dash, and the one whose own absence
+/// a POSIX script survives.
+fn unix_shells(shebang: Option<&str>) -> &'static [&'static str] {
     match shebang.and_then(shebang_interpreter) {
-        Some("bash") => "bash",
-        _ => "sh",
+        Some("bash") => &["bash", "sh"],
+        _ => &["sh"],
     }
 }
 
@@ -271,13 +349,15 @@ mod tests {
     }
 
     fn program_for(host: &str, name: &str, shebang: Option<&str>) -> String {
-        let (program, _) = script_command(host, Path::new(name), shebang);
-        program.to_string_lossy().to_string()
+        let (programs, _) = script_command(host, Path::new(name), shebang);
+        programs[0].to_string_lossy().to_string()
     }
 
     #[test]
     fn windows_runs_the_powershell_script_through_powershell() {
-        let (program, args) = script_command("windows", Path::new("/srv/setup.ps1"), None);
+        let (programs, args) = script_command("windows", Path::new("/srv/setup.ps1"), None);
+        assert_eq!(programs.len(), 1, "a .ps1 has no substitute interpreter");
+        let program = &programs[0];
         assert_eq!(program.to_string_lossy(), "powershell.exe");
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
         assert_eq!(
@@ -340,6 +420,75 @@ mod tests {
                 "shebang {shebang}"
             );
         }
+    }
+
+    /// Honouring the shebang must not turn bash into a hard requirement: most
+    /// registry setup scripts declare bash and use only POSIX constructs, and
+    /// they have to keep installing on a host that ships `sh` and nothing else.
+    #[test]
+    fn a_bash_script_falls_back_to_sh_when_bash_is_missing() {
+        let (programs, _) = script_command(
+            "linux",
+            Path::new("/srv/setup.sh"),
+            Some("#!/usr/bin/env bash"),
+        );
+        let programs: Vec<String> = programs
+            .iter()
+            .map(|p| p.to_string_lossy().into())
+            .collect();
+        assert_eq!(programs, vec!["bash".to_string(), "sh".into()]);
+
+        let (posix, _) = script_command("linux", Path::new("/srv/setup.sh"), Some("#!/bin/sh"));
+        assert_eq!(posix.len(), 1, "sh has nothing to fall back to");
+    }
+
+    /// The fallback actually runs the script, rather than reporting the first
+    /// interpreter's absence as a failed install.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_interpreter_falls_through_to_the_next_one() {
+        let dir = ScriptDir::new();
+        let marker = dir.root.join("ran");
+        let script = dir.write(
+            "s.sh",
+            &format!("#!/usr/bin/env bash\ntouch {}\n", marker.display()),
+        );
+        let programs = vec![
+            OsString::from("dmcp-no-such-interpreter"),
+            OsString::from("sh"),
+        ];
+        run_script(
+            &programs,
+            &[OsString::from(&script)],
+            &script,
+            &dir.root,
+            HashMap::new(),
+        )
+        .expect("a missing bash must not fail a POSIX script");
+        assert!(marker.exists(), "the fallback interpreter ran the script");
+    }
+
+    /// With nothing left to fall back to, the error names the interpreter and
+    /// the script instead of a bare "No such file or directory".
+    #[test]
+    fn a_missing_interpreter_with_no_fallback_names_itself() {
+        let dir = ScriptDir::new();
+        let script = dir.write("s.sh", "#!/usr/bin/env bash\nexit 0\n");
+        let programs = vec![OsString::from("dmcp-no-such-interpreter")];
+        let err = run_script(
+            &programs,
+            &[OsString::from(&script)],
+            &script,
+            &dir.root,
+            HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SetupError::SpawnFailed { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dmcp-no-such-interpreter") && msg.contains("s.sh"),
+            "the diagnostic names the interpreter and the script: {msg}"
+        );
     }
 
     #[test]

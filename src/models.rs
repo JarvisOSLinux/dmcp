@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::platform::PlatformDecl;
+
 /// Index file at `<base>/mcp/installed/index.json`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Index {
@@ -80,8 +82,13 @@ pub struct Manifest {
     pub stateful: Option<bool>,
     /// Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`.
     /// Absent means unrestricted — dmcp installs and runs it on any host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub platforms: Option<Vec<String>>,
+    ///
+    /// Read through `PlatformDecl`, which never fails: a manifest whose only
+    /// defect is this field still loads, so a slip cannot hide an installed
+    /// server from `list`, `info` and `uninstall` alike. What it cannot do is
+    /// pass the gate — an unreadable declaration covers no host.
+    #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
+    pub platforms: PlatformDecl,
 }
 
 /// One user-facing configuration field declared by a server manifest.
@@ -118,15 +125,15 @@ pub enum Transport {
         /// Platforms this launch line is for: `"linux"`, `"darwin"`, `"windows"`.
         /// Absent matches every host, which is what keeps every pre-`platforms`
         /// manifest launching exactly as before.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        platforms: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
+        platforms: PlatformDecl,
     },
     Sse {
         url: String,
         #[serde(default)]
         description: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        platforms: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
+        platforms: PlatformDecl,
     },
     #[serde(rename = "websocket")]
     WebSocket {
@@ -134,18 +141,20 @@ pub enum Transport {
         ws_url: String,
         #[serde(default)]
         description: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        platforms: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
+        platforms: PlatformDecl,
     },
 }
 
 impl Transport {
-    /// Platforms this transport is declared for; `None` is unrestricted.
-    pub fn platforms(&self) -> Option<&[String]> {
+    /// Platforms this transport is declared for. The declaration is returned as
+    /// read — including "present but unreadable", which covers no host — so the
+    /// typed and raw-JSON views of the same manifest select the same transport.
+    pub fn platforms(&self) -> &PlatformDecl {
         match self {
             Transport::Stdio { platforms, .. }
             | Transport::Sse { platforms, .. }
-            | Transport::WebSocket { platforms, .. } => platforms.as_deref(),
+            | Transport::WebSocket { platforms, .. } => platforms,
         }
     }
 }
@@ -159,5 +168,92 @@ impl Manifest {
             self.setup_script_windows.as_deref(),
             self.setup_script.as_deref(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_with(platforms: &str) -> Manifest {
+        let json = format!(
+            r#"{{"id":"com.test.s","transports":[{{"type":"stdio","command":"py"}}],
+                 "platforms":{}}}"#,
+            platforms
+        );
+        serde_json::from_str(&json).expect("a platforms slip must not sink the whole manifest")
+    }
+
+    /// The failure this forecloses: an installed server whose manifest no longer
+    /// parses is invisible to `list`, `info`, `run` and `uninstall` alike — on
+    /// disk, unusable, and unremovable through the CLI.
+    #[test]
+    fn a_malformed_platforms_value_still_parses_and_covers_no_host() {
+        for value in [
+            r#""windows""#,
+            r#"{"windows":true}"#,
+            r#"[123]"#,
+            r#"["linux", 5]"#,
+            r#"[["linux"]]"#,
+        ] {
+            let manifest = manifest_with(value);
+            assert!(
+                manifest.platforms.is_malformed(),
+                "{value} must read as malformed"
+            );
+            assert!(
+                !manifest
+                    .platforms
+                    .supports(crate::platform::host_platform()),
+                "{value} must not pass the gate"
+            );
+            assert_eq!(manifest.id.as_deref(), Some("com.test.s"));
+            assert!(manifest.transports.is_some(), "the rest still loads");
+        }
+    }
+
+    #[test]
+    fn a_well_formed_platforms_value_reads_as_declared() {
+        let manifest = manifest_with(r#"["linux"]"#);
+        assert_eq!(
+            manifest.platforms.names(),
+            Some(["linux".to_string()].as_slice())
+        );
+
+        // Empty and blank-only lists keep the documented "absent" reading.
+        assert!(manifest_with("[]").platforms.is_absent());
+        assert!(manifest_with(r#"["", "  "]"#).platforms.is_absent());
+        assert!(manifest_with("null").platforms.is_absent());
+    }
+
+    #[test]
+    fn an_absent_platforms_field_is_not_written_back() {
+        let manifest: Manifest = serde_json::from_str(r#"{"id":"com.test.s"}"#).unwrap();
+        assert!(manifest.platforms.is_absent());
+        let out = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !out.contains("platforms"),
+            "an absent list must not be written back as null: {out}"
+        );
+    }
+
+    /// Same leniency per transport, and the malformed value is preserved rather
+    /// than rewritten when the manifest is saved again (`dmcp config set`).
+    #[test]
+    fn a_malformed_transport_platforms_value_still_parses() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"id":"com.test.s",
+                "transports":[{"type":"stdio","command":"py","platforms":"windows"}]}"#,
+        )
+        .expect("a per-transport platforms slip must not sink the manifest");
+        let transports = manifest.transports.as_ref().unwrap();
+        assert!(transports[0].platforms().is_malformed());
+        assert!(!transports[0].platforms().supports("windows"));
+
+        let out = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            out["transports"][0]["platforms"],
+            serde_json::json!("windows")
+        );
     }
 }

@@ -60,7 +60,7 @@ cargo install --path .   # Install to ~/.cargo/bin
 | `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |
 | `dmcp serve` | Run dmcp as MCP server (for LLM integration) |
 | `dmcp setup <id>` | Run setup script for an installed server |
-| `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup]` | Connect to remote server |
+| `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup] [--ignore-platform]` | Connect to remote server (a fetched manifest is platform-gated like an install, before the manifest is written or its setup script runs) |
 | `dmcp count [--json]` | Count visible MCP servers (local + reachable registries) |
 | `dmcp sync-index` | Download and cache registry vector embeddings for semantic search |
 | `dmcp embedding-spec [--json]` | Show the embedding model spec the index expects |
@@ -114,12 +114,25 @@ server whose list excludes the host, **before** any clone or setup script runs, 
 a non-zero exit. `dmcp browse` marks such entries (`unsupported_on_host` in `--json`),
 so an agent browsing the registry never proposes a server that cannot run here.
 
-`--ignore-platform` overrides the refusal on `install` and `update`. It is the
-intended path for verifying a server on a new OS — once it works, PR the platform
-into the registry entry so everyone gets it.
+`--ignore-platform` overrides the refusal on `install`, `update` and `connect`. It
+is the intended path for verifying a server on a new OS — once it works, PR the
+platform into the registry entry so everyone gets it. Both spellings of an install
+gate identically: `dmcp install <id>` reads the registry entry, `dmcp install <url>`
+and `dmcp connect <url>` read the fetched manifest.
 
 An entry without `platforms` is unrestricted: pre-`platforms` manifests and
-third-party registries install exactly as before.
+third-party registries install exactly as before. An **empty** list (`[]`, or one
+that is all blanks) reads the same way — a list vouching for nothing is a
+serialization slip, not a server installable nowhere.
+
+A `platforms` value that is present but is not an array of platform names
+(`"windows"` instead of `["windows"]`, or an array with a non-string in it) is
+neither: it vouches for nothing readable, so it is refused on every host —
+`--ignore-platform` still gets past it, and `browse --json` reports
+`unsupported_on_host` with `platforms_malformed: true`. A gate that cannot read
+its input must not conclude "no restriction was declared". The manifest itself
+still loads: a slip in this one field never hides an installed server from
+`list`, `info` or `uninstall`.
 
 ### Per-transport launch lines
 
@@ -138,13 +151,20 @@ nothing matches every host, so existing manifests are untouched.
 Selection happens at every spawn site — `call`, `tools`, `run` and session calls
 — so they cannot disagree about which command starts the server. When no
 transport covers the host, the command fails naming the platforms the manifest
-declares, instead of spawning something written for another OS.
+declares, instead of spawning something written for another OS. A transport
+`platforms` value is read exactly like the top-level one, so raw-JSON readers
+(install, browse) and the typed manifest never pick different transports:
+empty is unrestricted, unreadable matches nothing. The listing surfaces
+(`browse`, `list`) still name the transport such a server would launch
+elsewhere, rather than blanking it out — they describe, they do not spawn.
 
 Setup scripts follow the same idea: `setupScript` is the POSIX one,
-`setupScriptWindows` (e.g. `setup.ps1`) the Windows one, run through PowerShell.
+`setupScriptWindows` (e.g. `setup.ps1`) the Windows one, run through PowerShell —
+`install`, `connect` and `dmcp setup` all choose through the same selector.
 Whichever script the host runs is SHA-256 verified against the registry's
 `integrity` entry first. On Unix a `#!/usr/bin/env bash` shebang is honoured
-rather than forcing every script through `sh`.
+rather than forcing every script through `sh`; a host with no bash falls back to
+`sh` with a warning, so a POSIX script carrying a bash shebang still installs.
 
 ## System-scoped servers
 
@@ -233,6 +253,8 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 
 ## Changelog — corrected claims
+
+*2026-07-25:* the platform gate reads one way everywhere — `dmcp install <url>` and `dmcp connect` gate the fetched manifest (both take `--ignore-platform`), a `platforms` value that is not an array of platform names is refused instead of ignored, an empty list is unrestricted on the typed path as well as the raw-JSON one, and a manifest with a malformed `platforms` still loads (so it stays listable and removable). `dmcp install <id>` refuses before the elevation prompt; `connect` picks its setup script by host; a bash shebang falls back to `sh` where bash is absent.
 
 *2026-07-22:* commands table completed (count, sync-index, embedding-spec, index-server; browse vector-search flags); project tree completed (call, serve, orchestrator, sync_index, vector_index, doc_comments); status list updated to the implemented surface; elevation notes cover `dmcp call` (#33) and per-OS behavior; PKGBUILD now installs the polkit policy file (manual copy only needed for non-packaged installs).
 

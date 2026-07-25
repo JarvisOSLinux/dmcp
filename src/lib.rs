@@ -36,7 +36,7 @@ pub use doc_comments::{extract_tool_docs, first_description, ToolDoc};
 pub use install::{fetch_server_from_registry, install, scope_from_registry_server, uninstall};
 pub use models::{Index, Manifest};
 pub use paths::Paths;
-pub use platform::{host_platform, UnsupportedHost};
+pub use platform::{host_platform, PlatformDecl, UnsupportedHost};
 pub use run::run;
 pub use setup::run_setup;
 pub use sources::{add_source, list_sources, remove_source, SourceScope, SourcesError};

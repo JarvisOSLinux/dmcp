@@ -94,9 +94,17 @@ fn load_from_scope(base: &Path, scope: Scope, debug: bool) -> Option<Vec<ServerI
             Ok(s) => match serde_json::from_str(&s) {
                 Ok(m) => m,
                 Err(e) => {
-                    if debug {
-                        eprintln!("[debug] Manifest parse error for {}: {}", id, e);
-                    }
+                    // Warned about unconditionally: a server that is installed
+                    // but unlistable is otherwise invisible, and a diagnostic
+                    // only `--debug` prints is one nobody thinks to ask for.
+                    eprintln!(
+                        "[warn] {}: manifest at {} does not parse ({}); \
+                         the server is installed but hidden — `dmcp uninstall {}` removes it",
+                        id,
+                        manifest_path.display(),
+                        e,
+                        id
+                    );
                     continue;
                 }
             },
@@ -167,23 +175,32 @@ pub fn get_manifest_path(paths: &Paths, id: &str) -> Option<std::path::PathBuf> 
 }
 
 /// Get manifest path, install dir, and scope for uninstall.
+///
+/// Read from the index, not from the manifest: removing a server must not
+/// depend on its manifest still being readable. A manifest that fails to parse
+/// is exactly when uninstall is needed, and requiring one to parse first is how
+/// a server becomes installed, invisible, and unremovable at the same time.
 pub fn get_uninstall_info(
     paths: &Paths,
     id: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, Scope)> {
-    if let Some((_, scope, manifest_path)) =
-        load_server_from_scope(paths.user_install_dir(), id, Scope::User)
-    {
-        let install_dir = manifest_path.parent()?.to_path_buf();
-        return Some((manifest_path, install_dir, scope));
-    }
-    if let Some((_, scope, manifest_path)) =
-        load_server_from_scope(paths.system_install_dir(), id, Scope::System)
-    {
-        let install_dir = manifest_path.parent()?.to_path_buf();
-        return Some((manifest_path, install_dir, scope));
+    for (base, scope) in [
+        (paths.user_install_dir(), Scope::User),
+        (paths.system_install_dir(), Scope::System),
+    ] {
+        if let Some(manifest_path) = indexed_manifest_path(base, id) {
+            let install_dir = manifest_path.parent()?.to_path_buf();
+            return Some((manifest_path, install_dir, scope));
+        }
     }
     None
+}
+
+/// The manifest path index.json records for `id`, if the index lists it.
+fn indexed_manifest_path(base: &Path, id: &str) -> Option<std::path::PathBuf> {
+    let s = std::fs::read_to_string(base.join("index.json")).ok()?;
+    let index: Index = serde_json::from_str(&s).ok()?;
+    Some(std::path::PathBuf::from(&index.servers.get(id)?.location))
 }
 
 fn load_server_from_scope(

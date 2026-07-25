@@ -252,11 +252,21 @@ transport that declares nothing matches every host, so single-entry manifests
 are unaffected. Order matters: an entry without `platforms` is a catch-all, so
 platform-specific entries belong before it.
 
+A transport's `platforms` reads by the same rules as the top-level field:
+absent or empty matches every host, and a value that is not an array of platform
+names matches none — a transport dmcp cannot read is skipped, never used as a
+catch-all. The rule is one implementation, so the raw-JSON readers (`install`,
+`browse`) and the parsed manifest the spawn sites use can never pick different
+transports for the same file.
+
 If no transport covers the host, `dmcp call`, `dmcp tools`, `dmcp run` and
 session calls all fail with a message naming the platforms the server *does*
-declare, rather than spawning a command written for another OS. This is
-per-transport dispatch, not a second trust decision — the top-level `platforms`
-list is what decides whether the server may be installed here at all.
+declare, rather than spawning a command written for another OS. The listing
+surfaces (`dmcp browse`, `dmcp list`) still report the transport such a server
+would launch elsewhere instead of blanking it out — they describe the entry,
+they do not start it. This is per-transport dispatch, not a second trust
+decision — the top-level `platforms` list is what decides whether the server may
+be installed here at all.
 
 ### Legacy Format (unsupported)
 
@@ -301,9 +311,18 @@ from `std::env::consts::OS`, mapping `macos` → `darwin`; any other host name m
 nothing and counts as unsupported.
 
 - **Absent means unrestricted** — dmcp installs the entry on any host, so existing
-  manifests and third-party registries are unaffected.
-- **A declared list that excludes the host is refused**: `dmcp install` and
-  `dmcp update` exit non-zero *before* cloning anything or running a setup script,
+  manifests and third-party registries are unaffected. An empty list (`[]`, or one
+  that is all blanks) reads the same way: a list vouching for nothing is a
+  serialization slip, not a server installable nowhere.
+- **A malformed value is refused everywhere** — `"windows"` instead of
+  `["windows"]`, or an array with a non-string in it, vouches for nothing dmcp can
+  read, so it is treated as excluding every host (`--ignore-platform` still
+  overrides, and `browse --json` adds `platforms_malformed: true`). Only absence
+  means "no restriction declared"; a gate that cannot parse its input must not
+  switch itself off.
+- **A declared list that excludes the host is refused**: `dmcp install` (by id
+  *and* by manifest URL), `dmcp connect` and `dmcp update` exit non-zero *before*
+  creating a directory, cloning anything or running a setup script,
   naming the vouched-for platforms. `--ignore-platform` overrides the refusal — use
   it to verify the server on a new OS, then PR that platform into the entry.
 - `dmcp browse` marks excluded entries in the table and sets `unsupported_on_host`
@@ -533,6 +552,8 @@ Removal is a simple `rm -rf <installDir>`. All files are self-contained. For sys
 - **Provide a `bugUrl`.** Wrapper UIs can surface it as a "Report Bug" link.
 
 ## Changelog — corrected claims
+
+*2026-07-25:* the `platforms` reading rules documented for both the entry and the transport — absent/empty is unrestricted, malformed is refused everywhere (`platforms_malformed` in `browse --json`), the refusal now covers `dmcp install <url>` and `dmcp connect`, and the listing surfaces still name the transport a foreign-only server would launch.
 
 *2026-07-25:* per-transport `platforms`, `setupScriptWindows` and
 `integrity.setupScriptWindowsSha256` documented (#42); the setup-script
