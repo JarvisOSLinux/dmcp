@@ -56,6 +56,7 @@ src/
 ├── sync_index.rs     Sync local indices with installed servers
 ├── vector_index.rs   Semantic search with embeddings
 ├── models.rs         Core data structures (Index, Manifest, Transport)
+├── platform.rs       Host platform identity + the registry `platforms` gate
 ├── elevation.rs      Privilege elevation for system scope (Linux: pkexec/polkit; macOS: sudo/osascript)
 └── transport.rs      Transport extraction from manifests
 ```
@@ -92,6 +93,7 @@ dmcp list                          # List installed servers
 dmcp browse                        # Browse registries
 dmcp install <id>                  # Install from registry
 dmcp update <id> | --all [--check] # Refresh servers whose registry manifest hash drifted
+dmcp install <id> --ignore-platform # Install despite an unvouched host (see Platform support)
 dmcp run <id>                      # Run a server
 dmcp tools <id>                    # List tools on a server
 dmcp call <id> <tool> --args '{}'  # Call a tool (one-shot: spawn, call once, kill)
@@ -115,6 +117,18 @@ serializes concurrent calls to one session. `--session` is gated to **stateful +
 user scope** (system-scope sessions are refused — elevation safety); without it,
 the one-shot path is untouched. See `src/broker.rs`.
 
+### Platform support (registry `platforms`)
+
+A registry entry may declare `platforms` — `"linux"` | `"darwin"` | `"windows"` —
+the platforms the registry has vetted the server on. `src/platform.rs` is the one
+place that maps the host (`std::env::consts::OS`, `macos` → `darwin`) and reads the
+field; `install` and `update` refuse an excluded host **before** any clone or setup
+(non-zero exit), `--ignore-platform` overrides on both, and `browse` marks such
+entries (`unsupported_on_host`, plus `platforms`, in the table and `--json` — the
+`--json` shape is what reaches the agent through JARVIS's `search_servers`).
+`update --check --json` rows carry the same state. The agent path (`dmcp serve`)
+has no override. An absent field is unrestricted: today's behavior, unchanged.
+
 ## Specs & Docs
 
 - `MCP-SYSTEM-SPEC.md` — Full path/format specification
@@ -132,5 +146,7 @@ the one-shot path is untouched. See `src/broker.rs`.
 *2026-07-22:* `doc_comments.rs` added to the tree; elevation described per-OS; env-var path overrides documented; semantic-search commands added to Key Commands; stale line count dropped.
 
 *2026-07-24:* `update.rs` added — hash-drift detection and the `dmcp update` subcommand (single id / `--all`, `--check`, `--json`); reuses the install flow and trust gates. `browse` now surfaces `update_available` for drifted installed servers.
+
+*2026-07-25:* `platform.rs` added — host detection (`macos` → `darwin`) and the registry `platforms` gate (#41). `Manifest.platforms`; `install`/`update` refuse an unvouched host before any clone or setup, with `--ignore-platform` on both; `RegistryServer` (browse) and `DriftReport` (`update --check --json`) carry `platforms` + `unsupported_on_host`. `install::install` and `update::refresh_install` take an `ignore_platform` argument; the `dmcp serve` agent path passes `false`.
 
 *2026-07-24:* `broker.rs` added — session-scoped persistent-server broker (#36). `Manifest.stateful` flag; `dmcp call --session <sid>` thin client (gated on stateful + user scope) over a UDS/NDJSON protocol; `dmcp broker` (hidden, auto-started) and `dmcp session list|close|gc`. Spawn/env/install-dir resolution is factored into `call::build_stdio_command` / `call::resolve_stdio_install_dir`, shared by the one-shot path, `run`, and the broker. Integration tests use a stdlib-only fake stateful MCP server (`tests/fixtures/fake_stateful_server.py`).

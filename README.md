@@ -51,10 +51,10 @@ cargo install --path .   # Install to ~/.cargo/bin
 | `dmcp sources list [--user] [--system]` | List registry source URLs |
 | `dmcp sources add <url> [--system]` | Add a registry source (default: user) |
 | `dmcp sources remove <url> [--system]` | Remove a registry source |
-| `dmcp browse [url] [--user] [--system] [-k keyword...] [--vector JSON \| --vectors JSON] [--top-k N] [--min-score F] [--json]` | Browse servers in registries (keyword filter or semantic vector search against the local index; transport fetched from manifest when registry omits it) |
-| `dmcp install <id or url> [--system] [--no-setup]` | Install from registry (by ID) or from manifest/endpoint URL |
+| `dmcp browse [url] [--user] [--system] [-k keyword...] [--vector JSON \| --vectors JSON] [--top-k N] [--min-score F] [--json]` | Browse servers in registries (keyword filter or semantic vector search against the local index; transport fetched from manifest when registry omits it; entries the registry does not vouch for on this host are marked `unsupported_on_host`) |
+| `dmcp install <id or url> [--system] [--no-setup] [--ignore-platform]` | Install from registry (by ID) or from manifest/endpoint URL (refused before any clone or setup when the entry's `platforms` exclude this host, unless `--ignore-platform`) |
 | `dmcp uninstall <id>` | Remove installed server |
-| `dmcp update <id> \| --all [--check] [--json]` | Refresh installed servers whose registry manifest hash has drifted (detects same-version fixes; `--check` reports without changing; `--json` requires `--check`) |
+| `dmcp update <id> \| --all [--check] [--json] [--ignore-platform]` | Refresh installed servers whose registry manifest hash has drifted (detects same-version fixes; `--check` reports without changing, including platform state; `--json` requires `--check`) |
 | `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
 | `dmcp tools <id> [--json]` | List tools on a server |
 | `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |
@@ -104,6 +104,22 @@ src/
 ## Status
 
 Core features implemented: list, info, config, sources, browse (keyword + semantic search), install, uninstall, connect, run, setup, tools, call, serve (MCP server mode), count, sync-index, embedding-spec, index-server, paths.
+
+## Platform support
+
+A registry entry may declare `platforms` — `"linux"`, `"darwin"`, `"windows"` — the
+platforms the registry has actually vetted that server on. dmcp maps the host via
+`std::env::consts::OS` (`macos` → `darwin`) and refuses to install or refresh a
+server whose list excludes the host, **before** any clone or setup script runs, with
+a non-zero exit. `dmcp browse` marks such entries (`unsupported_on_host` in `--json`),
+so an agent browsing the registry never proposes a server that cannot run here.
+
+`--ignore-platform` overrides the refusal on `install` and `update`. It is the
+intended path for verifying a server on a new OS — once it works, PR the platform
+into the registry entry so everyone gets it.
+
+An entry without `platforms` is unrestricted: pre-`platforms` manifests and
+third-party registries install exactly as before.
 
 ## System-scoped servers
 
@@ -194,3 +210,5 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 ## Changelog — corrected claims
 
 *2026-07-22:* commands table completed (count, sync-index, embedding-spec, index-server; browse vector-search flags); project tree completed (call, serve, orchestrator, sync_index, vector_index, doc_comments); status list updated to the implemented surface; elevation notes cover `dmcp call` (#33) and per-OS behavior; PKGBUILD now installs the polkit policy file (manual copy only needed for non-packaged installs).
+
+*2026-07-25:* registry `platforms` is enforced (#41) — install/update refuse a host the registry does not vouch for, `--ignore-platform` overrides, and browse marks unsupported entries; commands table updated with the new flags.

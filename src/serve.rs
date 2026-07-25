@@ -183,8 +183,17 @@ impl DmcpServer {
                 } else {
                     crate::install::scope_from_registry_server(&server)
                 };
-                match crate::install::install(&self.paths, &p.id, scope, Some(server), !p.no_setup)
-                {
+                // No platform override on the agent path: whether a server runs
+                // on this host is a registry fact a human verifies and PRs back,
+                // not something an agent may decide to disregard.
+                match crate::install::install(
+                    &self.paths,
+                    &p.id,
+                    scope,
+                    Some(server),
+                    !p.no_setup,
+                    false,
+                ) {
                     Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                         "Installed {}{}",
                         p.id, notice

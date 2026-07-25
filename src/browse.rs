@@ -38,6 +38,14 @@ pub struct RegistryServer {
     /// Internal to the browse command; never serialized.
     #[serde(skip)]
     pub registry_manifest_sha256: Option<String>,
+    /// Platforms the registry vouches for. Absent means unrestricted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
+    /// True when `platforms` excludes this host, so installing needs
+    /// `--ignore-platform`. Always serialized: the `--json` browse output is what
+    /// reaches the agent, and an agent that cannot see this would keep proposing
+    /// servers that cannot run here.
+    pub unsupported_on_host: bool,
 }
 
 /// Fetch and list servers from a specific registry URL.
@@ -139,75 +147,76 @@ fn fetch_registry(
 
     let mut result = Vec::new();
     for server in servers_array {
-        let id = server
-            .get("id")
-            .and_then(|i| i.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let name = server
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let summary = server
-            .get("summary")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let version = server
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
+        let mut entry = registry_server_from_entry(&server, url);
 
-        let mut transport = server
-            .get("transports")
-            .and_then(|t| t.as_array())
-            .and_then(|a| a.first())
-            .and_then(|t| t.get("type").and_then(|x| x.as_str()))
-            .map(String::from)
-            .unwrap_or_else(|| "?".to_string());
-
-        if transport == "?" {
+        if entry.transport == "?" {
             if let Some(manifest_url) = server.get("manifest").and_then(|m| m.as_str()) {
                 if let Some(t) = transport::transport_from_manifest_url(client, manifest_url) {
-                    transport = t;
+                    entry.transport = t;
                 }
             }
         }
 
-        let keywords: Vec<String> = server
-            .get("keywords")
-            .and_then(|k| k.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let registry_manifest_sha256 = server
-            .get("integrity")
-            .and_then(|i| i.get("manifestSha256"))
-            .and_then(|h| h.as_str())
-            .filter(|h| !h.is_empty())
-            .map(String::from);
-
-        result.push(RegistryServer {
-            id,
-            name,
-            summary,
-            version,
-            transport,
-            source: url.to_string(),
-            installed: false,
-            keywords,
-            update_available: None,
-            registry_manifest_sha256,
-        });
+        result.push(entry);
     }
 
     Ok(result)
+}
+
+/// Map one registry entry to its display form. Everything readable from the
+/// entry itself is resolved here — including the platform state, which the
+/// registry mirrors from the manifest so browsing never has to fetch manifests
+/// just to know what runs on this host.
+fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> RegistryServer {
+    let str_field = |key: &str, fallback: &str| {
+        server
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+
+    let transport = server
+        .get("transports")
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.first())
+        .and_then(|t| t.get("type").and_then(|x| x.as_str()))
+        .map(String::from)
+        .unwrap_or_else(|| "?".to_string());
+
+    let keywords: Vec<String> = server
+        .get("keywords")
+        .and_then(|k| k.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let registry_manifest_sha256 = server
+        .get("integrity")
+        .and_then(|i| i.get("manifestSha256"))
+        .and_then(|h| h.as_str())
+        .filter(|h| !h.is_empty())
+        .map(String::from);
+
+    let (platforms, unsupported_on_host) = crate::platform::entry_platform_state(server);
+
+    RegistryServer {
+        id: str_field("id", "?"),
+        name: str_field("name", "?"),
+        summary: str_field("summary", ""),
+        version: str_field("version", "?"),
+        transport,
+        source: source_url.to_string(),
+        installed: false,
+        keywords,
+        update_available: None,
+        registry_manifest_sha256,
+        platforms,
+        unsupported_on_host,
+    }
 }
 
 #[derive(Debug)]
@@ -241,3 +250,80 @@ impl std::fmt::Display for BrowseError {
 }
 
 impl std::error::Error for BrowseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{foreign_platform, host_platform};
+
+    const SOURCE: &str = "file:///reg/registry.json";
+
+    fn entry(platforms: Option<serde_json::Value>) -> serde_json::Value {
+        let mut e = serde_json::json!({
+            "id": "com.example.mcp.thing",
+            "name": "Thing",
+            "summary": "Does a thing",
+            "version": "1.0.0",
+            "transports": [{"type": "stdio", "command": "thing"}],
+        });
+        if let Some(p) = platforms {
+            e["platforms"] = p;
+        }
+        e
+    }
+
+    #[test]
+    fn entry_unsupported_on_this_host_is_marked() {
+        let s = registry_server_from_entry(
+            &entry(Some(serde_json::json!([foreign_platform()]))),
+            SOURCE,
+        );
+        assert!(s.unsupported_on_host);
+        assert_eq!(
+            s.platforms.as_deref(),
+            Some([foreign_platform().to_string()].as_slice())
+        );
+        // The rest of the mapping is untouched by the platform read.
+        assert_eq!(s.id, "com.example.mcp.thing");
+        assert_eq!(s.transport, "stdio");
+        assert_eq!(s.source, SOURCE);
+    }
+
+    #[test]
+    fn entry_vouching_for_this_host_is_not_marked() {
+        let s =
+            registry_server_from_entry(&entry(Some(serde_json::json!([host_platform()]))), SOURCE);
+        assert!(!s.unsupported_on_host);
+        assert_eq!(
+            s.platforms.as_deref(),
+            Some([host_platform().to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn entry_without_platforms_is_unrestricted() {
+        let s = registry_server_from_entry(&entry(None), SOURCE);
+        assert!(!s.unsupported_on_host);
+        assert_eq!(s.platforms, None);
+    }
+
+    #[test]
+    fn json_output_always_carries_the_host_verdict() {
+        // This is the payload JARVIS's search_servers hands the agent: the flag
+        // must be present whether or not the entry declares platforms.
+        let marked = serde_json::to_value(registry_server_from_entry(
+            &entry(Some(serde_json::json!([foreign_platform()]))),
+            SOURCE,
+        ))
+        .unwrap();
+        assert_eq!(marked["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(marked["platforms"], serde_json::json!([foreign_platform()]));
+
+        let plain = serde_json::to_value(registry_server_from_entry(&entry(None), SOURCE)).unwrap();
+        assert_eq!(plain["unsupported_on_host"], serde_json::json!(false));
+        assert!(
+            plain.get("platforms").is_none(),
+            "an undeclared list stays absent rather than becoming an empty one"
+        );
+    }
+}

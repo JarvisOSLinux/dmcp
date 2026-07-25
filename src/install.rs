@@ -14,17 +14,29 @@ use crate::sources::list_sources;
 /// Install a server from registry by id.
 /// When server_override is Some, uses it instead of fetching (avoids double fetch when main already fetched for scope resolution).
 /// When run_setup is true and the server has a setupScript, runs it after writing the manifest.
+/// When ignore_platform is true, install even though the registry does not vouch
+/// for this host (`--ignore-platform`).
 pub fn install(
     paths: &Paths,
     id: &str,
     scope: crate::discovery::Scope,
     server_override: Option<serde_json::Value>,
     run_setup: bool,
+    ignore_platform: bool,
 ) -> Result<(), InstallError> {
     let server = match server_override {
         Some(s) => s,
         None => fetch_server_from_registry(paths, id)?,
     };
+
+    // The platform gate sits ahead of every side effect: the wipe-and-recreate
+    // below would destroy a working install, and a clone or setup script on an
+    // unvetted host runs code the registry never checked there.
+    if !ignore_platform {
+        if let Some(refusal) = crate::platform::check_host(&server) {
+            return Err(InstallError::PlatformUnsupported(refusal));
+        }
+    }
 
     let install_dir = match scope {
         crate::discovery::Scope::User => paths.user_install_dir().join(id),
@@ -625,6 +637,7 @@ pub enum InstallError {
     SourceCheckoutFailed(String),
     SourceRevMismatch { requested: String, got: String },
     TrustDenied(String),
+    PlatformUnsupported(crate::platform::UnsupportedHost),
 }
 
 impl std::fmt::Display for InstallError {
@@ -661,6 +674,7 @@ impl std::fmt::Display for InstallError {
             InstallError::TrustDenied(reason) => {
                 write!(f, "Refused by trust policy: {}", reason)
             }
+            InstallError::PlatformUnsupported(refusal) => write!(f, "{}", refusal),
         }
     }
 }
@@ -870,6 +884,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(remote_server(&script)),
             true,
+            false,
         )
         .unwrap_err();
 
@@ -893,6 +908,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(remote_server(&script)),
             true,
+            false,
         );
 
         // The manifest is deliberately kept so `dmcp setup <id>` can retry.
@@ -917,6 +933,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(remote_server(&script)),
             true,
+            false,
         )
         .expect("a setup script that exits 0 must install cleanly");
 
@@ -924,6 +941,172 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["setupScriptStatus"], "ok");
+    }
+
+    /// A remote entry whose `platforms` list is passed straight through, plus a
+    /// setup script that leaves a sentinel file: the sentinel is how a test tells
+    /// "refused up front" from "refused after running the server's code".
+    fn platform_server(platforms: Option<&[&str]>, setup_script: &str) -> serde_json::Value {
+        let mut server = remote_server(setup_script);
+        if let Some(p) = platforms {
+            server["platforms"] = serde_json::json!(p);
+        }
+        server
+    }
+
+    #[test]
+    fn unsupported_platform_is_refused_before_any_side_effect() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let sentinel = tree.root.join("setup-ran");
+        let script = tree.script(
+            "touch.sh",
+            &format!("#!/bin/sh\ntouch {}\n", sentinel.display()),
+        );
+
+        let err = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(platform_server(
+                Some(&[crate::platform::foreign_platform()]),
+                &script,
+            )),
+            true,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, InstallError::PlatformUnsupported(_)),
+            "a host outside the registry's platforms must be refused, got {:?}",
+            err
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(crate::platform::foreign_platform()),
+            "refusal names the supported platforms: {msg}"
+        );
+        assert!(
+            msg.contains("--ignore-platform"),
+            "refusal names the override: {msg}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "setup must not run on a refused install"
+        );
+        assert!(
+            !paths.user_install_dir().join("test.server").exists(),
+            "a refused install must not create an install directory"
+        );
+    }
+
+    #[test]
+    fn refusal_leaves_an_existing_install_untouched() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(platform_server(None, &script)),
+            true,
+            false,
+        )
+        .expect("baseline install");
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        // A later registry entry that no longer vouches for this host must not
+        // wipe the working copy on its way to refusing.
+        let err = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(platform_server(
+                Some(&[crate::platform::foreign_platform()]),
+                &script,
+            )),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, InstallError::PlatformUnsupported(_)));
+        assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+    }
+
+    #[test]
+    fn ignore_platform_overrides_the_refusal() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(platform_server(
+                Some(&[crate::platform::foreign_platform()]),
+                &script,
+            )),
+            true,
+            true,
+        )
+        .expect("--ignore-platform must install on an unvouched host");
+
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["setupScriptStatus"], "ok");
+        // The declared coverage is recorded as installed, not rewritten.
+        assert_eq!(
+            manifest["platforms"],
+            serde_json::json!([crate::platform::foreign_platform()])
+        );
+    }
+
+    #[test]
+    fn absent_platforms_installs_unrestricted() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(platform_server(None, &script)),
+            true,
+            false,
+        )
+        .expect("an entry without platforms installs on any host");
+
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(manifest.get("platforms").is_none());
+    }
+
+    #[test]
+    fn declared_host_platform_installs() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(platform_server(
+                Some(&[crate::platform::host_platform()]),
+                &script,
+            )),
+            true,
+            false,
+        )
+        .expect("an entry vouching for this host installs without the override");
     }
 
     #[test]

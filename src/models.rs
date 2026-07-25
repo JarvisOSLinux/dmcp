@@ -74,6 +74,10 @@ pub struct Manifest {
     /// the broker. Absent or false means stateless — the default one-shot path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stateful: Option<bool>,
+    /// Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`.
+    /// Absent means unrestricted — dmcp installs and runs it on any host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
 }
 
 /// One user-facing configuration field declared by a server manifest.

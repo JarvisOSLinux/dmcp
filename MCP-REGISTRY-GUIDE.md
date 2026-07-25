@@ -136,6 +136,7 @@ refused, and `community` installs are flagged as not maintainer-reviewed. See
 | `screenshots`        | array  | Screenshot URLs or `{"thumbnail": ..., "url": ...}` objects.   |
 | `changelog`          | string | Changelog text.                                                 |
 | `scope`              | string | `"user"` (default) or `"system"`. See Scope below.              |
+| `platforms`          | array  | Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`. Omit for unrestricted. See Platforms below. |
 | `setupScript`        | string | For local servers: filename of a bash script inside the server folder (e.g. `"setup.sh"`). For remote servers: URL to download the script. See Setup Script below. |
 
 ### Setup Script
@@ -247,6 +248,38 @@ SSE/WebSocket servers also support scope. A system-scope SSE entry puts its mani
   ...
 }
 ```
+
+## Platforms
+
+`platforms` declares which platforms the registry has vetted the server on:
+
+```json
+{
+  "id": "com.example.mcp.thing",
+  "platforms": ["linux", "darwin"],
+  ...
+}
+```
+
+The vocabulary is exactly `"linux"`, `"darwin"`, `"windows"`. dmcp derives the host
+from `std::env::consts::OS`, mapping `macos` → `darwin`; any other host name matches
+nothing and counts as unsupported.
+
+- **Absent means unrestricted** — dmcp installs the entry on any host, so existing
+  manifests and third-party registries are unaffected.
+- **A declared list that excludes the host is refused**: `dmcp install` and
+  `dmcp update` exit non-zero *before* cloning anything or running a setup script,
+  naming the vouched-for platforms. `--ignore-platform` overrides the refusal — use
+  it to verify the server on a new OS, then PR that platform into the entry.
+- `dmcp browse` marks excluded entries in the table and sets `unsupported_on_host`
+  in `--json`, and `dmcp update --check --json` rows carry the same state.
+
+It is coverage, not aspiration: list a platform once the server has been vetted
+there, so the field stays a fact a user can trust. One capability is one server —
+growing `platforms` is how coverage expands, not per-OS sibling entries. dmcp reads
+the list from the registry entry, so a registry that keeps entries in sync with
+their manifests (as `sync_registry.py` does) never forces a manifest fetch just to
+filter by host.
 
 ## Source Configuration
 
@@ -417,14 +450,15 @@ Here is a complete minimal registry with one local server (Git) and one remote S
 
 When a user clicks Install on your server:
 
-1. `configurableProperties` are stored as metadata; wrapper UIs (e.g. JARVIS) may prompt for them — dmcp itself does not.
-2. If `scope` is `"system"`, the user authenticates via polkit (password prompt for pkexec).
-3. A dedicated directory is created at `<base>/mcp/installed/<id>/`.
-4. For **local servers** (stdio): `git clone` fetches the repo, then the project root (`source.path` or repo root) is extracted into the install dir. The transport's `command` + `args` run from that directory.
-5. For **remote servers** (SSE/WebSocket): the manifest with the connection details is written as-is — no local clone and no endpoint probe.
-6. A manifest is written to `<installDir>/manifest.json` with full metadata and config; the `config` map is injected as environment variables when the server is spawned.
-7. The index at `<base>/mcp/installed/index.json` is updated: top-level `{"servers": {...}, "version": "1.0", "updated": <RFC3339>}` with per-entry `{"location": "<path>/manifest.json", "keywords": ["..."]}` (`manifest` is accepted as a read alias for `location`). The index stores pointers plus keywords for search; full metadata lives in each manifest.
-8. For user-scope, `<base>` is `~/.local/share`. For system-scope, `<base>` is `/usr/share`.
+1. If the entry declares `platforms` and this host is not among them, the install is refused here — before any directory, clone, or setup script (see Platforms).
+2. `configurableProperties` are stored as metadata; wrapper UIs (e.g. JARVIS) may prompt for them — dmcp itself does not.
+3. If `scope` is `"system"`, the user authenticates via polkit (password prompt for pkexec).
+4. A dedicated directory is created at `<base>/mcp/installed/<id>/`.
+5. For **local servers** (stdio): `git clone` fetches the repo, then the project root (`source.path` or repo root) is extracted into the install dir. The transport's `command` + `args` run from that directory.
+6. For **remote servers** (SSE/WebSocket): the manifest with the connection details is written as-is — no local clone and no endpoint probe.
+7. A manifest is written to `<installDir>/manifest.json` with full metadata and config; the `config` map is injected as environment variables when the server is spawned.
+8. The index at `<base>/mcp/installed/index.json` is updated: top-level `{"servers": {...}, "version": "1.0", "updated": <RFC3339>}` with per-entry `{"location": "<path>/manifest.json", "keywords": ["..."]}` (`manifest` is accepted as a read alias for `location`). The index stores pointers plus keywords for search; full metadata lives in each manifest.
+9. For user-scope, `<base>` is `~/.local/share`. For system-scope, `<base>` is `/usr/share`.
 
 ### Directory Layout After Install
 
@@ -461,5 +495,7 @@ Removal is a simple `rm -rf <installDir>`. All files are self-contained. For sys
 - **Provide a `bugUrl`.** Wrapper UIs can surface it as a "Report Bug" link.
 
 ## Changelog — corrected claims
+
+*2026-07-25:* `platforms` documented (#41) — the vetted-platform list, the pre-clone install/update refusal, `--ignore-platform`, and the browse marking; the install steps now start with the platform gate.
 
 *2026-07-22:* reframed from "KDE Discover" to dmcp (the actual consumer) throughout; manifest-referenced entries with SHA-256 `integrity` and the `trustStatus` trust model documented; index schema corrected (`servers` map, `location` key, `version`/`updated` top-level); setup scripts run with `sh` and receive `MCP_INSTALL_DIR`/`MCP_CONFIG_<KEY>` env vars; config is delivered to servers as environment variables (defaults not auto-applied, no pre-install dialog in dmcp); no registry cache and no remote-endpoint probe; unsupported legacy transport format marked as such; `source.rev` pinning documented; no automatic upgrade detection; User-Agent is `dmcp/1.0`.

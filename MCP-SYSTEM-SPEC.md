@@ -111,11 +111,17 @@ Each server object in `servers`:
 
 **Required:** `id`, `name`, `summary`, `version`, and either inline `transports` + `source` (for stdio) **or** a `manifest` URL pointing to the server's `manifest.json` (the form the JARVIS mcp-registry uses — transports/source are then fetched from the manifest).
 
-**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`)
+**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`), `platforms` (vetted platforms)
 
 **Integrity:** at install, dmcp verifies the fetched manifest's raw bytes
 against `integrity.manifestSha256` (hard failure on mismatch) and setup
 scripts against `setupScriptSha256` before running them.
+
+**Platforms:** `platforms` lists the platforms the registry vouches for —
+`"linux"`, `"darwin"`, `"windows"`. dmcp maps the host from
+`std::env::consts::OS` (`macos` → `darwin`) and refuses to install or update an
+entry that excludes the host, before any clone or setup script, unless
+`--ignore-platform` is passed. Absent means unrestricted.
 
 **Icon:** Freedesktop icon name (e.g. `"utilities-terminal"`) or URL to image (e.g. `https://example.com/logo.png`).
 
@@ -332,5 +338,7 @@ For robustness, an implementation may support:
 ---
 
 ## Changelog — corrected claims
+
+*2026-07-25:* registry `platforms` documented (#41) — vetted-platform list, host mapping, and the pre-clone install/update refusal with `--ignore-platform`.
 
 *2026-07-22:* status corrected — this spec is implemented by dmcp (this repo); config delivery documented as env-var injection (servers do not read manifest.json); sources are not deduplicated across scopes; registry `servers` accepts array or id-keyed map, with manifest-referenced entries, `trustStatus`, and SHA-256 `integrity` verification documented; elevation (pkexec/polkit on Linux, sudo/osascript on macOS) and the vector index documented; env-var path overrides listed; index entries carry `keywords` with `manifest` as a read alias for `location`; setup-script fields documented; Discover-specific cache and `libdiscover`/`backward_compatibility.md` references removed; tool invocation / serve / connect / semantic search noted as beyond-spec capabilities.

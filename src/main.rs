@@ -77,6 +77,11 @@ enum Commands {
         /// Skip running the setup script (if defined)
         #[arg(long)]
         no_setup: bool,
+
+        /// Install even though the registry does not vouch for this platform
+        /// (use when verifying a new OS, then PR the result to the registry)
+        #[arg(long)]
+        ignore_platform: bool,
     },
 
     /// Uninstall an MCP server
@@ -106,6 +111,10 @@ enum Commands {
         /// Output the drift report as JSON (requires --check)
         #[arg(long, requires = "check")]
         json: bool,
+
+        /// Refresh even though the registry does not vouch for this platform
+        #[arg(long)]
+        ignore_platform: bool,
     },
 
     /// Run an MCP server (stdio: spawn and relay; SSE/WebSocket: print connection URL)
@@ -539,6 +548,7 @@ fn main() {
             id_or_url,
             system,
             no_setup,
+            ignore_platform,
         } => {
             let run_setup = !no_setup;
             let is_url = id_or_url.starts_with("http://") || id_or_url.starts_with("https://");
@@ -598,7 +608,7 @@ fn main() {
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
                     re_exec_with_pkexec();
                 }
-                match install(&paths, &id, scope, Some(server), run_setup) {
+                match install(&paths, &id, scope, Some(server), run_setup, ignore_platform) {
                     Ok(()) => println!("Installed {}", id),
                     Err(e) => {
                         eprintln!("Error: {}", e);
@@ -634,6 +644,7 @@ fn main() {
             all,
             check,
             json,
+            ignore_platform,
         } => {
             if !all && id.is_none() {
                 eprintln!("Error: specify a server id or --all");
@@ -702,6 +713,19 @@ fn main() {
                     println!("{}: up to date", id);
                     continue;
                 }
+                if a.report.unsupported_on_host && !ignore_platform {
+                    // Refuse from the drift report the check already fetched,
+                    // instead of letting the install gate catch it after a
+                    // second registry round-trip.
+                    let platforms = a.report.platforms.clone().unwrap_or_default();
+                    eprintln!(
+                        "Error: refusing to update {}: {}",
+                        id,
+                        dmcp::UnsupportedHost::new(platforms)
+                    );
+                    had_error = true;
+                    continue;
+                }
 
                 match dmcp::update::trust_gate_for_update(&a.report.trust_status) {
                     Ok(Some(msg)) => eprintln!("[warn] {}", msg),
@@ -726,7 +750,7 @@ fn main() {
                     re_exec_with_pkexec();
                 }
 
-                match dmcp::update::refresh_install(&paths, id, a.scope) {
+                match dmcp::update::refresh_install(&paths, id, a.scope, ignore_platform) {
                     Ok(()) => println!("{}: updated", id),
                     Err(e) => {
                         eprintln!("Error updating {}: {}", id, e);
@@ -1474,6 +1498,13 @@ fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
         } else {
             println!("{}: up to date", id);
         }
+        if a.report.unsupported_on_host {
+            println!(
+                "        platforms: {} (not {}) — refresh needs --ignore-platform",
+                a.report.platforms.as_deref().unwrap_or_default().join(", "),
+                dmcp::host_platform()
+            );
+        }
     }
     if !actionable {
         println!("All installed servers are up to date.");
@@ -1498,6 +1529,18 @@ fn print_browse_table(servers: &[dmcp::RegistryServer]) {
         println!("{}Version:   {}", INDENT, s.version);
         println!("{}Transport: {}", INDENT, s.transport);
         println!("{}Status:    {}", INDENT, status);
+        if let Some(ref platforms) = s.platforms {
+            if s.unsupported_on_host {
+                println!(
+                    "{}Platforms: {} — UNSUPPORTED on this host ({}); install needs --ignore-platform",
+                    INDENT,
+                    platforms.join(", "),
+                    dmcp::host_platform()
+                );
+            } else {
+                println!("{}Platforms: {}", INDENT, platforms.join(", "));
+            }
+        }
         if !s.summary.is_empty() {
             println!(
                 "{}Summary:   {}",
