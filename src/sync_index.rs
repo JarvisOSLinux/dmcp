@@ -122,11 +122,17 @@ fn fetch_embeddings_from_registry(
         return Err(resp.error_for_status().unwrap_err());
     }
     let registry: serde_json::Value = resp.json()?;
+    Ok(embeddings_from_registry(&registry))
+}
 
+/// Map one registry document to the index entries it contributes. Split from the
+/// fetch so the mapping — including the platform state each entry carries — is
+/// exercised without a registry to talk to.
+fn embeddings_from_registry(registry: &serde_json::Value) -> RegistryEmbeddings {
     let servers_array: Vec<serde_json::Value> = match registry.get("servers") {
         Some(s) if s.is_array() => s.as_array().unwrap().clone(),
         Some(s) if s.is_object() => s.as_object().unwrap().values().cloned().collect(),
-        _ => return Ok(vec![]),
+        _ => return vec![],
     };
 
     let mut result = Vec::new();
@@ -141,6 +147,14 @@ fn fetch_embeddings_from_registry(
             Some(id) => id.to_string(),
             None => continue,
         };
+
+        // Copied, not resolved: the index outlives the sync and can be carried
+        // to another machine, so the host verdict belongs to search time. Read
+        // through the one `platforms` reading so the vector surface cannot
+        // disagree with the install gate about what an entry vouches for.
+        let decl = crate::platform::platform_decl(&server);
+        let platforms = decl.names().map(<[String]>::to_vec);
+        let platforms_malformed = decl.is_malformed();
 
         let server_name = server
             .get("name")
@@ -202,6 +216,8 @@ fn fetch_embeddings_from_registry(
                 parameter_schema: None,
                 vector: server_vec,
                 source: "registry".to_string(),
+                platforms: platforms.clone(),
+                platforms_malformed,
             });
         }
 
@@ -240,6 +256,8 @@ fn fetch_embeddings_from_registry(
                     parameter_schema,
                     vector: tool_vec,
                     source: "registry".to_string(),
+                    platforms: platforms.clone(),
+                    platforms_malformed,
                 });
             }
         }
@@ -249,7 +267,7 @@ fn fetch_embeddings_from_registry(
         }
     }
 
-    Ok(result)
+    result
 }
 
 fn parse_vector(val: Option<&serde_json::Value>) -> Option<Vec<f32>> {
@@ -355,6 +373,89 @@ fn enrich_local_entries_from_doc_comments(paths: &Paths, index: &mut VectorIndex
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{foreign_platform, host_platform};
+
+    fn registry(platforms: Option<serde_json::Value>) -> serde_json::Value {
+        let mut server = serde_json::json!({
+            "id": "com.example.mcp.thing",
+            "name": "Thing",
+            "summary": "Does a thing",
+            "tools": [{"name": "do_thing", "description": "Do it"}],
+            "embeddings": {
+                "model": "test-embeddings",
+                "version": "1",
+                "server": [1.0, 0.0],
+                "tools": {"do_thing": [0.0, 1.0]},
+            },
+        });
+        if let Some(p) = platforms {
+            server["platforms"] = p;
+        }
+        serde_json::json!({"servers": {"com.example.mcp.thing": server}})
+    }
+
+    fn entries(platforms: Option<serde_json::Value>) -> Vec<VectorEntry> {
+        let mut fetched = embeddings_from_registry(&registry(platforms));
+        assert_eq!(fetched.len(), 1);
+        fetched.remove(0).1
+    }
+
+    /// Both levels carry the declaration: a tool-level hit is the one the agent
+    /// most often gets back, so marking only the server entry would leave the
+    /// common case platform-blind.
+    #[test]
+    fn every_entry_carries_the_registry_platforms() {
+        let entries = entries(Some(serde_json::json!([foreign_platform()])));
+        assert_eq!(
+            entries.len(),
+            2,
+            "one server-level and one tool-level entry"
+        );
+        for e in &entries {
+            assert_eq!(
+                e.platforms.as_deref(),
+                Some([foreign_platform().to_string()].as_slice()),
+                "entry {:?}",
+                e.tool_name
+            );
+            assert!(!e.platforms_malformed);
+        }
+        assert!(entries.iter().any(|e| e.tool_name.is_none()));
+        assert!(entries
+            .iter()
+            .any(|e| e.tool_name.as_deref() == Some("do_thing")));
+    }
+
+    /// An unreadable declaration is carried as such rather than dropped, so the
+    /// search verdict matches what `browse` and the install gate say.
+    #[test]
+    fn a_malformed_declaration_is_carried_as_malformed() {
+        for value in [
+            serde_json::json!(host_platform()),
+            serde_json::json!({"linux": true}),
+            serde_json::json!([123]),
+        ] {
+            for e in entries(Some(value.clone())) {
+                assert!(e.platforms_malformed, "{value} must be flagged");
+                assert_eq!(e.platforms, None, "there is no readable list to carry");
+                assert!(e.unsupported_on(host_platform()));
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_without_platforms_stays_unrestricted() {
+        for e in entries(None) {
+            assert_eq!(e.platforms, None);
+            assert!(!e.platforms_malformed);
+            assert!(!e.unsupported_on(host_platform()));
         }
     }
 }

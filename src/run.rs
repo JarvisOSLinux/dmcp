@@ -31,6 +31,7 @@ use crate::paths::Paths;
 pub enum RunError {
     ServerNotFound(String),
     NoTransports,
+    NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
     CommandNotFound(String),
     SpawnFailed(io::Error),
@@ -42,6 +43,7 @@ impl std::fmt::Display for RunError {
         match self {
             RunError::ServerNotFound(id) => write!(f, "Server not found: {}", id),
             RunError::NoTransports => write!(f, "No transports defined for this server"),
+            RunError::NoTransportForHost(e) => write!(f, "{}", e),
             RunError::NoStdioTransport => write!(
                 f,
                 "Server has no stdio transport (remote servers: use the printed URL to connect)"
@@ -54,6 +56,17 @@ impl std::fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+impl From<crate::transport::SelectError> for RunError {
+    fn from(e: crate::transport::SelectError) -> Self {
+        match e {
+            crate::transport::SelectError::Missing => RunError::NoTransports,
+            crate::transport::SelectError::ForeignHost(detail) => {
+                RunError::NoTransportForHost(detail)
+            }
+        }
+    }
+}
 
 /// Run an installed MCP server by id.
 ///
@@ -69,20 +82,18 @@ pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
 
     // System-scoped stdio servers need root to access /usr/share/mcp/.
     // Re-execute dmcp through pkexec so polkit can authenticate the user.
-    // Remote transports (SSE/WebSocket) just print a URL and need no root.
+    // Remote transports (SSE/WebSocket) just print a URL and need no root, and
+    // a transport declared for another platform is not the one being spawned —
+    // so the decision reads the host-selected transport, not entry zero.
     if scope == Scope::System && !is_elevated() {
-        if let Some(transports) = manifest.transports.as_deref() {
-            if let Some(Transport::Stdio { .. }) = transports.first() {
-                re_exec_with_pkexec();
-            }
+        if let Ok(Transport::Stdio { .. }) =
+            crate::transport::select(manifest.transports.as_deref())
+        {
+            re_exec_with_pkexec();
         }
     }
 
-    let transports = manifest
-        .transports
-        .as_deref()
-        .ok_or(RunError::NoTransports)?;
-    let primary = transports.first().ok_or(RunError::NoTransports)?;
+    let primary = crate::transport::select(manifest.transports.as_deref())?;
 
     match primary {
         Transport::Stdio { command, args, .. } => {

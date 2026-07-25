@@ -717,13 +717,8 @@ mod server {
             // already checked. A raw request over the socket for a stateless or
             // system-scope id must be refused here, never spawned.
             session_gate(scope, manifest.stateful)?;
-            let transports = manifest
-                .transports
-                .as_deref()
-                .ok_or_else(|| "no transports defined".to_string())?;
-            let primary = transports
-                .first()
-                .ok_or_else(|| "no transports defined".to_string())?;
+            let primary = crate::transport::select(manifest.transports.as_deref())
+                .map_err(|e| e.to_string())?;
             let (command, args) =
                 match primary {
                     Transport::Stdio { command, args, .. } => (command.clone(), args.clone()),

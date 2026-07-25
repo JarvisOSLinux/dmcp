@@ -38,6 +38,20 @@ pub struct RegistryServer {
     /// Internal to the browse command; never serialized.
     #[serde(skip)]
     pub registry_manifest_sha256: Option<String>,
+    /// Platforms the registry vouches for. Absent means unrestricted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
+    /// True when `platforms` excludes this host, so installing needs
+    /// `--ignore-platform`. Always serialized: the `--json` browse output is what
+    /// reaches the agent, and an agent that cannot see this would keep proposing
+    /// servers that cannot run here.
+    pub unsupported_on_host: bool,
+    /// The entry declares `platforms`, but not as an array of platform names.
+    /// Such an entry is unsupported here (it vouches for nothing readable);
+    /// this says why, so the operator can see it is a broken entry rather than
+    /// a foreign one. Omitted for every well-formed entry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub platforms_malformed: bool,
 }
 
 /// Fetch and list servers from a specific registry URL.
@@ -139,75 +153,83 @@ fn fetch_registry(
 
     let mut result = Vec::new();
     for server in servers_array {
-        let id = server
-            .get("id")
-            .and_then(|i| i.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let name = server
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let summary = server
-            .get("summary")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let version = server
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
+        let mut entry = registry_server_from_entry(&server, url);
 
-        let mut transport = server
-            .get("transports")
-            .and_then(|t| t.as_array())
-            .and_then(|a| a.first())
-            .and_then(|t| t.get("type").and_then(|x| x.as_str()))
-            .map(String::from)
-            .unwrap_or_else(|| "?".to_string());
-
-        if transport == "?" {
+        if entry.transport == "?" {
             if let Some(manifest_url) = server.get("manifest").and_then(|m| m.as_str()) {
                 if let Some(t) = transport::transport_from_manifest_url(client, manifest_url) {
-                    transport = t;
+                    entry.transport = t;
                 }
             }
         }
 
-        let keywords: Vec<String> = server
-            .get("keywords")
-            .and_then(|k| k.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let registry_manifest_sha256 = server
-            .get("integrity")
-            .and_then(|i| i.get("manifestSha256"))
-            .and_then(|h| h.as_str())
-            .filter(|h| !h.is_empty())
-            .map(String::from);
-
-        result.push(RegistryServer {
-            id,
-            name,
-            summary,
-            version,
-            transport,
-            source: url.to_string(),
-            installed: false,
-            keywords,
-            update_available: None,
-            registry_manifest_sha256,
-        });
+        result.push(entry);
     }
 
     Ok(result)
+}
+
+/// Map one registry entry to its display form. Everything readable from the
+/// entry itself is resolved here — including the platform state, which the
+/// registry mirrors from the manifest so browsing never has to fetch manifests
+/// just to know what runs on this host.
+fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> RegistryServer {
+    let str_field = |key: &str, fallback: &str| {
+        server
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+
+    // The transport this host would launch, so the column matches what an
+    // install here actually starts; the first entry still stands in when the
+    // list declares nothing for this host.
+    let transport = server
+        .get("transports")
+        .and_then(|t| t.as_array())
+        .and_then(|a| crate::transport::select_json(a).ok().or_else(|| a.first()))
+        .and_then(|t| t.get("type").and_then(|x| x.as_str()))
+        .map(String::from)
+        .unwrap_or_else(|| "?".to_string());
+
+    let keywords: Vec<String> = server
+        .get("keywords")
+        .and_then(|k| k.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let registry_manifest_sha256 = server
+        .get("integrity")
+        .and_then(|i| i.get("manifestSha256"))
+        .and_then(|h| h.as_str())
+        .filter(|h| !h.is_empty())
+        .map(String::from);
+
+    let decl = crate::platform::platform_decl(server);
+    let unsupported_on_host = !decl.supports(crate::platform::host_platform());
+    let platforms_malformed = decl.is_malformed();
+    let platforms = decl.names().map(<[String]>::to_vec);
+
+    RegistryServer {
+        id: str_field("id", "?"),
+        name: str_field("name", "?"),
+        summary: str_field("summary", ""),
+        version: str_field("version", "?"),
+        transport,
+        source: source_url.to_string(),
+        installed: false,
+        keywords,
+        update_available: None,
+        registry_manifest_sha256,
+        platforms,
+        unsupported_on_host,
+        platforms_malformed,
+    }
 }
 
 #[derive(Debug)]
@@ -241,3 +263,119 @@ impl std::fmt::Display for BrowseError {
 }
 
 impl std::error::Error for BrowseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{foreign_platform, host_platform};
+
+    const SOURCE: &str = "file:///reg/registry.json";
+
+    fn entry(platforms: Option<serde_json::Value>) -> serde_json::Value {
+        let mut e = serde_json::json!({
+            "id": "com.example.mcp.thing",
+            "name": "Thing",
+            "summary": "Does a thing",
+            "version": "1.0.0",
+            "transports": [{"type": "stdio", "command": "thing"}],
+        });
+        if let Some(p) = platforms {
+            e["platforms"] = p;
+        }
+        e
+    }
+
+    #[test]
+    fn entry_unsupported_on_this_host_is_marked() {
+        let s = registry_server_from_entry(
+            &entry(Some(serde_json::json!([foreign_platform()]))),
+            SOURCE,
+        );
+        assert!(s.unsupported_on_host);
+        assert_eq!(
+            s.platforms.as_deref(),
+            Some([foreign_platform().to_string()].as_slice())
+        );
+        // The rest of the mapping is untouched by the platform read.
+        assert_eq!(s.id, "com.example.mcp.thing");
+        assert_eq!(s.transport, "stdio");
+        assert_eq!(s.source, SOURCE);
+    }
+
+    #[test]
+    fn entry_vouching_for_this_host_is_not_marked() {
+        let s =
+            registry_server_from_entry(&entry(Some(serde_json::json!([host_platform()]))), SOURCE);
+        assert!(!s.unsupported_on_host);
+        assert_eq!(
+            s.platforms.as_deref(),
+            Some([host_platform().to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn entry_without_platforms_is_unrestricted() {
+        let s = registry_server_from_entry(&entry(None), SOURCE);
+        assert!(!s.unsupported_on_host);
+        assert_eq!(s.platforms, None);
+    }
+
+    /// The `--json` payload is what JARVIS's search_servers hands the agent. An
+    /// entry whose `platforms` cannot be read must never be reported as running
+    /// here — the agent has no way to check for itself.
+    #[test]
+    fn a_malformed_platforms_entry_is_reported_as_unsupported() {
+        for value in [
+            serde_json::json!(host_platform()),
+            serde_json::json!({"linux": true}),
+            serde_json::json!([123]),
+        ] {
+            let s = registry_server_from_entry(&entry(Some(value.clone())), SOURCE);
+            assert!(s.unsupported_on_host, "{value} must be marked unsupported");
+            assert!(s.platforms_malformed, "{value} must be flagged malformed");
+            assert_eq!(s.platforms, None, "there is no readable list to report");
+
+            let json = serde_json::to_value(&s).unwrap();
+            assert_eq!(json["unsupported_on_host"], serde_json::json!(true));
+            assert_eq!(json["platforms_malformed"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn json_output_always_carries_the_host_verdict() {
+        // This is the payload JARVIS's search_servers hands the agent: the flag
+        // must be present whether or not the entry declares platforms.
+        let marked = serde_json::to_value(registry_server_from_entry(
+            &entry(Some(serde_json::json!([foreign_platform()]))),
+            SOURCE,
+        ))
+        .unwrap();
+        assert_eq!(marked["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(marked["platforms"], serde_json::json!([foreign_platform()]));
+
+        let plain = serde_json::to_value(registry_server_from_entry(&entry(None), SOURCE)).unwrap();
+        assert_eq!(plain["unsupported_on_host"], serde_json::json!(false));
+        assert!(
+            plain.get("platforms").is_none(),
+            "an undeclared list stays absent rather than becoming an empty one"
+        );
+        assert!(
+            plain.get("platforms_malformed").is_none(),
+            "the flag is noise on every well-formed entry"
+        );
+    }
+
+    /// A server declared only for other platforms still reports the transport
+    /// it would launch there, the same way `dmcp list` does for the installed
+    /// copy — one manifest, one answer, whichever surface is asked.
+    #[test]
+    fn a_foreign_only_entry_still_reports_its_transport() {
+        let mut e = entry(Some(serde_json::json!([foreign_platform()])));
+        e["transports"] = serde_json::json!([
+            {"type": "sse", "url": "https://example.invalid", "platforms": [foreign_platform()]}
+        ]);
+        let s = registry_server_from_entry(&e, SOURCE);
+        assert_eq!(s.transport, "sse");
+        assert!(s.unsupported_on_host);
+    }
+}

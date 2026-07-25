@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::discovery::{self, Scope};
 use crate::install::{self, cli_trust_gate, fetch_server_from_registry, InstallError, TrustGate};
 use crate::paths::Paths;
+use crate::platform::{self, PlatformDecl};
 use crate::sources::list_sources;
 
 /// Machine-readable drift record for one installed server. Field names are the
@@ -25,6 +26,28 @@ pub struct DriftReport {
     pub registry_hash: Option<String>,
     pub trust_status: String,
     pub update_available: bool,
+    /// Platforms the registry vouches for; absent means unrestricted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
+    /// True when `platforms` excludes this host. Orthogonal to
+    /// `update_available`: the drift is real either way, but applying it needs
+    /// `--ignore-platform`, and the daemon's drift view has to show that.
+    pub unsupported_on_host: bool,
+    /// The entry declares `platforms`, but not readably. Unsupported here for
+    /// that reason rather than for naming other platforms. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub platforms_malformed: bool,
+}
+
+impl DriftReport {
+    /// The refusal to report when this row cannot be applied on this host.
+    pub fn platform_refusal(&self) -> platform::UnsupportedHost {
+        if self.platforms_malformed {
+            platform::UnsupportedHost::malformed()
+        } else {
+            platform::UnsupportedHost::new(self.platforms.clone().unwrap_or_default())
+        }
+    }
 }
 
 /// The subset of a registry entry needed to assess drift for one server.
@@ -32,6 +55,7 @@ pub struct DriftReport {
 pub struct RegistryEntryInfo {
     pub manifest_sha256: Option<String>,
     pub trust_status: String,
+    pub platforms: PlatformDecl,
 }
 
 /// An installed server assessed against the live registry.
@@ -89,6 +113,9 @@ pub fn assess(
                 registry_hash: None,
                 trust_status: "unknown".to_string(),
                 update_available: false,
+                platforms: None,
+                unsupported_on_host: false,
+                platforms_malformed: false,
             },
             revoked: false,
             in_registry: false,
@@ -101,6 +128,7 @@ pub fn assess(
             // trust_status field so the daemon sees the revocation.
             let update_available =
                 !revoked && is_drifted(installed_hash.as_deref(), e.manifest_sha256.as_deref());
+            let unsupported_on_host = !e.platforms.supports(platform::host_platform());
             AssessedServer {
                 report: DriftReport {
                     id: id.to_string(),
@@ -108,6 +136,9 @@ pub fn assess(
                     registry_hash: e.manifest_sha256.clone(),
                     trust_status: e.trust_status.clone(),
                     update_available,
+                    platforms: e.platforms.names().map(<[String]>::to_vec),
+                    unsupported_on_host,
+                    platforms_malformed: e.platforms.is_malformed(),
                 },
                 revoked,
                 in_registry: true,
@@ -147,6 +178,7 @@ pub fn parse_registry_entries(registry: &serde_json::Value) -> HashMap<String, R
         let info = RegistryEntryInfo {
             manifest_sha256,
             trust_status,
+            platforms: platform::platform_decl(&entry),
         };
         // First source wins; list_sources yields user scope before system, so a
         // user-configured source shadows a system one for the same id.
@@ -212,10 +244,17 @@ pub fn assess_servers(paths: &Paths, ids: &[String]) -> Result<Vec<AssessedServe
 /// Re-run the install flow for a drifted server: overwrite in place, re-verify
 /// the manifest hash, re-clone at the pinned rev, re-run setup — all handled by
 /// the existing install path. Trust gating is the caller's responsibility (it
-/// mirrors the install command's gate and warnings).
-pub fn refresh_install(paths: &Paths, id: &str, scope: Scope) -> Result<(), UpdateError> {
+/// mirrors the install command's gate and warnings); the platform gate is not,
+/// so a refresh cannot bypass it by going through this path.
+pub fn refresh_install(
+    paths: &Paths,
+    id: &str,
+    scope: Scope,
+    ignore_platform: bool,
+) -> Result<(), UpdateError> {
     let server = fetch_server_from_registry(paths, id).map_err(UpdateError::Install)?;
-    install::install(paths, id, scope, Some(server), true).map_err(UpdateError::Install)?;
+    install::install(paths, id, scope, Some(server), true, ignore_platform)
+        .map_err(UpdateError::Install)?;
     Ok(())
 }
 
@@ -353,6 +392,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "community".into(),
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(a.in_registry);
@@ -367,6 +407,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("same".into()),
             trust_status: "official".into(),
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("same".into()), Some(&entry), Scope::User);
         assert!(!a.report.update_available);
@@ -378,6 +419,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "removed".into(),
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(a.revoked);
@@ -391,6 +433,7 @@ mod tests {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
             trust_status: "deprecated".into(),
+            platforms: PlatformDecl::Absent,
         };
         let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
         assert!(!a.revoked);
@@ -407,6 +450,77 @@ mod tests {
         let a = assess("s", Some("old".into()), None, Scope::User);
         assert!(!a.in_registry);
         assert!(!a.report.update_available);
+    }
+
+    #[test]
+    fn assess_marks_a_host_the_registry_does_not_vouch_for() {
+        let entry = RegistryEntryInfo {
+            manifest_sha256: Some("new".into()),
+            trust_status: "official".into(),
+            platforms: PlatformDecl::Declared(vec![platform::foreign_platform().to_string()]),
+        };
+        let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
+        assert!(a.report.unsupported_on_host);
+        // Drift is a fact about the manifest, not about the host: the row still
+        // reports the update, and the apply path is what refuses.
+        assert!(a.report.update_available);
+        assert_eq!(
+            a.report.platforms.as_deref(),
+            Some([platform::foreign_platform().to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn assess_leaves_supported_and_undeclared_hosts_unmarked() {
+        let vouched = RegistryEntryInfo {
+            manifest_sha256: Some("new".into()),
+            trust_status: "official".into(),
+            platforms: PlatformDecl::Declared(vec![platform::host_platform().to_string()]),
+        };
+        assert!(
+            !assess("s", Some("old".into()), Some(&vouched), Scope::User)
+                .report
+                .unsupported_on_host
+        );
+
+        let undeclared = RegistryEntryInfo {
+            manifest_sha256: Some("new".into()),
+            trust_status: "official".into(),
+            platforms: PlatformDecl::Absent,
+        };
+        let a = assess("s", Some("old".into()), Some(&undeclared), Scope::User);
+        assert!(!a.report.unsupported_on_host);
+        assert_eq!(a.report.platforms, None);
+    }
+
+    #[test]
+    fn check_json_rows_carry_platform_state() {
+        let entry = RegistryEntryInfo {
+            manifest_sha256: Some("new".into()),
+            trust_status: "official".into(),
+            platforms: PlatformDecl::Declared(vec![platform::foreign_platform().to_string()]),
+        };
+        let row =
+            serde_json::to_value(assess("s", Some("old".into()), Some(&entry), Scope::User).report)
+                .unwrap();
+        assert_eq!(row["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(
+            row["platforms"],
+            serde_json::json!([platform::foreign_platform()])
+        );
+
+        // An entry that declares nothing keeps the row's shape stable for the
+        // daemon: the verdict is always there, the list only when declared.
+        let plain = RegistryEntryInfo {
+            manifest_sha256: Some("new".into()),
+            trust_status: "official".into(),
+            platforms: PlatformDecl::Absent,
+        };
+        let row =
+            serde_json::to_value(assess("s", Some("old".into()), Some(&plain), Scope::User).report)
+                .unwrap();
+        assert_eq!(row["unsupported_on_host"], serde_json::json!(false));
+        assert!(row.get("platforms").is_none());
     }
 
     #[test]
@@ -461,6 +575,50 @@ mod tests {
         assert_eq!(m2["a"].manifest_sha256.as_deref(), Some("h1"));
         // Absent trustStatus defaults to the cautious tier.
         assert_eq!(m2["a"].trust_status, "community");
+        assert_eq!(m2["a"].platforms, PlatformDecl::Absent);
+    }
+
+    #[test]
+    fn parse_registry_entries_reads_platforms() {
+        let reg = serde_json::json!({
+            "servers": {
+                "a": {"id": "a", "platforms": ["linux", "darwin"]},
+                "b": {"id": "b"}
+            }
+        });
+        let m = parse_registry_entries(&reg);
+        assert_eq!(
+            m["a"].platforms.names(),
+            Some(["linux".to_string(), "darwin".to_string()].as_slice())
+        );
+        assert_eq!(m["b"].platforms, PlatformDecl::Absent);
+    }
+
+    /// A registry entry whose `platforms` cannot be read is unsupported here,
+    /// not unrestricted: `dmcp update` must not refresh a server on a host
+    /// nothing readable ever vouched for.
+    #[test]
+    fn a_malformed_registry_platforms_field_is_refused() {
+        let reg = serde_json::json!({
+            "servers": { "a": {"id": "a", "platforms": platform::host_platform()} }
+        });
+        let m = parse_registry_entries(&reg);
+        assert!(m["a"].platforms.is_malformed());
+
+        let a = assess("a", Some("old".into()), Some(&m["a"]), Scope::User);
+        assert!(a.report.unsupported_on_host);
+        assert!(a.report.platforms_malformed);
+        assert_eq!(a.report.platforms, None);
+
+        let row = serde_json::to_value(&a.report).unwrap();
+        assert_eq!(row["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(row["platforms_malformed"], serde_json::json!(true));
+
+        let msg = a.report.platform_refusal().to_string();
+        assert!(
+            msg.contains("`platforms`") && msg.contains("--ignore-platform"),
+            "the refusal says what is wrong and how to proceed: {msg}"
+        );
     }
 
     // ---- offline fixtures (temp dirs mirror the MCP_USER_* env overrides) --
@@ -617,6 +775,51 @@ mod tests {
         // Assessment (the --check path) must not touch the install tree.
         let after = std::fs::read_to_string(&manifest_path).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn drift_check_against_local_registry_reports_platform_state() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install_fake_server(&paths, "s", "OLD");
+        write_registry(
+            &paths,
+            &serde_json::json!({
+                "servers": {"s": {"id": "s", "trustStatus": "official",
+                    "platforms": [platform::foreign_platform()],
+                    "integrity": {"manifestSha256": "NEW"}}}
+            }),
+        );
+
+        let assessed = assess_servers(&paths, &["s".to_string()]).unwrap();
+        let report = &assessed[0].report;
+        assert!(report.update_available);
+        assert!(
+            report.unsupported_on_host,
+            "a registry that stopped vouching for this host must show in the drift view"
+        );
+        assert_eq!(
+            report.platforms.as_deref(),
+            Some([platform::foreign_platform().to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn drift_check_leaves_a_vouched_host_unmarked() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install_fake_server(&paths, "s", "OLD");
+        write_registry(
+            &paths,
+            &serde_json::json!({
+                "servers": {"s": {"id": "s", "trustStatus": "official",
+                    "platforms": [platform::host_platform()],
+                    "integrity": {"manifestSha256": "NEW"}}}
+            }),
+        );
+
+        let assessed = assess_servers(&paths, &["s".to_string()]).unwrap();
+        assert!(!assessed[0].report.unsupported_on_host);
     }
 
     #[test]

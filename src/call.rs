@@ -20,6 +20,7 @@ use crate::run::config_to_env;
 pub enum CallError {
     ServerNotFound(String),
     NoTransports,
+    NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
     RemoteNotSupported(String),
     ConnectionFailed(String),
@@ -31,6 +32,7 @@ impl std::fmt::Display for CallError {
         match self {
             CallError::ServerNotFound(id) => write!(f, "Server not found: {}", id),
             CallError::NoTransports => write!(f, "No transports defined"),
+            CallError::NoTransportForHost(e) => write!(f, "{}", e),
             CallError::NoStdioTransport => write!(f, "Server has no stdio transport"),
             CallError::RemoteNotSupported(t) => {
                 write!(f, "Remote transport not yet supported: {}", t)
@@ -43,13 +45,28 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
+impl From<crate::transport::SelectError> for CallError {
+    fn from(e: crate::transport::SelectError) -> Self {
+        match e {
+            crate::transport::SelectError::Missing => CallError::NoTransports,
+            crate::transport::SelectError::ForeignHost(detail) => {
+                CallError::NoTransportForHost(detail)
+            }
+        }
+    }
+}
+
 /// True when invoking a tool requires re-executing dmcp as root: the target is a
 /// system-scoped stdio server (its process — and therefore every command it
 /// runs — must be privileged) and we are not already elevated. User-scope
 /// servers and remote (SSE/WebSocket) transports never elevate.
-fn needs_system_elevation(scope: Scope, transports: Option<&[Transport]>, elevated: bool) -> bool {
-    let first = transports.and_then(|t| t.first());
-    !elevated && scope == Scope::System && matches!(first, Some(Transport::Stdio { .. }))
+///
+/// The transport passed here is the one this host will actually launch, not
+/// entry zero: a manifest that pairs a remote endpoint for one platform with a
+/// stdio launch line for another would otherwise decide elevation from a
+/// transport nobody is about to spawn.
+fn needs_system_elevation(scope: Scope, selected: Option<&Transport>, elevated: bool) -> bool {
+    !elevated && scope == Scope::System && matches!(selected, Some(Transport::Stdio { .. }))
 }
 
 /// Elevate a `dmcp call` on a system-scoped stdio server to root, mirroring
@@ -65,7 +82,8 @@ fn needs_system_elevation(scope: Scope, transports: Option<&[Transport]>, elevat
 /// run commands and the daemon calls it constantly.
 pub fn elevate_call_for_system_scope(paths: &Paths, id: &str) {
     if let Some((manifest, scope)) = get_server(paths, id) {
-        if needs_system_elevation(scope, manifest.transports.as_deref(), is_elevated()) {
+        let selected = crate::transport::select(manifest.transports.as_deref()).ok();
+        if needs_system_elevation(scope, selected, is_elevated()) {
             re_exec_with_pkexec();
         }
     }
@@ -117,11 +135,7 @@ pub async fn call_tool(
     let (manifest, _) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let transports = manifest
-        .transports
-        .as_deref()
-        .ok_or(CallError::NoTransports)?;
-    let primary = transports.first().ok_or(CallError::NoTransports)?;
+    let primary = crate::transport::select(manifest.transports.as_deref())?;
 
     match primary {
         Transport::Stdio { command, args, .. } => {
@@ -223,11 +237,7 @@ pub async fn list_tools(paths: &Paths, id: &str) -> Result<Vec<rmcp::model::Tool
     let (manifest, _) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let transports = manifest
-        .transports
-        .as_deref()
-        .ok_or(CallError::NoTransports)?;
-    let primary = transports.first().ok_or(CallError::NoTransports)?;
+    let primary = crate::transport::select(manifest.transports.as_deref())?;
 
     match primary {
         Transport::Stdio { command, args, .. } => {
@@ -304,6 +314,7 @@ pub fn call_is_error(result: &CallToolResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::PlatformDecl;
     use rmcp::model::Content;
 
     fn stdio() -> Vec<Transport> {
@@ -311,23 +322,40 @@ mod tests {
             command: "srv".into(),
             args: None,
             description: None,
+            platforms: PlatformDecl::Absent,
         }]
+    }
+
+    fn selected(transports: &[Transport]) -> Option<&Transport> {
+        crate::transport::select(Some(transports)).ok()
     }
 
     #[test]
     fn system_stdio_elevates_when_not_root() {
-        assert!(needs_system_elevation(Scope::System, Some(&stdio()), false));
+        assert!(needs_system_elevation(
+            Scope::System,
+            selected(&stdio()),
+            false
+        ));
     }
 
     #[test]
     fn already_root_does_not_re_elevate() {
         // Guards against a pkexec re-exec loop: once elevated, never again.
-        assert!(!needs_system_elevation(Scope::System, Some(&stdio()), true));
+        assert!(!needs_system_elevation(
+            Scope::System,
+            selected(&stdio()),
+            true
+        ));
     }
 
     #[test]
     fn user_scope_never_elevates() {
-        assert!(!needs_system_elevation(Scope::User, Some(&stdio()), false));
+        assert!(!needs_system_elevation(
+            Scope::User,
+            selected(&stdio()),
+            false
+        ));
     }
 
     #[test]
@@ -335,8 +363,86 @@ mod tests {
         let sse = vec![Transport::Sse {
             url: "http://example".into(),
             description: None,
+            platforms: PlatformDecl::Absent,
         }];
-        assert!(!needs_system_elevation(Scope::System, Some(&sse), false));
+        assert!(!needs_system_elevation(
+            Scope::System,
+            selected(&sse),
+            false
+        ));
+    }
+
+    /// Elevation follows the transport this host launches. A remote endpoint
+    /// listed first for another platform must not talk dmcp out of the pkexec
+    /// re-exec the local stdio server needs.
+    #[test]
+    fn elevation_follows_the_host_selected_transport() {
+        let transports = vec![
+            Transport::Sse {
+                url: "http://example".into(),
+                description: None,
+                platforms: PlatformDecl::Declared(vec![
+                    crate::platform::foreign_platform().to_string()
+                ]),
+            },
+            Transport::Stdio {
+                command: "srv".into(),
+                args: None,
+                description: None,
+                platforms: PlatformDecl::Declared(vec![
+                    crate::platform::host_platform().to_string()
+                ]),
+            },
+        ];
+        assert!(needs_system_elevation(
+            Scope::System,
+            selected(&transports),
+            false
+        ));
+    }
+
+    /// Nothing runnable here: no transport, so nothing to elevate for. The call
+    /// itself then reports the refusal.
+    #[test]
+    fn no_transport_for_this_host_does_not_elevate() {
+        let transports = vec![Transport::Stdio {
+            command: "srv".into(),
+            args: None,
+            description: None,
+            platforms: PlatformDecl::Declared(
+                vec![crate::platform::foreign_platform().to_string()],
+            ),
+        }];
+        assert!(selected(&transports).is_none());
+        assert!(!needs_system_elevation(
+            Scope::System,
+            selected(&transports),
+            false
+        ));
+    }
+
+    /// The refusal reaches the caller as a call error naming the platforms, not
+    /// as a spawn failure for a command that was never meant to run here.
+    #[test]
+    fn select_error_maps_to_a_call_error_naming_the_platforms() {
+        let transports = vec![Transport::Stdio {
+            command: "srv".into(),
+            args: None,
+            description: None,
+            platforms: PlatformDecl::Declared(
+                vec![crate::platform::foreign_platform().to_string()],
+            ),
+        }];
+        let err: CallError = crate::transport::select(Some(&transports))
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, CallError::NoTransportForHost(_)));
+        assert!(err
+            .to_string()
+            .contains(crate::platform::foreign_platform()));
+
+        let missing: CallError = crate::transport::select(None).unwrap_err().into();
+        assert!(matches!(missing, CallError::NoTransports));
     }
 
     #[test]

@@ -51,16 +51,16 @@ cargo install --path .   # Install to ~/.cargo/bin
 | `dmcp sources list [--user] [--system]` | List registry source URLs |
 | `dmcp sources add <url> [--system]` | Add a registry source (default: user) |
 | `dmcp sources remove <url> [--system]` | Remove a registry source |
-| `dmcp browse [url] [--user] [--system] [-k keyword...] [--vector JSON \| --vectors JSON] [--top-k N] [--min-score F] [--json]` | Browse servers in registries (keyword filter or semantic vector search against the local index; transport fetched from manifest when registry omits it) |
-| `dmcp install <id or url> [--system] [--no-setup]` | Install from registry (by ID) or from manifest/endpoint URL |
+| `dmcp browse [url] [--user] [--system] [-k keyword...] [--vector JSON \| --vectors JSON] [--top-k N] [--min-score F] [--json]` | Browse servers in registries (keyword filter or semantic vector search against the local index; transport fetched from manifest when registry omits it; entries the registry does not vouch for on this host are marked `unsupported_on_host`) |
+| `dmcp install <id or url> [--system] [--no-setup] [--ignore-platform]` | Install from registry (by ID) or from manifest/endpoint URL (refused before any clone or setup when the entry's `platforms` exclude this host, unless `--ignore-platform`) |
 | `dmcp uninstall <id>` | Remove installed server |
-| `dmcp update <id> \| --all [--check] [--json]` | Refresh installed servers whose registry manifest hash has drifted (detects same-version fixes; `--check` reports without changing; `--json` requires `--check`) |
+| `dmcp update <id> \| --all [--check] [--json] [--ignore-platform]` | Refresh installed servers whose registry manifest hash has drifted (detects same-version fixes; `--check` reports without changing, including platform state; `--json` requires `--check`) |
 | `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
 | `dmcp tools <id> [--json]` | List tools on a server |
 | `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |
 | `dmcp serve` | Run dmcp as MCP server (for LLM integration) |
 | `dmcp setup <id>` | Run setup script for an installed server |
-| `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup]` | Connect to remote server |
+| `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup] [--ignore-platform]` | Connect to remote server (a fetched manifest is platform-gated like an install, before the manifest is written or its setup script runs) |
 | `dmcp count [--json]` | Count visible MCP servers (local + reachable registries) |
 | `dmcp sync-index` | Download and cache registry vector embeddings for semantic search |
 | `dmcp embedding-spec [--json]` | Show the embedding model spec the index expects |
@@ -104,6 +104,74 @@ src/
 ## Status
 
 Core features implemented: list, info, config, sources, browse (keyword + semantic search), install, uninstall, connect, run, setup, tools, call, serve (MCP server mode), count, sync-index, embedding-spec, index-server, paths.
+
+## Platform support
+
+A registry entry may declare `platforms` — `"linux"`, `"darwin"`, `"windows"` — the
+platforms the registry has actually vetted that server on. dmcp maps the host via
+`std::env::consts::OS` (`macos` → `darwin`) and refuses to install or refresh a
+server whose list excludes the host, **before** any clone or setup script runs, with
+a non-zero exit. `dmcp browse` marks such entries (`unsupported_on_host` in `--json`)
+in both of its modes — keyword search reads the registry entry, semantic search
+reads the platform state `dmcp sync-index` copied into the local vector index — so
+an agent browsing the registry never proposes a server that cannot run here. An
+index synced before that state existed reads as unrestricted until the next
+`dmcp sync-index`; locally indexed servers (`dmcp index-server`) declare nothing
+and stay unrestricted.
+
+`--ignore-platform` overrides the refusal on `install`, `update` and `connect`. It
+is the intended path for verifying a server on a new OS — once it works, PR the
+platform into the registry entry so everyone gets it. Both spellings of an install
+gate identically: `dmcp install <id>` reads the registry entry, `dmcp install <url>`
+and `dmcp connect <url>` read the fetched manifest.
+
+An entry without `platforms` is unrestricted: pre-`platforms` manifests and
+third-party registries install exactly as before. An **empty** list (`[]`, or one
+that is all blanks) reads the same way — a list vouching for nothing is a
+serialization slip, not a server installable nowhere.
+
+A `platforms` value that is present but is not an array of platform names
+(`"windows"` instead of `["windows"]`, or an array with a non-string in it) is
+neither: it vouches for nothing readable, so it is refused on every host —
+`--ignore-platform` still gets past it, and `browse --json` reports
+`unsupported_on_host` with `platforms_malformed: true`. A gate that cannot read
+its input must not conclude "no restriction was declared". The manifest itself
+still loads: a slip in this one field never hides an installed server from
+`list`, `info` or `uninstall`.
+
+### Per-transport launch lines
+
+A server keeps one entry even where its launch line differs — `python3` here,
+`python` there. Each entry in `transports` may carry its own `platforms`, and
+dmcp launches the first transport the host is in; a transport that declares
+nothing matches every host, so existing manifests are untouched.
+
+```json
+"transports": [
+  { "type": "stdio", "command": "python3", "args": ["server.py"], "platforms": ["linux", "darwin"] },
+  { "type": "stdio", "command": "python",  "args": ["server.py"], "platforms": ["windows"] }
+]
+```
+
+Selection happens at every spawn site — `call`, `tools`, `run` and session calls
+— so they cannot disagree about which command starts the server. When no
+transport covers the host, the command fails naming the platforms the manifest
+declares, instead of spawning something written for another OS. A transport
+`platforms` value is read exactly like the top-level one, so raw-JSON readers
+(install, browse) and the typed manifest never pick different transports:
+empty is unrestricted, unreadable matches nothing. The listing surfaces
+(`browse`, `list`) still name the transport such a server would launch
+elsewhere, rather than blanking it out — they describe, they do not spawn.
+
+Setup scripts follow the same idea: `setupScript` is the POSIX one,
+`setupScriptWindows` (e.g. `setup.ps1`) the Windows one, run through PowerShell —
+`install`, `connect` and `dmcp setup` all choose through the same selector.
+Whichever script the host runs is SHA-256 verified against the registry's
+`integrity` entry first. A Windows host handed only a POSIX script refuses by
+name — PowerShell runs nothing but a `.ps1`, so the entry is what is missing a
+`setupScriptWindows`. On Unix a `#!/usr/bin/env bash` shebang is honoured
+rather than forcing every script through `sh`; a host with no bash falls back to
+`sh` with a warning, so a POSIX script carrying a bash shebang still installs.
 
 ## System-scoped servers
 
@@ -193,4 +261,12 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 
 ## Changelog — corrected claims
 
+*2026-07-25:* semantic search carries the platform state too — `sync-index` copies each entry's `platforms` into the vector index and `browse --vector`/`--vectors` mark `unsupported_on_host` in the table and in `--json`, the surface an agent reaches through dispatch. Re-run `dmcp sync-index` to fill an older index. A Windows host with no `setupScriptWindows` now refuses by name instead of handing `setup.sh` to PowerShell.
+
+*2026-07-25:* the platform gate reads one way everywhere — `dmcp install <url>` and `dmcp connect` gate the fetched manifest (both take `--ignore-platform`), a `platforms` value that is not an array of platform names is refused instead of ignored, an empty list is unrestricted on the typed path as well as the raw-JSON one, and a manifest with a malformed `platforms` still loads (so it stays listable and removable). `dmcp install <id>` refuses before the elevation prompt; `connect` picks its setup script by host; a bash shebang falls back to `sh` where bash is absent.
+
 *2026-07-22:* commands table completed (count, sync-index, embedding-spec, index-server; browse vector-search flags); project tree completed (call, serve, orchestrator, sync_index, vector_index, doc_comments); status list updated to the implemented surface; elevation notes cover `dmcp call` (#33) and per-OS behavior; PKGBUILD now installs the polkit policy file (manual copy only needed for non-packaged installs).
+
+*2026-07-25:* per-transport `platforms` selects the launch line at every spawn site (#42); `setupScriptWindows` runs through PowerShell on Windows, hash-verified like the POSIX script; a bash shebang is honoured instead of always invoking `sh`.
+
+*2026-07-25:* registry `platforms` is enforced (#41) — install/update refuse a host the registry does not vouch for, `--ignore-platform` overrides, and browse marks unsupported entries; commands table updated with the new flags.

@@ -77,6 +77,11 @@ enum Commands {
         /// Skip running the setup script (if defined)
         #[arg(long)]
         no_setup: bool,
+
+        /// Install even though the registry does not vouch for this platform
+        /// (use when verifying a new OS, then PR the result to the registry)
+        #[arg(long)]
+        ignore_platform: bool,
     },
 
     /// Uninstall an MCP server
@@ -106,6 +111,10 @@ enum Commands {
         /// Output the drift report as JSON (requires --check)
         #[arg(long, requires = "check")]
         json: bool,
+
+        /// Refresh even though the registry does not vouch for this platform
+        #[arg(long)]
+        ignore_platform: bool,
     },
 
     /// Run an MCP server (stdio: spawn and relay; SSE/WebSocket: print connection URL)
@@ -150,6 +159,11 @@ enum Commands {
         /// Skip running the setup script (if defined)
         #[arg(long)]
         no_setup: bool,
+
+        /// Connect even though the manifest does not vouch for this platform
+        /// (use when verifying a new OS, then PR the result to the registry)
+        #[arg(long)]
+        ignore_platform: bool,
     },
 
     /// Run the setup script for an installed server (e.g. after config changes)
@@ -539,6 +553,7 @@ fn main() {
             id_or_url,
             system,
             no_setup,
+            ignore_platform,
         } => {
             let run_setup = !no_setup;
             let is_url = id_or_url.starts_with("http://") || id_or_url.starts_with("https://");
@@ -562,6 +577,7 @@ fn main() {
                     &[],
                     scope,
                     run_setup,
+                    ignore_platform,
                 ) {
                     Ok(id) => println!("Installed {}", id),
                     Err(e) => {
@@ -590,6 +606,10 @@ fn main() {
                     dmcp::install::TrustGate::Warn(msg) => eprintln!("[warn] {}", msg),
                     dmcp::install::TrustGate::Allow => {}
                 }
+                if let Some(refusal) = install_platform_refusal(&server, ignore_platform) {
+                    eprintln!("Error: refusing to install {}: {}", id, refusal);
+                    std::process::exit(1);
+                }
                 let scope = if system {
                     dmcp::discovery::Scope::System
                 } else {
@@ -598,7 +618,7 @@ fn main() {
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
                     re_exec_with_pkexec();
                 }
-                match install(&paths, &id, scope, Some(server), run_setup) {
+                match install(&paths, &id, scope, Some(server), run_setup, ignore_platform) {
                     Ok(()) => println!("Installed {}", id),
                     Err(e) => {
                         eprintln!("Error: {}", e);
@@ -634,6 +654,7 @@ fn main() {
             all,
             check,
             json,
+            ignore_platform,
         } => {
             if !all && id.is_none() {
                 eprintln!("Error: specify a server id or --all");
@@ -702,6 +723,18 @@ fn main() {
                     println!("{}: up to date", id);
                     continue;
                 }
+                if a.report.unsupported_on_host && !ignore_platform {
+                    // Refuse from the drift report the check already fetched,
+                    // instead of letting the install gate catch it after a
+                    // second registry round-trip.
+                    eprintln!(
+                        "Error: refusing to update {}: {}",
+                        id,
+                        a.report.platform_refusal()
+                    );
+                    had_error = true;
+                    continue;
+                }
 
                 match dmcp::update::trust_gate_for_update(&a.report.trust_status) {
                     Ok(Some(msg)) => eprintln!("[warn] {}", msg),
@@ -726,7 +759,7 @@ fn main() {
                     re_exec_with_pkexec();
                 }
 
-                match dmcp::update::refresh_install(&paths, id, a.scope) {
+                match dmcp::update::refresh_install(&paths, id, a.scope, ignore_platform) {
                     Ok(()) => println!("{}: updated", id),
                     Err(e) => {
                         eprintln!("Error updating {}: {}", id, e);
@@ -747,6 +780,7 @@ fn main() {
             config,
             system,
             no_setup,
+            ignore_platform,
         } => {
             let scope = if system {
                 dmcp::discovery::Scope::System
@@ -768,6 +802,7 @@ fn main() {
                 &config_ref,
                 scope,
                 run_setup,
+                ignore_platform,
             ) {
                 Ok(id) => println!("Connected {}", id),
                 Err(e) => {
@@ -779,7 +814,7 @@ fn main() {
         Commands::Setup { id } => {
             match get_server(&paths, &id) {
                 Some((manifest, _)) => {
-                    let setup_script = manifest.setup_script.as_deref().filter(|s| !s.is_empty());
+                    let setup_script = manifest.setup_script_for_host(dmcp::host_platform());
                     match setup_script {
                         Some(script) => {
                             let install_dir = manifest
@@ -1224,6 +1259,11 @@ fn main() {
                         parameter_schema: None,
                         vector: vec,
                         source: "local".to_string(),
+                        // A locally indexed server has no registry entry to
+                        // vouch for it, so nothing restricts it — the same
+                        // reading an absent `platforms` gets everywhere else.
+                        platforms: None,
+                        platforms_malformed: false,
                     });
                 }
             }
@@ -1248,6 +1288,8 @@ fn main() {
                                 parameter_schema: None,
                                 vector: vec,
                                 source: "local".to_string(),
+                                platforms: None,
+                                platforms_malformed: false,
                             });
                         }
                     }
@@ -1270,6 +1312,24 @@ fn main() {
             println!("Indexed {} vector(s) for {}.", n, server_id);
         }
     }
+}
+
+/// Whether `dmcp install <id>` must refuse this registry entry on this host.
+///
+/// Applied to the entry the CLI already fetched, before the scope is resolved
+/// and therefore before any pkexec re-exec: a host the registry never vouched
+/// for should not cost the operator a polkit authentication first, and the
+/// refusal should not arrive from an elevated child. `install()` gates again —
+/// this is a pre-elevation fast path, not a replacement for the choke point
+/// library callers (`dmcp serve`, `update::refresh_install`) go through.
+fn install_platform_refusal(
+    server: &serde_json::Value,
+    ignore_platform: bool,
+) -> Option<dmcp::UnsupportedHost> {
+    if ignore_platform {
+        return None;
+    }
+    dmcp::platform::check_host(server)
 }
 
 fn parse_config(s: &str) -> Result<(String, String), String> {
@@ -1380,6 +1440,9 @@ fn print_info_output(manifest: &dmcp::Manifest, scope_str: &str) {
     if let Some(ref s) = manifest.setup_script {
         println!("{}Setup:      {}", INDENT, s);
     }
+    if let Some(ref s) = manifest.setup_script_windows {
+        println!("{}Setup (windows): {}", INDENT, s);
+    }
 }
 
 fn print_list_table(servers: &[dmcp::ServerInfo]) {
@@ -1443,6 +1506,25 @@ fn print_vector_results(results: &[dmcp::SearchResult]) {
         if let Some(ref schema) = r.parameter_schema {
             println!("{}Params:  {}", INDENT, schema);
         }
+        if r.platforms_malformed {
+            println!(
+                "{}Platforms: unreadable declaration — UNSUPPORTED on this host ({}); \
+                 install needs --ignore-platform",
+                INDENT,
+                dmcp::host_platform()
+            );
+        } else if let Some(ref platforms) = r.platforms {
+            if r.unsupported_on_host {
+                println!(
+                    "{}Platforms: {} — UNSUPPORTED on this host ({}); install needs --ignore-platform",
+                    INDENT,
+                    platforms.join(", "),
+                    dmcp::host_platform()
+                );
+            } else {
+                println!("{}Platforms: {}", INDENT, platforms.join(", "));
+            }
+        }
         println!("{}Score:   {:.4}", INDENT, r.score);
         println!();
     }
@@ -1474,6 +1556,19 @@ fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
         } else {
             println!("{}: up to date", id);
         }
+        if a.report.unsupported_on_host {
+            if a.report.platforms_malformed {
+                println!(
+                    "        platforms: unreadable declaration — refresh needs --ignore-platform"
+                );
+            } else {
+                println!(
+                    "        platforms: {} (not {}) — refresh needs --ignore-platform",
+                    a.report.platforms.as_deref().unwrap_or_default().join(", "),
+                    dmcp::host_platform()
+                );
+            }
+        }
     }
     if !actionable {
         println!("All installed servers are up to date.");
@@ -1498,6 +1593,25 @@ fn print_browse_table(servers: &[dmcp::RegistryServer]) {
         println!("{}Version:   {}", INDENT, s.version);
         println!("{}Transport: {}", INDENT, s.transport);
         println!("{}Status:    {}", INDENT, status);
+        if s.platforms_malformed {
+            println!(
+                "{}Platforms: unreadable declaration — UNSUPPORTED on this host ({}); \
+                 install needs --ignore-platform",
+                INDENT,
+                dmcp::host_platform()
+            );
+        } else if let Some(ref platforms) = s.platforms {
+            if s.unsupported_on_host {
+                println!(
+                    "{}Platforms: {} — UNSUPPORTED on this host ({}); install needs --ignore-platform",
+                    INDENT,
+                    platforms.join(", "),
+                    dmcp::host_platform()
+                );
+            } else {
+                println!("{}Platforms: {}", INDENT, platforms.join(", "));
+            }
+        }
         if !s.summary.is_empty() {
             println!(
                 "{}Summary:   {}",
@@ -1534,4 +1648,66 @@ fn resolve_doc_comment_descriptions(
         .collect();
 
     (server_desc, map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A platform that is never the host, so the refusal paths are exercised
+    /// the same way whichever OS the suite runs on.
+    fn foreign_platform() -> &'static str {
+        if dmcp::host_platform() == "linux" {
+            "windows"
+        } else {
+            "linux"
+        }
+    }
+
+    fn system_entry(platforms: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "com.example.mcp.thing",
+            "scope": "system",
+            "trustStatus": "official",
+            "platforms": platforms,
+            "transports": [{"type": "stdio", "command": "thing"}],
+        })
+    }
+
+    /// The refusal is decided from the already-fetched entry, so `install`'s
+    /// system scope never gets as far as asking for elevation.
+    #[test]
+    fn a_system_scoped_entry_is_refused_before_the_scope_is_resolved() {
+        let entry = system_entry(serde_json::json!([foreign_platform()]));
+        let refusal =
+            install_platform_refusal(&entry, false).expect("an unvouched host must be refused");
+        assert!(refusal.to_string().contains(foreign_platform()));
+        assert_eq!(
+            dmcp::scope_from_registry_server(&entry),
+            dmcp::discovery::Scope::System,
+            "the refused entry is exactly the kind that would have prompted"
+        );
+    }
+
+    #[test]
+    fn a_malformed_declaration_is_refused_the_same_way() {
+        let entry = system_entry(serde_json::json!("windows"));
+        let refusal = install_platform_refusal(&entry, false).expect("malformed must be refused");
+        assert!(refusal.malformed);
+    }
+
+    #[test]
+    fn a_vouched_host_and_the_override_both_pass() {
+        let vouched = system_entry(serde_json::json!([dmcp::host_platform()]));
+        assert!(install_platform_refusal(&vouched, false).is_none());
+
+        let foreign = system_entry(serde_json::json!([foreign_platform()]));
+        assert!(
+            install_platform_refusal(&foreign, true).is_none(),
+            "--ignore-platform is the way past the gate"
+        );
+
+        let undeclared = system_entry(serde_json::Value::Null);
+        assert!(install_platform_refusal(&undeclared, false).is_none());
+    }
 }

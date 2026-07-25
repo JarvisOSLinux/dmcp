@@ -31,6 +31,30 @@ fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_stateful_server.py")
 }
 
+/// A stdio transport that launches the fake server, optionally declared for a
+/// specific platform.
+fn fake_server_transport(platforms: Option<&[&str]>) -> serde_json::Value {
+    let mut transport = serde_json::json!({
+        "type": "stdio",
+        "command": "python3",
+        "args": [fixture_path().to_string_lossy()],
+    });
+    if let Some(p) = platforms {
+        transport["platforms"] = serde_json::json!(p);
+    }
+    transport
+}
+
+/// A platform that is never this host, so a transport declared for it is one
+/// dmcp must skip whichever OS the suite runs on.
+fn foreign_platform() -> &'static str {
+    if dmcp::host_platform() == "linux" {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
 /// True if a signal can be sent to `pid` — i.e. the process is still alive.
 fn pid_alive(pid: u32) -> bool {
     Command::new("kill")
@@ -119,20 +143,32 @@ impl TestEnv {
     /// Install the fake server under `id` in the given scope. `stateful`
     /// controls whether the manifest declares `"stateful": true`.
     fn install(&self, id: &str, scope: &str, stateful: bool) {
+        self.install_with_transports(
+            id,
+            scope,
+            stateful,
+            serde_json::json!([fake_server_transport(None)]),
+        );
+    }
+
+    /// Same, with the manifest's `transports` array supplied verbatim — how a
+    /// per-platform launch line is put in front of dmcp.
+    fn install_with_transports(
+        &self,
+        id: &str,
+        scope: &str,
+        stateful: bool,
+        transports: serde_json::Value,
+    ) {
         let base = self.scope_root(scope);
         let dir = base.join(id);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let fixture = fixture_path();
         let mut manifest = serde_json::json!({
             "id": id,
             "name": id,
             "version": "0.1.0",
-            "transports": [{
-                "type": "stdio",
-                "command": "python3",
-                "args": [fixture.to_string_lossy()],
-            }],
+            "transports": transports,
             "installDir": dir.to_string_lossy(),
         });
         if stateful {
@@ -717,4 +753,103 @@ fn broker_reenforces_gate_on_raw_socket_request() {
     );
 
     env.session_close("S1");
+}
+
+// ---------------------------------------------------------------------------
+// Per-transport platform selection (#42)
+// ---------------------------------------------------------------------------
+
+/// A manifest may carry one launch line per platform. Every spawn site has to
+/// pick the one for this host: the one-shot call, the session broker, and
+/// `tools`. Here the first transport is declared for another platform and names
+/// a command that does not exist, so anything that still takes entry zero fails
+/// with a spawn error instead of returning the fake server's output.
+#[test]
+fn every_spawn_site_launches_the_transport_declared_for_this_host() {
+    if !python3_available() {
+        eprintln!("skipping every_spawn_site_launches_the_transport_declared_for_this_host: python3 not found");
+        return;
+    }
+    let env = TestEnv::new();
+    let transports = serde_json::json!([
+        {
+            "type": "stdio",
+            "command": "dmcp-no-such-command-for-another-platform",
+            "args": [],
+            "platforms": [foreign_platform()],
+        },
+        fake_server_transport(Some(&[dmcp::host_platform()])),
+    ]);
+    env.install_with_transports("com.test.fake", "user", true, transports);
+
+    let one_shot = env.call_oneshot("com.test.fake", "counter");
+    assert!(
+        one_shot.status.success(),
+        "one-shot call must launch this host's transport: {}",
+        String::from_utf8_lossy(&one_shot.stderr)
+    );
+    assert_eq!(stdout_trimmed(&one_shot), "1");
+
+    let session = env.call_session("com.test.fake", "counter", "PLAT");
+    assert!(
+        session.status.success(),
+        "broker must launch this host's transport: {}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+    assert_eq!(stdout_trimmed(&session), "1");
+
+    let tools = env
+        .cmd()
+        .args(["tools", "com.test.fake"])
+        .output()
+        .expect("run dmcp tools");
+    assert!(
+        tools.status.success(),
+        "tools must launch this host's transport: {}",
+        String::from_utf8_lossy(&tools.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tools.stdout).contains("counter"));
+
+    env.session_close("PLAT");
+}
+
+/// Nothing is declared for this host: the refusal names the platforms the
+/// server was written for, rather than spawning a command meant for another OS
+/// and reporting whatever it dies of.
+#[test]
+fn a_server_with_no_transport_for_this_host_is_refused_by_name() {
+    let env = TestEnv::new();
+    env.install_with_transports(
+        "com.test.elsewhere",
+        "user",
+        true,
+        serde_json::json!([fake_server_transport(Some(&[foreign_platform()]))]),
+    );
+
+    for args in [
+        vec!["call", "com.test.elsewhere", "counter"],
+        vec!["call", "com.test.elsewhere", "counter", "--session", "X"],
+        vec!["tools", "com.test.elsewhere"],
+        vec!["run", "com.test.elsewhere"],
+    ] {
+        let out = env.cmd().args(&args).output().expect("run dmcp");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "`dmcp {}` must fail when no transport covers this host",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains(foreign_platform()),
+            "`dmcp {}` must name the platforms the server declares, got: {}",
+            args.join(" "),
+            stderr
+        );
+        assert!(
+            !stderr.contains("No such file or directory"),
+            "`dmcp {}` must refuse before spawning, got: {}",
+            args.join(" "),
+            stderr
+        );
+    }
 }

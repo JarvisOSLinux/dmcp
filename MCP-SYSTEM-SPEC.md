@@ -111,11 +111,27 @@ Each server object in `servers`:
 
 **Required:** `id`, `name`, `summary`, `version`, and either inline `transports` + `source` (for stdio) **or** a `manifest` URL pointing to the server's `manifest.json` (the form the JARVIS mcp-registry uses — transports/source are then fetched from the manifest).
 
-**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`)
+**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`, `setupScriptWindowsSha256`), `platforms` (vetted platforms), `setupScriptWindows` (Windows setup script)
 
 **Integrity:** at install, dmcp verifies the fetched manifest's raw bytes
-against `integrity.manifestSha256` (hard failure on mismatch) and setup
-scripts against `setupScriptSha256` before running them.
+against `integrity.manifestSha256` (hard failure on mismatch) and setup scripts
+before running them — `setup.sh` against `setupScriptSha256`, `setup.ps1`
+against `setupScriptWindowsSha256`. Whichever script the host runs passes the
+same gate.
+
+**Platforms:** `platforms` lists the platforms the registry vouches for —
+`"linux"`, `"darwin"`, `"windows"`. dmcp maps the host from
+`std::env::consts::OS` (`macos` → `darwin`) and refuses to install or update an
+entry that excludes the host, before any clone or setup script, unless
+`--ignore-platform` is passed. Absent means unrestricted; so does an empty or
+all-blank list. A value that is present but is not an array of platform names
+vouches for nothing readable and is refused on every host — only absence means
+"no restriction". A manifest carrying such a value still parses; the field, not
+the file, is what fails.
+
+Individual entries in `transports` may carry the same field, selecting the
+launch line for the host (see §9). The top-level list governs installability;
+a transport's list governs which command starts the server.
 
 **Icon:** Freedesktop icon name (e.g. `"utilities-terminal"`) or URL to image (e.g. `https://example.com/logo.png`).
 
@@ -236,10 +252,19 @@ Structure matches the registry server entry, plus:
 Manifests may carry `setupScript` (a filename inside the server folder for
 local servers, or a URL for remote servers). dmcp records the related fields
 `setupScriptPath`, `setupScriptRunAt`, `setupScriptVersion`, and
-`setupScriptStatus` in the installed manifest. Scripts run with `sh` in the
-install directory and receive `MCP_INSTALL_DIR` plus `MCP_CONFIG_<KEY>`
-(uppercased, `-`/`.` → `_`) for each config key. Registry-referenced setup
-scripts are verified against `integrity.setupScriptSha256` before running.
+`setupScriptStatus` in the installed manifest, and `setupScriptWindows` names
+the Windows counterpart (e.g. `setup.ps1`). Scripts run in the install directory
+and receive `MCP_INSTALL_DIR` plus `MCP_CONFIG_<KEY>` (uppercased, `-`/`.` → `_`)
+for each config key.
+
+The interpreter is `sh`, except that a shebang naming bash (`#!/usr/bin/env
+bash`, `#!/bin/bash`) is honoured — `/bin/sh` is dash on several distributions,
+where `pipefail`, arrays and `[[ ]]` are hard errors. A Windows host runs
+`setupScriptWindows` through PowerShell (`-NoProfile -ExecutionPolicy Bypass
+-File`), falling back to `setupScript`; other hosts only consider `setupScript`.
+Registry-referenced setup scripts are verified against
+`integrity.setupScriptSha256` / `integrity.setupScriptWindowsSha256` before
+running.
 
 ### 6.5 Scope
 
@@ -304,7 +329,7 @@ When spawning a stdio server:
 
 1. Resolve manifest path from index
 2. Load manifest.json
-3. Get primary transport (first in `transports` array) with `type == "stdio"`
+3. Get the primary transport: the first entry in `transports` whose `platforms` include the host (an entry without `platforms` matches every host) with `type == "stdio"`. If no entry covers the host, the invocation fails naming the platforms the manifest declares
 4. `cwd` = `installDir` from manifest (or dir containing manifest.json)
 5. Execute `command` with `args`
 6. Config is delivered via environment variables (the manifest `config` map, keys verbatim)
@@ -332,5 +357,11 @@ For robustness, an implementation may support:
 ---
 
 ## Changelog — corrected claims
+
+*2026-07-25:* `platforms` reading rules stated for both fields — absent and empty mean unrestricted, a value that is not an array of platform names is refused on every host, and neither state can make a manifest unparseable.
+
+*2026-07-25:* per-transport `platforms` documented (#42) — host-selected launch line at every spawn site; `setupScriptWindows` / `integrity.setupScriptWindowsSha256`; the setup-script interpreter corrected (`sh`, bash when the shebang asks, PowerShell for the Windows script).
+
+*2026-07-25:* registry `platforms` documented (#41) — vetted-platform list, host mapping, and the pre-clone install/update refusal with `--ignore-platform`.
 
 *2026-07-22:* status corrected — this spec is implemented by dmcp (this repo); config delivery documented as env-var injection (servers do not read manifest.json); sources are not deduplicated across scopes; registry `servers` accepts array or id-keyed map, with manifest-referenced entries, `trustStatus`, and SHA-256 `integrity` verification documented; elevation (pkexec/polkit on Linux, sudo/osascript on macOS) and the vector index documented; env-var path overrides listed; index entries carry `keywords` with `manifest` as a read alias for `location`; setup-script fields documented; Discover-specific cache and `libdiscover`/`backward_compatibility.md` references removed; tool invocation / serve / connect / semantic search noted as beyond-spec capabilities.
