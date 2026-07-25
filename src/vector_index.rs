@@ -34,6 +34,28 @@ pub struct VectorEntry {
     pub vector: Vec<f32>,
     /// `"registry"` (from sync-index) or `"local"` (from index-server).
     pub source: String,
+    /// Platforms the registry vouches for, copied from the entry at sync time.
+    /// Absent means unrestricted — which is also what an index synced before
+    /// this field existed reads as, until `dmcp sync-index` runs again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
+    /// The registry entry declared `platforms`, but not as an array of platform
+    /// names. Stored rather than resolved so the verdict is computed against the
+    /// host that is searching, not the host that synced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub platforms_malformed: bool,
+}
+
+impl VectorEntry {
+    /// Whether `host` is outside what this entry vouches for. A declaration the
+    /// sync could not read is carried as a flag rather than a value, and still
+    /// has to read as unsupported: a gate that cannot parse its input must not
+    /// conclude "no restriction", exactly as in `browse`.
+    pub(crate) fn unsupported_on(&self, host: &str) -> bool {
+        self.platforms_malformed
+            || !crate::platform::PlatformDecl::from_names(self.platforms.as_deref().unwrap_or(&[]))
+                .supports(host)
+    }
 }
 
 /// The local vector index, stored at `~/.local/share/mcp/vector_index/index.json`.
@@ -61,6 +83,18 @@ pub struct SearchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameter_schema: Option<serde_json::Value>,
     pub score: f32,
+    /// Platforms the registry vouches for. Absent means unrestricted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
+    /// True when `platforms` excludes this host. Always serialized, for the same
+    /// reason as in `browse`: `--json` vector search is the discovery surface the
+    /// agent actually reaches through JARVIS, and an agent that cannot see this
+    /// keeps proposing servers that cannot run here.
+    pub unsupported_on_host: bool,
+    /// The entry declares `platforms`, but not as an array of platform names, so
+    /// it vouches for nothing readable. Omitted for every well-formed entry.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub platforms_malformed: bool,
 }
 
 impl VectorIndex {
@@ -99,7 +133,12 @@ impl VectorIndex {
 
     /// Search the index for the most similar entries to `query`.
     /// Returns up to `top_k` results with score >= `min_score`, ordered by descending score.
+    ///
+    /// The host verdict is decided here rather than at sync time, so an index
+    /// copied between machines — or synced before a host was re-imaged — still
+    /// answers for the machine doing the searching.
     pub fn search(&self, query: &[f32], top_k: usize, min_score: f32) -> Vec<SearchResult> {
+        let host = crate::platform::host_platform();
         let mut scored: Vec<(f32, &VectorEntry)> = self
             .entries
             .iter()
@@ -126,6 +165,9 @@ impl VectorIndex {
                 tool_description: entry.tool_description.clone(),
                 parameter_schema: entry.parameter_schema.clone(),
                 score,
+                platforms: entry.platforms.clone(),
+                unsupported_on_host: entry.unsupported_on(host),
+                platforms_malformed: entry.platforms_malformed,
             })
             .collect()
     }
@@ -173,3 +215,127 @@ impl std::fmt::Display for VectorIndexError {
 }
 
 impl std::error::Error for VectorIndexError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{foreign_platform, host_platform};
+
+    fn entry(platforms: Option<Vec<String>>, malformed: bool) -> VectorEntry {
+        VectorEntry {
+            server_id: "com.example.mcp.thing".to_string(),
+            server_name: "Thing".to_string(),
+            server_description: Some("Does a thing".to_string()),
+            tool_name: None,
+            tool_description: None,
+            parameter_schema: None,
+            vector: vec![1.0, 0.0],
+            source: "registry".to_string(),
+            platforms,
+            platforms_malformed: malformed,
+        }
+    }
+
+    fn index(entries: Vec<VectorEntry>) -> VectorIndex {
+        VectorIndex {
+            entries,
+            ..Default::default()
+        }
+    }
+
+    fn search_one(entry: VectorEntry) -> SearchResult {
+        let index = index(vec![entry]);
+        let mut results = index.search(&[1.0, 0.0], 5, 0.0);
+        assert_eq!(results.len(), 1);
+        results.remove(0)
+    }
+
+    /// The `--json` payload of `dmcp browse --vector` is what JARVIS's
+    /// search_servers hands the agent: the flag must be present whether or not
+    /// the entry declares platforms, exactly as in the keyword browse.
+    #[test]
+    fn json_output_always_carries_the_host_verdict() {
+        let marked = serde_json::to_value(search_one(entry(
+            Some(vec![foreign_platform().to_string()]),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(marked["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(marked["platforms"], serde_json::json!([foreign_platform()]));
+
+        let plain = serde_json::to_value(search_one(entry(None, false))).unwrap();
+        assert_eq!(plain["unsupported_on_host"], serde_json::json!(false));
+        assert!(
+            plain.get("platforms").is_none(),
+            "an undeclared list stays absent rather than becoming an empty one"
+        );
+        assert!(
+            plain.get("platforms_malformed").is_none(),
+            "the flag is noise on every well-formed entry"
+        );
+    }
+
+    #[test]
+    fn an_entry_vouching_for_this_host_is_not_marked() {
+        let r = search_one(entry(Some(vec![host_platform().to_string()]), false));
+        assert!(!r.unsupported_on_host);
+        assert_eq!(
+            r.platforms.as_deref(),
+            Some([host_platform().to_string()].as_slice())
+        );
+    }
+
+    /// A declaration the sync could not read vouches for nothing, so searching
+    /// must report it as unsupported rather than as unrestricted.
+    #[test]
+    fn a_malformed_declaration_is_reported_as_unsupported() {
+        let r = search_one(entry(None, true));
+        assert!(r.unsupported_on_host);
+        assert!(r.platforms_malformed);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["unsupported_on_host"], serde_json::json!(true));
+        assert_eq!(json["platforms_malformed"], serde_json::json!(true));
+    }
+
+    /// Locally indexed entries (`dmcp index-server`) have no registry entry to
+    /// read platforms from, and an index synced before the field existed has
+    /// none either: absent stays unrestricted, byte for byte today's behavior.
+    #[test]
+    fn an_index_without_platforms_still_loads_and_reads_as_unrestricted() {
+        let legacy = serde_json::json!({
+            "entries": [{
+                "server_id": "com.example.mcp.legacy",
+                "server_name": "Legacy",
+                "vector": [1.0, 0.0],
+                "source": "registry",
+            }]
+        });
+        let index: VectorIndex = serde_json::from_value(legacy).unwrap();
+        let results = index.search(&[1.0, 0.0], 5, 0.0);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].unsupported_on_host);
+        assert_eq!(results[0].platforms, None);
+    }
+
+    /// The verdict follows the searching host, not the syncing one, so a copied
+    /// index does not carry a stale answer.
+    #[test]
+    fn the_verdict_is_computed_per_host_not_stored() {
+        let e = entry(Some(vec![foreign_platform().to_string()]), false);
+        assert!(e.unsupported_on(host_platform()));
+        assert!(!e.unsupported_on(foreign_platform()));
+    }
+
+    /// Batch search is the `browse_servers_batch` path; it must mark the same
+    /// way the single-query one does.
+    #[test]
+    fn batch_search_marks_results_too() {
+        let index = index(vec![entry(
+            Some(vec![foreign_platform().to_string()]),
+            false,
+        )]);
+        let batch = index.search_batch(&[vec![1.0, 0.0], vec![0.0, 1.0]], 5, 0.5);
+        assert!(batch[0][0].unsupported_on_host);
+        assert!(batch[1].is_empty(), "min_score still applies per query");
+    }
+}

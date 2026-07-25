@@ -25,6 +25,10 @@ use std::process::Command;
 pub enum SetupError {
     NoSetupScript,
     ScriptNotFound(String),
+    /// A Windows host was handed the POSIX script, because the entry declares no
+    /// `setupScriptWindows`. Nothing here can run it, and the fault is in the
+    /// registry entry rather than on the machine.
+    NoWindowsScript(String),
     FetchFailed(String),
     /// The interpreter could not be started. It names itself and the script:
     /// a bare "No such file or directory" points at neither.
@@ -41,6 +45,14 @@ impl std::fmt::Display for SetupError {
         match self {
             SetupError::NoSetupScript => write!(f, "No setup script defined"),
             SetupError::ScriptNotFound(path) => write!(f, "Setup script not found: {}", path),
+            SetupError::NoWindowsScript(script) => write!(
+                f,
+                "No Windows setup script: this host is windows and the entry declares \
+                 only the POSIX script ({}), which no interpreter here can run — the \
+                 registry entry needs `setupScriptWindows` (a setup.ps1), or should \
+                 drop \"windows\" from `platforms`",
+                script
+            ),
             SetupError::FetchFailed(msg) => write!(f, "Failed to fetch setup script: {}", msg),
             SetupError::SpawnFailed {
                 program,
@@ -65,7 +77,9 @@ impl std::error::Error for SetupError {}
 /// Windows prefers `setupScriptWindows`; falling back to the POSIX field there
 /// is deliberate — a server that ships only `setup.sh` then fails loudly at
 /// install instead of silently skipping setup and failing later at launch, when
-/// nothing points back at the missing dependencies.
+/// nothing points back at the missing dependencies. `run_setup` turns that
+/// fallback into `SetupError::NoWindowsScript`, which names the field the entry
+/// is missing.
 pub fn script_for_host<'a>(
     host: &str,
     windows: Option<&'a str>,
@@ -90,6 +104,12 @@ pub fn run_setup(
     install_dir: &Path,
     config: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<(), SetupError> {
+    // Decided from the name, before anything is fetched or opened: a POSIX
+    // script on a Windows host has no interpreter at all, and the diagnostic
+    // that helps is the registry field it is missing — not a download, nor a
+    // missing file that was never going to run.
+    let interpreter = interpreter_for(crate::platform::host_platform(), setup_script)?;
+
     let script_path = if setup_script.starts_with("http://") || setup_script.starts_with("https://")
     {
         fetch_script(setup_script)?
@@ -105,7 +125,7 @@ pub fn run_setup(
 
     let env = build_env(install_dir, config);
     let (programs, args) = script_command(
-        crate::platform::host_platform(),
+        interpreter,
         &script_path,
         read_shebang(&script_path).as_deref(),
     );
@@ -177,29 +197,54 @@ fn run_script(
     })
 }
 
-/// Interpreters (preferred first) and arguments that execute `script` on `host`.
+/// What can interpret a setup script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interpreter {
+    /// A `.ps1`. Nothing else can interpret one, anywhere.
+    PowerShell,
+    /// A shell script, run by the shell it asks for.
+    UnixShell,
+}
+
+/// Whether a script name is a PowerShell script — the one rule, shared with the
+/// naming of a downloaded script, so a URL and a path are read the same way.
+fn is_powershell_script(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".ps1")
+}
+
+/// What runs `script` on `host`, or why nothing can.
 ///
-/// Windows has no POSIX shell to fall back on, so the script goes through
-/// PowerShell. `-NoProfile` keeps an operator's profile out of an install, and
+/// Windows has no POSIX shell to fall back on, and PowerShell's `-File` accepts
+/// nothing but a `.ps1` — so handing it `setup.sh` cannot work, and the failure
+/// it produces is about a file extension rather than about the registry entry
+/// that never shipped a `setupScriptWindows`. Refusing by name says which.
+fn interpreter_for(host: &str, script: &str) -> Result<Interpreter, SetupError> {
+    if is_powershell_script(script) {
+        Ok(Interpreter::PowerShell)
+    } else if host == "windows" {
+        Err(SetupError::NoWindowsScript(script.to_string()))
+    } else {
+        Ok(Interpreter::UnixShell)
+    }
+}
+
+/// Interpreters (preferred first) and arguments that execute `script`.
+///
+/// `-NoProfile` keeps an operator's profile out of an install, and
 /// `-ExecutionPolicy Bypass` is required because a registry-delivered script is
 /// unsigned — its integrity comes from the SHA-256 the registry recorded and
-/// dmcp verified before writing it, not from Authenticode. A `.ps1` is run the
-/// same way anywhere, since nothing else can interpret it — and nothing else
-/// can stand in for it either, so that list has exactly one entry.
+/// dmcp verified before writing it, not from Authenticode. Nothing can stand in
+/// for PowerShell, so that list has exactly one entry.
 ///
-/// Everywhere else the script is a shell script, run by the shell it asks for,
-/// with `sh` behind it as the shell that has always run these scripts.
+/// A shell script is run by the shell it asks for, with `sh` behind it as the
+/// shell that has always run these scripts.
 fn script_command(
-    host: &str,
+    interpreter: Interpreter,
     script: &Path,
     shebang: Option<&str>,
 ) -> (Vec<OsString>, Vec<OsString>) {
-    let is_powershell = host == "windows"
-        || script
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("ps1"));
-    if is_powershell {
-        (
+    match interpreter {
+        Interpreter::PowerShell => (
             vec![OsString::from("powershell.exe")],
             vec![
                 OsString::from("-NoProfile"),
@@ -208,12 +253,11 @@ fn script_command(
                 OsString::from("-File"),
                 script.into(),
             ],
-        )
-    } else {
-        (
+        ),
+        Interpreter::UnixShell => (
             unix_shells(shebang).iter().map(OsString::from).collect(),
             vec![script.into()],
-        )
+        ),
     }
 }
 
@@ -302,7 +346,11 @@ fn fetch_script(url: &str) -> Result<std::path::PathBuf, SetupError> {
         .map_err(|e| SetupError::FetchFailed(e.to_string()))?;
 
     // Keep the extension: PowerShell refuses to `-File` anything but a .ps1.
-    let ext = if url.ends_with(".ps1") { "ps1" } else { "sh" };
+    let ext = if is_powershell_script(url) {
+        "ps1"
+    } else {
+        "sh"
+    };
     let temp = std::env::temp_dir().join(format!("dmcp-setup-{}.{}", std::process::id(), ext));
     std::fs::write(&temp, &body).map_err(|e| SetupError::FetchFailed(e.to_string()))?;
 
@@ -349,13 +397,19 @@ mod tests {
     }
 
     fn program_for(host: &str, name: &str, shebang: Option<&str>) -> String {
-        let (programs, _) = script_command(host, Path::new(name), shebang);
+        let interpreter = interpreter_for(host, name).expect("host can run this script");
+        let (programs, _) = script_command(interpreter, Path::new(name), shebang);
         programs[0].to_string_lossy().to_string()
     }
 
     #[test]
     fn windows_runs_the_powershell_script_through_powershell() {
-        let (programs, args) = script_command("windows", Path::new("/srv/setup.ps1"), None);
+        assert_eq!(
+            interpreter_for("windows", "/srv/setup.ps1").unwrap(),
+            Interpreter::PowerShell
+        );
+        let (programs, args) =
+            script_command(Interpreter::PowerShell, Path::new("/srv/setup.ps1"), None);
         assert_eq!(programs.len(), 1, "a .ps1 has no substitute interpreter");
         let program = &programs[0];
         assert_eq!(program.to_string_lossy(), "powershell.exe");
@@ -428,7 +482,7 @@ mod tests {
     #[test]
     fn a_bash_script_falls_back_to_sh_when_bash_is_missing() {
         let (programs, _) = script_command(
-            "linux",
+            Interpreter::UnixShell,
             Path::new("/srv/setup.sh"),
             Some("#!/usr/bin/env bash"),
         );
@@ -438,7 +492,11 @@ mod tests {
             .collect();
         assert_eq!(programs, vec!["bash".to_string(), "sh".into()]);
 
-        let (posix, _) = script_command("linux", Path::new("/srv/setup.sh"), Some("#!/bin/sh"));
+        let (posix, _) = script_command(
+            Interpreter::UnixShell,
+            Path::new("/srv/setup.sh"),
+            Some("#!/bin/sh"),
+        );
         assert_eq!(posix.len(), 1, "sh has nothing to fall back to");
     }
 
@@ -588,10 +646,52 @@ mod tests {
         }
     }
 
+    /// The failure a Windows host without `setupScriptWindows` actually gets.
+    /// PowerShell `-File` cannot run a `.sh`, so the old argv could only produce
+    /// a complaint about a file extension; the entry is what is incomplete.
+    #[test]
+    fn a_windows_host_refuses_a_posix_setup_script_by_name() {
+        for script in ["setup.sh", "scripts/setup.sh", "https://x.invalid/setup.sh"] {
+            let err = interpreter_for("windows", script).unwrap_err();
+            assert!(matches!(err, SetupError::NoWindowsScript(_)));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("setupScriptWindows") && msg.contains(script),
+                "the diagnostic names the missing field and the script: {msg}"
+            );
+        }
+        // A .ps1 is what a Windows host is waiting for, wherever it came from.
+        for script in ["setup.ps1", "SETUP.PS1", "https://x.invalid/setup.ps1"] {
+            assert_eq!(
+                interpreter_for("windows", script).unwrap(),
+                Interpreter::PowerShell,
+                "script {script}"
+            );
+        }
+    }
+
+    /// The refusal is a Windows-only rule: nothing about a POSIX host changes.
+    #[test]
+    fn posix_hosts_are_untouched_by_the_windows_refusal() {
+        for host in ["linux", "darwin", "freebsd"] {
+            assert_eq!(
+                interpreter_for(host, "setup.sh").unwrap(),
+                Interpreter::UnixShell,
+                "host {host}"
+            );
+            assert_eq!(
+                interpreter_for(host, "setup.ps1").unwrap(),
+                Interpreter::PowerShell,
+                "host {host}"
+            );
+        }
+    }
+
     #[test]
     fn a_windows_host_falls_back_to_the_posix_script() {
-        // Loud failure at install beats a silently skipped setup that only
-        // surfaces later as a server that will not start.
+        // The fallback still happens — `run_setup` is where it turns into a
+        // failure that names the missing field, rather than a silently skipped
+        // setup that only surfaces later as a server that will not start.
         assert_eq!(
             script_for_host("windows", None, Some("setup.sh")),
             Some("setup.sh")

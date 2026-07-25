@@ -111,8 +111,13 @@ A registry entry may declare `platforms` — `"linux"`, `"darwin"`, `"windows"` 
 platforms the registry has actually vetted that server on. dmcp maps the host via
 `std::env::consts::OS` (`macos` → `darwin`) and refuses to install or refresh a
 server whose list excludes the host, **before** any clone or setup script runs, with
-a non-zero exit. `dmcp browse` marks such entries (`unsupported_on_host` in `--json`),
-so an agent browsing the registry never proposes a server that cannot run here.
+a non-zero exit. `dmcp browse` marks such entries (`unsupported_on_host` in `--json`)
+in both of its modes — keyword search reads the registry entry, semantic search
+reads the platform state `dmcp sync-index` copied into the local vector index — so
+an agent browsing the registry never proposes a server that cannot run here. An
+index synced before that state existed reads as unrestricted until the next
+`dmcp sync-index`; locally indexed servers (`dmcp index-server`) declare nothing
+and stay unrestricted.
 
 `--ignore-platform` overrides the refusal on `install`, `update` and `connect`. It
 is the intended path for verifying a server on a new OS — once it works, PR the
@@ -162,7 +167,9 @@ Setup scripts follow the same idea: `setupScript` is the POSIX one,
 `setupScriptWindows` (e.g. `setup.ps1`) the Windows one, run through PowerShell —
 `install`, `connect` and `dmcp setup` all choose through the same selector.
 Whichever script the host runs is SHA-256 verified against the registry's
-`integrity` entry first. On Unix a `#!/usr/bin/env bash` shebang is honoured
+`integrity` entry first. A Windows host handed only a POSIX script refuses by
+name — PowerShell runs nothing but a `.ps1`, so the entry is what is missing a
+`setupScriptWindows`. On Unix a `#!/usr/bin/env bash` shebang is honoured
 rather than forcing every script through `sh`; a host with no bash falls back to
 `sh` with a warning, so a POSIX script carrying a bash shebang still installs.
 
@@ -253,6 +260,8 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 
 ## Changelog — corrected claims
+
+*2026-07-25:* semantic search carries the platform state too — `sync-index` copies each entry's `platforms` into the vector index and `browse --vector`/`--vectors` mark `unsupported_on_host` in the table and in `--json`, the surface an agent reaches through dispatch. Re-run `dmcp sync-index` to fill an older index. A Windows host with no `setupScriptWindows` now refuses by name instead of handing `setup.sh` to PowerShell.
 
 *2026-07-25:* the platform gate reads one way everywhere — `dmcp install <url>` and `dmcp connect` gate the fetched manifest (both take `--ignore-platform`), a `platforms` value that is not an array of platform names is refused instead of ignored, an empty list is unrestricted on the typed path as well as the raw-JSON one, and a manifest with a malformed `platforms` still loads (so it stays listable and removable). `dmcp install <id>` refuses before the elevation prompt; `connect` picks its setup script by host; a bash shebang falls back to `sh` where bash is absent.
 

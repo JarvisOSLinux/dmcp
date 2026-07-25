@@ -156,7 +156,7 @@ The setup script runs in the server’s **install directory** (where `manifest.j
 - **Re-run**: If setup failed or was skipped, the main action button shows "Run Setup" instead of "Copy ID".
 - **Execution**: The script runs in the install directory. For system scope, it runs with elevated privileges.
 - **Interpreter**: `sh`, unless the script's shebang names bash (`#!/usr/bin/env bash`, `#!/bin/bash`) — then bash. Write the shebang if the script uses `set -o pipefail`, arrays or `[[ ]]`: `/bin/sh` is dash on Debian and Ubuntu and those are hard errors there.
-- **Windows**: on a Windows host dmcp runs `setupScriptWindows` (e.g. `setup.ps1`) through PowerShell (`-NoProfile -ExecutionPolicy Bypass -File`), falling back to `setupScript` when no Windows script is declared. On every other host `setupScript` is the only one considered.
+- **Windows**: on a Windows host dmcp runs `setupScriptWindows` (e.g. `setup.ps1`) through PowerShell (`-NoProfile -ExecutionPolicy Bypass -File`). An entry that declares only `setupScript` fails the install by name — PowerShell's `-File` runs nothing but a `.ps1`, so the entry needs a `setupScriptWindows` or should not vouch for `"windows"`. On every other host `setupScript` is the only one considered.
 - **Storage**: The manifest stores `setupScript` / `setupScriptWindows` (filename or URL), `setupScriptPath` (local path), `setupScriptVersion`, and `setupScriptRunAt` (last run timestamp).
 
 Example (local server):
@@ -326,7 +326,11 @@ nothing and counts as unsupported.
   naming the vouched-for platforms. `--ignore-platform` overrides the refusal — use
   it to verify the server on a new OS, then PR that platform into the entry.
 - `dmcp browse` marks excluded entries in the table and sets `unsupported_on_host`
-  in `--json`, and `dmcp update --check --json` rows carry the same state.
+  in `--json` — in the keyword mode from the registry entry, and in the
+  `--vector`/`--vectors` mode from the platform state `dmcp sync-index` copies
+  into the local vector index. `dmcp update --check --json` rows carry the same
+  state. An index synced before that state existed reads as unrestricted until
+  `dmcp sync-index` runs again.
 - Individual transports may narrow further (see Per-transport platforms): the
   top-level list says where the server may be installed, a transport's list says
   which launch line runs there.
@@ -552,6 +556,8 @@ Removal is a simple `rm -rf <installDir>`. All files are self-contained. For sys
 - **Provide a `bugUrl`.** Wrapper UIs can surface it as a "Report Bug" link.
 
 ## Changelog — corrected claims
+
+*2026-07-25:* the browse marking covers the semantic-search mode too (`sync-index` copies each entry's `platforms` into the vector index; the host verdict is computed at search time), with the re-sync caveat for an older index. The Windows setup fallback corrected: a `"windows"`-vetted entry that ships only `setupScript` fails the install naming the missing `setupScriptWindows`, rather than being handed to PowerShell.
 
 *2026-07-25:* the `platforms` reading rules documented for both the entry and the transport — absent/empty is unrestricted, malformed is refused everywhere (`platforms_malformed` in `browse --json`), the refusal now covers `dmcp install <url>` and `dmcp connect`, and the listing surfaces still name the transport a foreign-only server would launch.
 

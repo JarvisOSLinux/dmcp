@@ -1259,6 +1259,11 @@ fn main() {
                         parameter_schema: None,
                         vector: vec,
                         source: "local".to_string(),
+                        // A locally indexed server has no registry entry to
+                        // vouch for it, so nothing restricts it — the same
+                        // reading an absent `platforms` gets everywhere else.
+                        platforms: None,
+                        platforms_malformed: false,
                     });
                 }
             }
@@ -1283,6 +1288,8 @@ fn main() {
                                 parameter_schema: None,
                                 vector: vec,
                                 source: "local".to_string(),
+                                platforms: None,
+                                platforms_malformed: false,
                             });
                         }
                     }
@@ -1498,6 +1505,25 @@ fn print_vector_results(results: &[dmcp::SearchResult]) {
         }
         if let Some(ref schema) = r.parameter_schema {
             println!("{}Params:  {}", INDENT, schema);
+        }
+        if r.platforms_malformed {
+            println!(
+                "{}Platforms: unreadable declaration — UNSUPPORTED on this host ({}); \
+                 install needs --ignore-platform",
+                INDENT,
+                dmcp::host_platform()
+            );
+        } else if let Some(ref platforms) = r.platforms {
+            if r.unsupported_on_host {
+                println!(
+                    "{}Platforms: {} — UNSUPPORTED on this host ({}); install needs --ignore-platform",
+                    INDENT,
+                    platforms.join(", "),
+                    dmcp::host_platform()
+                );
+            } else {
+                println!("{}Platforms: {}", INDENT, platforms.join(", "));
+            }
         }
         println!("{}Score:   {:.4}", INDENT, r.score);
         println!();

@@ -127,6 +127,9 @@ excluded host **before** any directory, clone or setup (non-zero exit),
 `--ignore-platform` overrides on all three, and `browse` marks such entries
 (`unsupported_on_host`, plus `platforms`, in the table and `--json` — the
 `--json` shape is what reaches the agent through JARVIS's `search_servers`).
+Both browse modes mark: the keyword one from the registry entry, the
+`--vector`/`--vectors` one from the platform state `sync-index` copies into the
+vector index (the surface dispatch's `browse_servers` actually calls).
 `update --check --json` rows carry the same state. The agent path (`dmcp serve`)
 has no override. `dmcp install <id>` refuses ahead of the pkexec re-exec, so an
 unvouched host never costs a polkit prompt; `install()` gates again for library
@@ -170,6 +173,8 @@ one SHA-256 gate in `install.rs`. On Unix the script's shebang decides `sh` vs
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-25:* the vector-search surface carries the platform state. `VectorEntry.platforms` / `platforms_malformed` are copied from the registry entry by `sync-index` (both server- and tool-level entries, read through `platform::platform_decl`); `SearchResult` gains `platforms`, `platforms_malformed` and an always-serialized `unsupported_on_host`, computed at search time so a copied index still answers for the host doing the searching. `dmcp browse --vector`/`--vectors` mark in the table and in `--json`. **Migration:** an `index.json` synced before this reads as unrestricted until `dmcp sync-index` runs again. Locally indexed entries (`dmcp index-server`) declare nothing and stay unrestricted. `setup::run_setup` refuses a POSIX script on a Windows host with `SetupError::NoWindowsScript` instead of handing `setup.sh` to `powershell.exe -File`, which could only fail on the extension.
 
 *2026-07-25:* `platform::PlatformDecl` — one three-state reading (absent / malformed / declared) shared by the raw-JSON and typed views; `Manifest.platforms` and `Transport.platforms` deserialize through it and never fail. `connect` takes `ignore_platform` and gates the fetched manifest, so `dmcp install <url>` and `dmcp connect --ignore-platform` behave like the by-id path; `Commands::Install` refuses before the elevation prompt; `connect` selects its setup script with `setup::script_for_host`; `setup::run_setup` falls back from `bash` to `sh` and names the interpreter it failed to spawn.
 
