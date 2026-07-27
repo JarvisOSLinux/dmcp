@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::orchestrator::{DispatchRequest, Orchestrator};
 use crate::paths::Paths;
+use crate::update::AssessedServer;
 
 /// dmcp MCP server - exposes all dmcp operations as tools.
 #[derive(Clone)]
@@ -72,6 +73,69 @@ struct GetTaskStatusParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct KillTaskParams {
     pid: u64,
+}
+
+/// What the agent-facing update path should do with an assessed server.
+///
+/// Split out from the tool body so the policy is unit-testable without an MCP
+/// client or a network: the tool only fetches, decides, and formats.
+#[derive(Debug)]
+enum UpdateDecision {
+    /// The registry stopped vouching for this server — dropped from the index
+    /// or marked `removed`. Refreshing it would pull code the registry has
+    /// disowned, so the only safe answer is "uninstall it".
+    Disowned(String),
+    /// Trust or platform policy blocks this particular refresh.
+    Refuse(String),
+    UpToDate,
+    /// Apply the refresh; `warning` (deprecated/community tier) prefixes the
+    /// success text so the agent sees the tier it just pulled from.
+    Refresh {
+        warning: Option<String>,
+    },
+}
+
+/// Decide what `update_server` does with an assessed server.
+///
+/// The trust gate here is the human CLI gate, not `agent_trust_gate`: that gate
+/// exists to stop an agent *adopting* a deprecated or unreviewed server it does
+/// not have, and a refresh adopts nothing — a human already installed this id.
+/// Refusing the refresh would pin the machine to the older manifest of a server
+/// whose drift is often the very fix it needs. `removed` stays an absolute
+/// refusal in both gates.
+fn update_decision(assessed: &AssessedServer) -> UpdateDecision {
+    let id = &assessed.report.id;
+    if !assessed.in_registry {
+        return UpdateDecision::Disowned(format!(
+            "{} is no longer listed in any configured registry; not refreshed. \
+             Its local copy still works, but nothing upstream vouches for it — \
+             use uninstall_server to remove it.",
+            id
+        ));
+    }
+    if assessed.revoked {
+        return UpdateDecision::Disowned(format!(
+            "{} was REVOKED upstream (trustStatus \"removed\"); refusing to refresh it. \
+             A revoked server is uninstalled, never updated — use uninstall_server.",
+            id
+        ));
+    }
+    if !assessed.report.update_available {
+        return UpdateDecision::UpToDate;
+    }
+    // No `--ignore-platform` equivalent on the agent path: whether a server runs
+    // on this host is a registry fact a human verifies and PRs back.
+    if assessed.report.unsupported_on_host {
+        return UpdateDecision::Refuse(format!(
+            "Refusing to update {}: {}",
+            id,
+            assessed.report.platform_refusal()
+        ));
+    }
+    match crate::update::trust_gate_for_update(&assessed.report.trust_status) {
+        Ok(warning) => UpdateDecision::Refresh { warning },
+        Err(e) => UpdateDecision::Refuse(format!("Refusing to update {}: {}", id, e)),
+    }
 }
 
 #[tool_router]
@@ -143,6 +207,23 @@ impl DmcpServer {
                         serde_json::to_string_pretty(&types).unwrap().into(),
                     );
                 }
+                // Drift at the point of use (#39): the agent is about to call
+                // this server, and this is where it can learn that a fixed
+                // manifest exists upstream or that the registry revoked it.
+                //
+                // Best-effort by construction: a server's local metadata must
+                // stay readable when no registry answers, so an unreachable or
+                // unconfigured registry omits the three fields rather than
+                // turning `get_server_info` into a failing call.
+                if let Some(a) =
+                    crate::update::assess_servers(&self.paths, std::slice::from_ref(&id))
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                {
+                    out.insert("update_available".into(), a.report.update_available.into());
+                    out.insert("revoked".into(), a.revoked.into());
+                    out.insert("trust_status".into(), a.report.trust_status.into());
+                }
                 let json = serde_json::to_string_pretty(&out).unwrap_or_default();
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
@@ -202,6 +283,54 @@ impl DmcpServer {
                 }
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
+    }
+
+    #[tool(
+        description = "Update an installed MCP server by ID: re-install it from its registry when the registry's manifest hash has drifted from the installed copy (a same-version fix counts). Refuses servers the registry revoked — uninstall those instead."
+    )]
+    async fn update_server(
+        &self,
+        params: Parameters<ServerIdParam>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let id = params.0.id;
+        // One registry fetch, shared with the CLI's `dmcp update` path.
+        let assessed = match crate::update::assess_servers(&self.paths, std::slice::from_ref(&id)) {
+            Ok(a) => a,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        };
+        let Some(assessed) = assessed.into_iter().next() else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Server not installed: {}",
+                id
+            ))]));
+        };
+
+        match update_decision(&assessed) {
+            UpdateDecision::Disowned(msg) | UpdateDecision::Refuse(msg) => {
+                Ok(CallToolResult::error(vec![Content::text(msg)]))
+            }
+            UpdateDecision::UpToDate => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{} is already up to date (registry manifest hash matches the installed copy)",
+                id
+            ))])),
+            UpdateDecision::Refresh { warning } => {
+                let old = assessed.report.installed_hash.as_deref().unwrap_or("none");
+                let new = assessed.report.registry_hash.as_deref().unwrap_or("none");
+                // No platform override on the agent path, same as install_server.
+                match crate::update::refresh_install(&self.paths, &id, assessed.scope, false) {
+                    Ok(()) => {
+                        let prefix = warning
+                            .map(|w| format!("[warn] {}\n", w))
+                            .unwrap_or_default();
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "{}Updated {} ({} -> {})",
+                            prefix, id, old, new
+                        ))]))
+                    }
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+                }
+            }
         }
     }
 
@@ -330,8 +459,11 @@ impl ServerHandler for DmcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "dmcp is an MCP server manager. Use these tools to list, install, uninstall, \
+                "dmcp is an MCP server manager. Use these tools to list, install, update, uninstall, \
                  configure, and run MCP servers. You can also list and call tools on installed servers. \
+                 get_server_info reports update_available and revoked for an installed server: if a call to a \
+                 server with update_available=true fails, run update_server once and retry; a revoked server \
+                 should be uninstalled, not updated. \
                  For concurrent multitasking: dispatch_tasks spawns multiple tool calls in parallel and returns PIDs; \
                  get_task_status returns completed/failed results; kill_task aborts a task by PID."
                     .into(),
@@ -375,6 +507,7 @@ mod tests {
             "list_servers",
             "get_server_info",
             "install_server",
+            "update_server",
             "uninstall_server",
             "set_config",
             "list_server_tools",
@@ -398,29 +531,192 @@ mod tests {
         }
     }
 
-    #[test]
-    fn install_server_tool_is_id_only() {
+    /// Assert a tool exists and names its target by id, never by a location the
+    /// agent could point anywhere.
+    fn assert_tool_is_id_only(name: &str, params_type: &str) {
         let router = DmcpServer::tool_router();
         let tool = router
-            .get("install_server")
-            .expect("install_server tool must exist");
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} tool must exist on the serve surface"));
         let props = tool
             .input_schema
             .get("properties")
             .and_then(|p| p.as_object())
-            .expect("install_server input schema must list properties");
+            .unwrap_or_else(|| panic!("{name} input schema must list properties"));
         for forbidden in [
             "url", "uri", "path", "source", "manifest", "endpoint", "registry",
         ] {
             assert!(
                 !props.contains_key(forbidden),
-                "InstallParams gained a '{forbidden}' field — the agent could install \
+                "{params_type} gained a '{forbidden}' field — the agent could fetch \
                  from an arbitrary location, breaking source confinement"
             );
         }
+        assert!(props.contains_key("id"), "{name} must act by id");
+    }
+
+    #[test]
+    fn install_server_tool_is_id_only() {
+        assert_tool_is_id_only("install_server", "InstallParams");
+    }
+
+    /// update_server re-installs from the registry, so it is exactly as capable
+    /// of escaping source confinement as install_server. Same lock.
+    #[test]
+    fn update_server_tool_is_id_only() {
+        assert_tool_is_id_only("update_server", "ServerIdParam");
+    }
+
+    // ---- update_server decision policy ------------------------------------
+    //
+    // The tool body is fetch → decide → format; these pin the decide step. All
+    // offline: `assess` is pure, and the fixture-backed test below reads its
+    // registry through a `file://` source (the pattern from update.rs tests).
+
+    use crate::discovery::Scope;
+    use crate::platform::PlatformDecl;
+    use crate::update::{assess, assess_servers, RegistryEntryInfo};
+
+    fn entry(trust: &str, hash: &str) -> RegistryEntryInfo {
+        RegistryEntryInfo {
+            manifest_sha256: Some(hash.to_string()),
+            trust_status: trust.to_string(),
+            platforms: PlatformDecl::Absent,
+        }
+    }
+
+    #[test]
+    fn revoked_server_is_never_refreshed() {
+        let e = entry("removed", "NEW");
+        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        match update_decision(&a) {
+            UpdateDecision::Disowned(msg) => {
+                assert!(msg.contains("REVOKED"), "{msg}");
+                assert!(
+                    msg.contains("uninstall_server"),
+                    "the refusal must point at the remedy: {msg}"
+                );
+            }
+            other => panic!("a revoked server must never be refreshed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_gone_from_the_registry_is_not_refreshed() {
+        let a = assess("s", Some("OLD".into()), None, Scope::User);
+        match update_decision(&a) {
+            UpdateDecision::Disowned(msg) => assert!(msg.contains("uninstall_server"), "{msg}"),
+            other => panic!("nothing upstream to refresh from: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deprecated_server_updates_with_a_warning() {
+        let e = entry("deprecated", "NEW");
+        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        match update_decision(&a) {
+            UpdateDecision::Refresh { warning } => assert!(
+                warning.is_some_and(|w| w.contains("deprecated")),
+                "a deprecated refresh proceeds, but says so"
+            ),
+            other => panic!("deprecated warns and proceeds: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn official_server_updates_without_a_warning() {
+        let e = entry("official", "NEW");
+        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        assert!(matches!(
+            update_decision(&a),
+            UpdateDecision::Refresh { warning: None }
+        ));
+    }
+
+    #[test]
+    fn matching_hashes_are_a_no_op() {
+        let e = entry("official", "SAME");
+        let a = assess("s", Some("SAME".into()), Some(&e), Scope::User);
+        assert!(matches!(update_decision(&a), UpdateDecision::UpToDate));
+    }
+
+    /// The agent path has no `--ignore-platform`: a host the registry stopped
+    /// vouching for refuses here, it does not fall through to the install gate.
+    #[test]
+    fn a_host_the_registry_does_not_vouch_for_is_refused() {
+        let e = RegistryEntryInfo {
+            manifest_sha256: Some("NEW".into()),
+            trust_status: "official".into(),
+            platforms: PlatformDecl::Declared(
+                vec![crate::platform::foreign_platform().to_string()],
+            ),
+        };
+        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        match update_decision(&a) {
+            UpdateDecision::Refuse(msg) => assert!(msg.contains("--ignore-platform"), "{msg}"),
+            other => panic!("an unvouched host must refuse on the agent path: {other:?}"),
+        }
+    }
+
+    /// End-to-end offline: a real install tree + a `file://` registry, through
+    /// the same `assess_servers` fetch the tool runs. Proves the wiring, not
+    /// just the policy — and that assessing a revoked server touches nothing.
+    #[test]
+    fn revoked_fixture_refuses_without_touching_the_install_tree() {
+        let tree = crate::update::tests::TempTree::new();
+        let paths = tree.paths();
+        crate::update::tests::install_fake_server(&paths, "s", "OLD");
+        crate::update::tests::write_registry(
+            &paths,
+            &serde_json::json!({
+                "servers": {"s": {"id": "s", "trustStatus": "removed",
+                    "integrity": {"manifestSha256": "NEW"}}}
+            }),
+        );
+
+        let manifest_path = paths.user_install_dir().join("s/manifest.json");
+        let before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        let assessed = assess_servers(&paths, &["s".to_string()]).unwrap();
+        assert!(matches!(
+            update_decision(&assessed[0]),
+            UpdateDecision::Disowned(_)
+        ));
+        assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+    }
+
+    /// The same fixture path `get_server_info` uses for its drift fields.
+    #[test]
+    fn drift_fields_come_from_a_live_registry_read() {
+        let tree = crate::update::tests::TempTree::new();
+        let paths = tree.paths();
+        crate::update::tests::install_fake_server(&paths, "s", "OLD");
+        crate::update::tests::write_registry(
+            &paths,
+            &serde_json::json!({
+                "servers": {"s": {"id": "s", "trustStatus": "official",
+                    "integrity": {"manifestSha256": "NEW"}}}
+            }),
+        );
+
+        let a = assess_servers(&paths, &["s".to_string()]).unwrap();
+        let a = &a[0];
+        assert!(a.report.update_available);
+        assert!(!a.revoked);
+        assert_eq!(a.report.trust_status, "official");
+    }
+
+    /// No sources configured is the common offline case; `get_server_info` must
+    /// still answer, just without the drift fields.
+    #[test]
+    fn drift_fields_are_omitted_when_no_registry_answers() {
+        let tree = crate::update::tests::TempTree::new();
+        let paths = tree.paths();
+        crate::update::tests::install_fake_server(&paths, "s", "OLD");
         assert!(
-            props.contains_key("id"),
-            "install_server must install by id"
+            assess_servers(&paths, &["s".to_string()]).is_err(),
+            "with no sources the fetch fails — get_server_info drops the fields \
+             instead of failing the call"
         );
     }
 }

@@ -352,8 +352,11 @@ impl std::fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
+// `pub(crate)` so the serve surface's tests can drive the same offline install
+// tree + `file://` registry fixtures against `update_server`, rather than
+// growing a second copy of them that can drift from this one.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -627,12 +630,12 @@ mod tests {
 
     /// A temp directory removed on drop; isolates each test's install tree and
     /// sources.list without touching the real XDG paths or the network.
-    struct TempTree {
+    pub(crate) struct TempTree {
         root: PathBuf,
     }
 
     impl TempTree {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let root =
                 std::env::temp_dir().join(format!("dmcp-update-test-{}-{}", std::process::id(), n));
@@ -643,7 +646,7 @@ mod tests {
         /// Build a `Paths` rooted in this temp tree. The fields are exactly the
         /// targets of MCP_USER_SOURCES_PATH / MCP_USER_INSTALL_DIR /
         /// MCP_SYSTEM_* / MCP_VECTOR_INDEX_DIR, kept off the real XDG locations.
-        fn paths(&self) -> Paths {
+        pub(crate) fn paths(&self) -> Paths {
             Paths {
                 user_sources: self.root.join("user/sources.list"),
                 user_install_dir: self.root.join("user/installed"),
@@ -662,7 +665,7 @@ mod tests {
 
     /// Install a fake user-scope server: index.json entry + manifest.json whose
     /// recorded `integrity.manifestSha256` is `installed_hash`.
-    fn install_fake_server(paths: &Paths, id: &str, installed_hash: &str) {
+    pub(crate) fn install_fake_server(paths: &Paths, id: &str, installed_hash: &str) {
         let dir = paths.user_install_dir().join(id);
         std::fs::create_dir_all(&dir).unwrap();
         let manifest_path = dir.join("manifest.json");
@@ -694,7 +697,7 @@ mod tests {
 
     /// Write a registry.json fixture and point the user sources.list at it via a
     /// `file://` URL, so all fetches stay on disk.
-    fn write_registry(paths: &Paths, registry: &serde_json::Value) {
+    pub(crate) fn write_registry(paths: &Paths, registry: &serde_json::Value) {
         let reg_path = paths.user_install_dir().join("registry-fixture.json");
         std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
         std::fs::write(&reg_path, serde_json::to_string_pretty(registry).unwrap()).unwrap();
