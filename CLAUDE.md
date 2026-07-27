@@ -51,7 +51,7 @@ src/
 ├── run.rs            Spawn stdio servers, print SSE/WS URLs
 ├── setup.rs          Execute setup scripts
 ├── call.rs           Call tools on MCP servers
-├── serve.rs          Run dmcp as MCP server for LLM integration
+├── serve.rs          Run dmcp as MCP server for LLM integration (incl. `update_server` + drift fields)
 ├── orchestrator.rs   Concurrent task dispatch and tracking
 ├── sync_index.rs     Sync local indices with installed servers
 ├── vector_index.rs   Semantic search with embeddings
@@ -160,6 +160,35 @@ three call sites (`install`, `connect`, `dmcp setup`) and delivered through the
 one SHA-256 gate in `install.rs`. On Unix the script's shebang decides `sh` vs
 `bash`, with `sh` as the announced fallback where bash is not installed.
 
+### Drift on the agent surface (`dmcp serve`)
+
+Detection (`update.rs`) reaches the agent through two places in `src/serve.rs`,
+both feeding on one registry fetch via `update::assess_servers`:
+
+- **`update_server`** — **id-only**, like `install_server`: no URL, no path, no
+  source, so refreshing cannot widen the set of registries the agent installs
+  from (TRUST-MODEL §2.2). `serve::update_decision` is the whole policy, split
+  out from the tool body to be testable without an MCP client: registry entry
+  gone **or** `trustStatus: "removed"` → refuse and advise `uninstall_server` (a
+  revoked server is uninstalled, never refreshed); no drift → "already up to
+  date"; drift → `update::refresh_install` and report `old -> new` hash.
+  Trust gating is the **CLI** gate (`trust_gate_for_update`), not
+  `agent_trust_gate`: the agent gate stops an agent *adopting* a deprecated or
+  unreviewed server, and a refresh adopts nothing — a human already installed
+  this id, and refusing would pin the box to the older manifest of the server
+  whose drift is often the fix. So `deprecated` warns and proceeds (the warning
+  prefixes the success text), `removed` is refused either way. `refresh_install`
+  is called with `ignore_platform: false` — the agent path has no override, per
+  Platform support above.
+- **`get_server_info`** — carries `update_available`, `revoked` and
+  `trust_status` for an installed server, so the drift signal exists at the
+  point of use and not only in `browse` search results. **Best-effort**: any
+  fetch failure (unreachable registry, no sources configured) omits all three
+  silently rather than failing a read of local metadata.
+
+The `dmcp serve` instructions state the retry rule: if a call to a server with
+`update_available: true` fails, `update_server` once and retry.
+
 ## Specs & Docs
 
 - `MCP-SYSTEM-SPEC.md` — Full path/format specification
@@ -173,6 +202,8 @@ one SHA-256 gate in `install.rs`. On Unix the script's shebang decides `sh` vs
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-25:* drift reaches the agent (#39, dmcp half). `serve.rs` gains `update_server` (id-only, mirroring `install_server`'s confinement) plus `serve::update_decision`, the extracted policy: disowned/`removed` → refuse + advise `uninstall_server`, no drift → up to date, drift → `update::refresh_install` with `ignore_platform: false` and an `old -> new` hash in the result; `deprecated` warns and proceeds because the update path uses `trust_gate_for_update` (CLI gate), not `agent_trust_gate`. `get_server_info` carries best-effort `update_available` / `revoked` / `trust_status` from a live registry read, omitted silently on any fetch failure. `update::tests` is `pub(crate)` so the serve tests reuse its `TempTree` + `file://` registry fixtures instead of copying them. The daemon-side half (a Project-JARVIS `update_server` action, the periodic `--check --all` sweep) is not in this repo.
 
 *2026-07-25:* the vector-search surface carries the platform state. `VectorEntry.platforms` / `platforms_malformed` are copied from the registry entry by `sync-index` (both server- and tool-level entries, read through `platform::platform_decl`); `SearchResult` gains `platforms`, `platforms_malformed` and an always-serialized `unsupported_on_host`, computed at search time so a copied index still answers for the host doing the searching. `dmcp browse --vector`/`--vectors` mark in the table and in `--json`. **Migration:** an `index.json` synced before this reads as unrestricted until `dmcp sync-index` runs again. Locally indexed entries (`dmcp index-server`) declare nothing and stay unrestricted. `setup::run_setup` refuses a POSIX script on a Windows host with `SetupError::NoWindowsScript` instead of handing `setup.sh` to `powershell.exe -File`, which could only fail on the extension.
 
