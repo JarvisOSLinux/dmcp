@@ -71,6 +71,19 @@ All paths are env-var-overridable before the XDG defaults apply
 `MCP_SYSTEM_INSTALL_DIR`, `MCP_VECTOR_INDEX_DIR`), loaded from `.env` via
 dotenvy.
 
+**System-scope elevation is a CLI-only capability.** The one-shot `dmcp call`
+re-execs through pkexec before the runtime, so a system-scope **stdio** server's
+tools run as root. The agent surface (`dmcp serve`, and the orchestrator behind
+`dispatch_tasks`) cannot do this — it is long-lived and possibly headless, so it
+can neither re-exec (that would replace the daemon) nor raise a per-call polkit
+prompt. `call::call_tool` therefore **refuses** a system-scope stdio server when
+the process is not already elevated (`refuse_unelevated_system_stdio`, keyed on
+the same `needs_system_elevation` predicate that drives the CLI's re-exec, so the
+two cannot drift), rather than silently running it at the invoking user's uid.
+The CLI is unaffected (already root by the time `call_tool` runs); a `dmcp serve`
+deliberately started as root is already elevated and proceeds. User-scope tools
+and remote transports are never refused.
+
 ### Server Types
 
 - **Local (stdio)**: Git repos cloned to disk, spawned as child processes
@@ -202,6 +215,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-30:* the agent surface refuses system-scope stdio it cannot elevate (#45). `call::call_tool` now gates on `refuse_unelevated_system_stdio` (new `CallError::SystemScopeRequiresElevation`) before spawning, so a system-scope stdio server invoked from `dmcp serve` / `dispatch_tasks` is refused with a clear error instead of silently running at the invoking user's uid. Keyed on the same `needs_system_elevation` predicate as the CLI's pkexec re-exec, so the CLI (already root by `call_tool`) and the agent surface cannot disagree on what needs root; user-scope and remote transports are untouched. The chokepoint covers every unprivileged `call_tool` caller (serve, orchestrator, future lib callers). Introspection (`list_tools`) stays unprivileged.
 
 *2026-07-25:* drift reaches the agent (#39, dmcp half). `serve.rs` gains `update_server` (id-only, mirroring `install_server`'s confinement) plus `serve::update_decision`, the extracted policy: disowned/`removed` → refuse + advise `uninstall_server`, no drift → up to date, drift → `update::refresh_install` with `ignore_platform: false` and an `old -> new` hash in the result; `deprecated` warns and proceeds because the update path uses `trust_gate_for_update` (CLI gate), not `agent_trust_gate`. `get_server_info` carries best-effort `update_available` / `revoked` / `trust_status` from a live registry read, omitted silently on any fetch failure. `update::tests` is `pub(crate)` so the serve tests reuse its `TempTree` + `file://` registry fixtures instead of copying them. The daemon-side half (a Project-JARVIS `update_server` action, the periodic `--check --all` sweep) is not in this repo.
 

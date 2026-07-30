@@ -22,6 +22,7 @@ pub enum CallError {
     NoTransports,
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
+    SystemScopeRequiresElevation(String),
     RemoteNotSupported(String),
     ConnectionFailed(String),
     ToolCallFailed(String),
@@ -34,6 +35,15 @@ impl std::fmt::Display for CallError {
             CallError::NoTransports => write!(f, "No transports defined"),
             CallError::NoTransportForHost(e) => write!(f, "{}", e),
             CallError::NoStdioTransport => write!(f, "Server has no stdio transport"),
+            CallError::SystemScopeRequiresElevation(id) => write!(
+                f,
+                "System-scope server '{}' cannot run on the unprivileged agent \
+                 surface: `dmcp serve` does not elevate, so its tools would \
+                 execute as the invoking user instead of root. Run it through \
+                 the `dmcp call` CLI (which elevates via polkit), or use a \
+                 user-scope server.",
+                id
+            ),
             CallError::RemoteNotSupported(t) => {
                 write!(f, "Remote transport not yet supported: {}", t)
             }
@@ -67,6 +77,36 @@ impl From<crate::transport::SelectError> for CallError {
 /// transport nobody is about to spawn.
 fn needs_system_elevation(scope: Scope, selected: Option<&Transport>, elevated: bool) -> bool {
     !elevated && scope == Scope::System && matches!(selected, Some(Transport::Stdio { .. }))
+}
+
+/// Refuse to run a system-scope stdio server from an unprivileged process,
+/// rather than silently executing it at the wrong uid (#45).
+///
+/// The CLI elevates before it ever reaches tool execution
+/// (`elevate_call_for_system_scope` re-execs through pkexec), so by the time
+/// `call_tool` runs there it is already root and this passes. The agent surface
+/// (`dmcp serve`, and the orchestrator behind `dispatch_tasks`) cannot elevate
+/// — it is a long-lived, possibly headless process, so it can neither re-exec
+/// through pkexec (that would replace the daemon) nor raise a per-call polkit
+/// prompt. There the only safe answer is a clear refusal: the system server's
+/// tools would otherwise run as the invoking user, a confusing wrong-uid failure
+/// the agent cannot diagnose, or — worse, if the daemon were run as root to
+/// "fix" that — every user-scope tool would silently gain root too, exactly the
+/// blast radius the scope split exists to prevent. This mirrors how the serve
+/// surface already refuses source-mutating installs it cannot safely perform.
+///
+/// The same predicate that decides the CLI's pkexec re-exec decides the refusal,
+/// so the two surfaces cannot drift on what "needs root" means.
+fn refuse_unelevated_system_stdio(
+    scope: Scope,
+    selected: &Transport,
+    elevated: bool,
+    id: &str,
+) -> Result<(), CallError> {
+    if needs_system_elevation(scope, Some(selected), elevated) {
+        return Err(CallError::SystemScopeRequiresElevation(id.to_string()));
+    }
+    Ok(())
 }
 
 /// Elevate a `dmcp call` on a system-scoped stdio server to root, mirroring
@@ -132,10 +172,15 @@ pub async fn call_tool(
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let (manifest, _) =
+    let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
     let primary = crate::transport::select(manifest.transports.as_deref())?;
+
+    // Never silently run a system-scope stdio server unprivileged. The CLI has
+    // already re-exec'd as root by now; an unelevated caller (the agent surface)
+    // is refused here instead (#45).
+    refuse_unelevated_system_stdio(scope, primary, is_elevated(), id)?;
 
     match primary {
         Transport::Stdio { command, args, .. } => {
@@ -443,6 +488,73 @@ mod tests {
 
         let missing: CallError = crate::transport::select(None).unwrap_err().into();
         assert!(matches!(missing, CallError::NoTransports));
+    }
+
+    /// The agent surface is unprivileged, so a system-scope stdio server is
+    /// refused there with the dedicated error — never run at the wrong uid (#45).
+    #[test]
+    fn agent_surface_refuses_unelevated_system_stdio() {
+        let transports = stdio();
+        let err = refuse_unelevated_system_stdio(
+            Scope::System,
+            selected(&transports).unwrap(),
+            false,
+            "sys.server",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CallError::SystemScopeRequiresElevation(ref id) if id == "sys.server")
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("sys.server"));
+        assert!(msg.contains("agent surface"));
+    }
+
+    /// A serve deliberately started as root is already elevated — root is the
+    /// right uid for a system tool, so it proceeds (matches the CLI outcome).
+    #[test]
+    fn elevated_process_runs_system_stdio() {
+        let transports = stdio();
+        assert!(refuse_unelevated_system_stdio(
+            Scope::System,
+            selected(&transports).unwrap(),
+            true,
+            "sys.server",
+        )
+        .is_ok());
+    }
+
+    /// User-scope tools are unaffected by the refusal — the whole point of the
+    /// scope split is that they never need root.
+    #[test]
+    fn agent_surface_allows_unelevated_user_stdio() {
+        let transports = stdio();
+        assert!(refuse_unelevated_system_stdio(
+            Scope::User,
+            selected(&transports).unwrap(),
+            false,
+            "user.server",
+        )
+        .is_ok());
+    }
+
+    /// A remote (SSE/WebSocket) system server holds no local process to run as
+    /// root, so it is not refused even unprivileged — consistent with the CLI,
+    /// which never elevates for a remote transport.
+    #[test]
+    fn agent_surface_allows_unelevated_system_remote() {
+        let sse = vec![Transport::Sse {
+            url: "http://example".into(),
+            description: None,
+            platforms: PlatformDecl::Absent,
+        }];
+        assert!(refuse_unelevated_system_stdio(
+            Scope::System,
+            selected(&sse).unwrap(),
+            false,
+            "sys.remote",
+        )
+        .is_ok());
     }
 
     #[test]
