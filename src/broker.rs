@@ -46,6 +46,12 @@ pub enum BrokerRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    /// Answer a prompt the broker relayed mid-call. Only valid while a `call`
+    /// on this connection is parked waiting for one.
+    Answer {
+        #[serde(flatten)]
+        answer: crate::elicit::PromptAnswer,
+    },
     /// Force an immediate idle sweep.
     Gc,
     /// List live sessions.
@@ -73,6 +79,27 @@ pub struct BrokerResponse {
     /// `close` / `gc`: how many sessions were closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<usize>,
+    /// `call`, **interim**: the server asked for input and the call is parked.
+    /// This is not the final response — the client must reply with an `answer`
+    /// op, after which more interim prompts or the final response follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::elicit::PromptRequest>,
+}
+
+impl BrokerResponse {
+    /// An interim message: the call is parked on this prompt.
+    fn needs_answer(request: crate::elicit::PromptRequest) -> Self {
+        Self {
+            ok: true,
+            prompt: Some(request),
+            ..Default::default()
+        }
+    }
+
+    /// Whether this is an interim prompt rather than the final response.
+    pub fn is_prompt(&self) -> bool {
+        self.prompt.is_some()
+    }
 }
 
 impl BrokerResponse {
@@ -376,6 +403,16 @@ pub fn session_gc(_paths: &Paths) -> Result<usize, SessionError> {
 
 #[cfg(unix)]
 fn send_request(sock: &Path, req: &BrokerRequest) -> Result<BrokerResponse, SessionError> {
+    send_request_with(sock, req, decline_prompts)
+}
+
+/// Run one broker exchange, answering any prompts it parks on via `on_prompt`.
+#[cfg(unix)]
+fn send_request_with(
+    sock: &Path,
+    req: &BrokerRequest,
+    on_prompt: impl Fn(crate::elicit::PromptRequest) -> crate::elicit::PromptAnswer,
+) -> Result<BrokerResponse, SessionError> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -390,16 +427,38 @@ fn send_request(sock: &Path, req: &BrokerRequest) -> Result<BrokerResponse, Sess
     writer.flush().ok();
 
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| SessionError::Io(e.to_string()))?;
-    if line.trim().is_empty() {
-        return Err(SessionError::Protocol(
-            "empty response from broker".to_string(),
-        ));
+    // The broker may interleave prompts before the final response, so read
+    // until one arrives rather than assuming the first line is it. `on_prompt`
+    // decides each answer; a driver that cannot ask anyone declines, which
+    // unblocks the server instead of parking the session.
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| SessionError::Io(e.to_string()))?;
+        if line.trim().is_empty() {
+            return Err(SessionError::Protocol(
+                "empty response from broker".to_string(),
+            ));
+        }
+        let resp = decode_response(&line).map_err(|e| SessionError::Protocol(e.to_string()))?;
+        let Some(request) = resp.prompt.clone() else {
+            return Ok(resp);
+        };
+        let answer = on_prompt(request);
+        writer
+            .write_all(encode_line(&BrokerRequest::Answer { answer }).as_bytes())
+            .map_err(|e| SessionError::Io(e.to_string()))?;
+        writer.flush().ok();
     }
-    decode_response(&line).map_err(|e| SessionError::Protocol(e.to_string()))
+}
+
+/// Answer every prompt with a decline: the reply for a caller with nobody to
+/// ask. It is not silence — the server is told "no" and carries on or stops,
+/// which is a normal protocol outcome, where silence would hang the call.
+#[cfg(unix)]
+fn decline_prompts(_r: crate::elicit::PromptRequest) -> crate::elicit::PromptAnswer {
+    crate::elicit::PromptAnswer::Decline
 }
 
 #[cfg(unix)]
@@ -582,11 +641,12 @@ mod server {
     use rmcp::transport::TokioChildProcess;
     use rmcp::{RoleClient, ServiceExt};
     use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{mpsc, oneshot};
 
     use crate::models::Transport;
 
     type Key = (String, String);
-    type Client = RunningService<RoleClient, ()>;
+    type Client = RunningService<RoleClient, crate::elicit::ServerClient>;
     type Entry = Arc<AsyncMutex<SessionSlot>>;
 
     /// One pooled session. The `client` is `None` before first spawn and after a
@@ -594,6 +654,11 @@ mod server {
     /// call racing the removal transparently retries with a fresh slot.
     struct SessionSlot {
         client: Option<Client>,
+        /// Prompts raised by this session's server. Lives beside the client
+        /// because the client is cached across calls while the connection
+        /// driving it is not; calls to one session are serialized, so exactly
+        /// one in-flight call ever drains this.
+        prompts: Option<mpsc::Receiver<crate::elicit::Prompt>>,
         created: Instant,
         last_used: Instant,
         removed: bool,
@@ -605,6 +670,71 @@ mod server {
         sessions: Mutex<HashMap<Key, Entry>>,
         empty_since: Mutex<Option<Instant>>,
         shutdown: tokio::sync::Notify,
+    }
+
+    /// How a parked prompt reaches the driver on the other end of the socket,
+    /// and how its answer comes back.
+    pub(super) type PromptRelay = mpsc::Sender<(
+        crate::elicit::PromptRequest,
+        oneshot::Sender<crate::elicit::PromptAnswer>,
+    )>;
+
+    /// Await `fut` while relaying any prompt the server raises.
+    ///
+    /// A server that elicits stays blocked until it is answered, so the prompt
+    /// channel must be drained while the call is still running — awaiting the
+    /// call first would deadlock against the very prompt that has to be
+    /// answered to finish it.
+    ///
+    /// With no relay (a driver that never declared it can answer), or once the
+    /// relay is gone, prompts are declined immediately: the server unblocks and
+    /// the call ends, rather than the session hanging on a question nobody will
+    /// ever see.
+    async fn drive_call<F, T>(
+        fut: F,
+        mut prompts: Option<&mut mpsc::Receiver<crate::elicit::Prompt>>,
+        relay: Option<&PromptRelay>,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::pin!(fut);
+        loop {
+            let Some(rx) = prompts.as_mut() else {
+                return fut.await;
+            };
+            tokio::select! {
+                // Bias the call: when a result and a prompt are both ready, the
+                // finished call wins, so a late prompt cannot strand it.
+                biased;
+                out = &mut fut => return out,
+                got = rx.recv() => {
+                    let Some(prompt) = got else {
+                        // The client is gone; nothing more can be asked.
+                        prompts = None;
+                        continue;
+                    };
+                    let answer = match relay {
+                        Some(r) => ask_driver(r, prompt.request.clone()).await,
+                        None => crate::elicit::PromptAnswer::Decline,
+                    };
+                    let _ = prompt.answer.send(answer);
+                }
+            }
+        }
+    }
+
+    /// Put one prompt to the driver and wait for its answer, treating any
+    /// breakdown of that channel as a decline so the server always unblocks.
+    async fn ask_driver(
+        relay: &PromptRelay,
+        request: crate::elicit::PromptRequest,
+    ) -> crate::elicit::PromptAnswer {
+        let (tx, rx) = oneshot::channel();
+        if relay.send((request, tx)).await.is_err() {
+            return crate::elicit::PromptAnswer::Decline;
+        }
+        rx.await.unwrap_or(crate::elicit::PromptAnswer::Decline)
     }
 
     fn ttl_from_env() -> Duration {
@@ -666,6 +796,7 @@ mod server {
                 return e.clone();
             }
             let e: Entry = Arc::new(AsyncMutex::new(SessionSlot {
+                prompts: None,
                 client: None,
                 created: Instant::now(),
                 last_used: Instant::now(),
@@ -708,7 +839,10 @@ mod server {
 
         /// Spawn + initialize a fresh rmcp client for `id`, reusing the one-shot
         /// path's manifest→transport / install-dir / env resolution.
-        async fn spawn_client(&self, id: &str) -> Result<Client, String> {
+        async fn spawn_client(
+            &self,
+            id: &str,
+        ) -> Result<(Client, mpsc::Receiver<crate::elicit::Prompt>), String> {
             let (manifest, scope) =
                 get_server(&self.paths, id).ok_or_else(|| format!("Server not found: {}", id))?;
             // Re-enforce the CLI gate at the socket trust boundary: the broker
@@ -743,7 +877,13 @@ mod server {
             // cannot leak.
             let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
             let spawn_timeout = spawn_timeout_from_env();
-            let client = match tokio::time::timeout(spawn_timeout, ().serve(transport)).await {
+            // A brokered server is long-lived, so it CAN be asked a question
+            // mid-call and wait for the reply — the one thing the one-shot path
+            // cannot offer. Hence an attended client here, which declares the
+            // elicitation capability during this handshake.
+            let (ptx, prx) = mpsc::channel(1);
+            let handler = crate::elicit::ServerClient::attended(id, ptx);
+            let client = match tokio::time::timeout(spawn_timeout, handler.serve(transport)).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => return Err(e.to_string()),
                 Err(_) => {
@@ -753,7 +893,7 @@ mod server {
                     ))
                 }
             };
-            Ok(client)
+            Ok((client, prx))
         }
 
         async fn handle_call(
@@ -762,6 +902,7 @@ mod server {
             session: String,
             tool: String,
             args: Option<Value>,
+            relay: Option<PromptRelay>,
         ) -> BrokerResponse {
             let key: Key = (id.clone(), session);
             loop {
@@ -775,8 +916,9 @@ mod server {
                 }
                 if slot.client.is_none() {
                     match self.spawn_client(&id).await {
-                        Ok(c) => {
+                        Ok((c, prx)) => {
                             slot.client = Some(c);
+                            slot.prompts = Some(prx);
                             slot.created = Instant::now();
                         }
                         Err(e) => {
@@ -801,7 +943,10 @@ mod server {
                 // the server returned an error — which must be classified, not
                 // blanket-treated as session loss.
                 let call_result = {
-                    let client = slot.client.as_ref().unwrap();
+                    let SessionSlot {
+                        client, prompts, ..
+                    } = &mut *slot;
+                    let client = client.as_ref().unwrap();
                     let fut = client.call_tool(CallToolRequestParams {
                         meta: None,
                         name: tool.clone().into(),
@@ -812,9 +957,14 @@ mod server {
                         },
                         task: None,
                     });
+                    // The server may ask a question while this call is in
+                    // flight, and it stays blocked until answered — so the
+                    // prompt channel has to be drained CONCURRENTLY with the
+                    // call rather than after it, or the two would deadlock.
+                    let driven = drive_call(fut, prompts.as_mut(), relay.as_ref());
                     match call_timeout_from_env() {
-                        Some(t) => tokio::time::timeout(t, fut).await,
-                        None => Ok(fut.await),
+                        Some(t) => tokio::time::timeout(t, driven).await,
+                        None => Ok(driven.await),
                     }
                 };
 
@@ -992,7 +1142,7 @@ mod server {
             }
         }
 
-        async fn dispatch(&self, req: BrokerRequest) -> BrokerResponse {
+        async fn dispatch(&self, req: BrokerRequest, relay: Option<PromptRelay>) -> BrokerResponse {
             match req {
                 BrokerRequest::Ping => BrokerResponse::ok(),
                 BrokerRequest::Call {
@@ -1000,10 +1150,15 @@ mod server {
                     session,
                     tool,
                     args,
-                } => self.handle_call(id, session, tool, args).await,
+                } => self.handle_call(id, session, tool, args, relay).await,
                 BrokerRequest::Close { session, id } => self.handle_close(session, id).await,
                 BrokerRequest::Gc => BrokerResponse::closed(self.sweep().await),
                 BrokerRequest::List => BrokerResponse::list(self.list().await),
+                // An answer only means something while a call on this
+                // connection is parked, where the reader consumes it directly.
+                BrokerRequest::Answer { .. } => {
+                    BrokerResponse::err("no prompt is awaiting an answer".to_string())
+                }
             }
         }
     }
@@ -1025,9 +1180,54 @@ mod server {
             if trimmed.is_empty() {
                 continue;
             }
-            let resp = match decode_request(trimmed) {
-                Ok(req) => broker.dispatch(req).await,
-                Err(e) => BrokerResponse::err(format!("bad request: {}", e)),
+            let req = match decode_request(trimmed) {
+                Ok(req) => req,
+                Err(e) => {
+                    let resp = BrokerResponse::err(format!("bad request: {}", e));
+                    if wr.write_all(encode_line(&resp).as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = wr.flush().await;
+                    continue;
+                }
+            };
+
+            // A call may park on a prompt, so its exchange is a small loop
+            // rather than one write: interim prompt out, answer in, repeat,
+            // then the final response. Every other op answers in one shot and
+            // never touches the relay.
+            let (relay_tx, mut relay_rx) = mpsc::channel(1);
+            let fut = broker.dispatch(req, Some(relay_tx));
+            tokio::pin!(fut);
+            let resp = loop {
+                tokio::select! {
+                    biased;
+                    resp = &mut fut => break resp,
+                    Some((request, answer_to)) = relay_rx.recv() => {
+                        let interim = BrokerResponse::needs_answer(request);
+                        if wr.write_all(encode_line(&interim).as_bytes()).await.is_err() {
+                            // The driver hung up mid-question. Declining lets
+                            // the server unblock so the call can wind down
+                            // instead of leaving the session parked forever.
+                            let _ = answer_to.send(crate::elicit::PromptAnswer::Decline);
+                            continue;
+                        }
+                        let _ = wr.flush().await;
+
+                        line.clear();
+                        let answer = match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => crate::elicit::PromptAnswer::Decline,
+                            Ok(_) => match decode_request(line.trim()) {
+                                Ok(BrokerRequest::Answer { answer }) => answer,
+                                // Anything else here is a protocol mistake by
+                                // the driver; treat it as "no answer" rather
+                                // than guessing what the human meant.
+                                _ => crate::elicit::PromptAnswer::Decline,
+                            },
+                        };
+                        let _ = answer_to.send(answer);
+                    }
+                }
             };
             if wr.write_all(encode_line(&resp).as_bytes()).await.is_err() {
                 break;
