@@ -227,6 +227,17 @@ impl TestEnv {
             .expect("run dmcp call --session")
     }
 
+    /// `call_session` with tool arguments, for a server whose behavior varies
+    /// by input (the eliciting fake's round count).
+    fn call_session_args(&self, id: &str, tool: &str, args: Option<&str>, session: &str) -> Output {
+        let mut c = self.cmd();
+        c.args(["call", id, tool, "--session", session]);
+        if let Some(a) = args {
+            c.args(["--args", a]);
+        }
+        c.output().expect("run dmcp call --session --args")
+    }
+
     fn call_oneshot(&self, id: &str, tool: &str) -> Output {
         self.cmd()
             .args(["call", id, tool])
@@ -852,4 +863,201 @@ fn a_server_with_no_transport_for_this_host_is_refused_by_name() {
             stderr
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Elicitation (Project-JARVIS#210): a server asking a question mid-tool-call.
+// ---------------------------------------------------------------------------
+
+fn eliciting_fixture_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_eliciting_server.py")
+}
+
+/// Install the eliciting fake under `id`, stateful and user-scoped — the only
+/// shape `--session` accepts, and the only one that can hold a server alive
+/// across the question-and-answer exchange.
+fn install_eliciting(env: &TestEnv, id: &str) {
+    env.install_with_transports(
+        id,
+        "user",
+        true,
+        serde_json::json!([{
+            "type": "stdio",
+            "command": "python3",
+            "args": [eliciting_fixture_path().to_string_lossy()],
+        }]),
+    );
+}
+
+/// The end the whole feature turns on: a server that asks a question mid-call
+/// must get an answer and finish, never hang.
+///
+/// The `dmcp call --session` CLI has nobody to ask, so it declines — and a
+/// decline is a real protocol answer, not silence. The server unblocks, reports
+/// what it heard, and the call completes. Before elicitation was handled at all,
+/// rmcp's default client also declined, so this asserts the *observable*
+/// contract rather than merely that nothing crashed: the answer reaches the
+/// server, and the call terminates well inside the timeout.
+#[test]
+fn a_server_that_asks_a_question_gets_an_answer_and_finishes() {
+    if !python3_available() {
+        eprintln!(
+            "skipping a_server_that_asks_a_question_gets_an_answer_and_finishes: python3 not found"
+        );
+        return;
+    }
+    let env = TestEnv::new();
+    install_eliciting(&env, "com.test.elicit");
+
+    let started = Instant::now();
+    let out = env.call_session("com.test.elicit", "ask", "ELICIT");
+    let elapsed = started.elapsed();
+
+    assert!(
+        out.status.success(),
+        "eliciting call failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("decline"),
+        "the server should have been told 'decline', got: {}",
+        stdout
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the call took {:?} — a parked prompt must not hang the session",
+        elapsed
+    );
+}
+
+/// A wizard asks more than once. Every round must be answered independently,
+/// so the server walks through all of them and the call still terminates.
+#[test]
+fn every_round_of_a_multi_question_wizard_is_answered() {
+    if !python3_available() {
+        eprintln!("skipping every_round_of_a_multi_question_wizard_is_answered: python3 not found");
+        return;
+    }
+    let env = TestEnv::new();
+    install_eliciting(&env, "com.test.elicit.multi");
+
+    let out = env.call_session_args(
+        "com.test.elicit.multi",
+        "ask",
+        Some(r#"{"rounds": 3}"#),
+        "WIZARD",
+    );
+
+    assert!(
+        out.status.success(),
+        "multi-round call failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("decline").count(),
+        3,
+        "each of the three questions needs its own answer, got: {}",
+        stdout
+    );
+}
+
+/// The session survives an elicitation: the server is still the same live
+/// process afterwards, so a parked-then-answered prompt does not cost the
+/// in-process state the broker exists to preserve.
+#[test]
+fn a_session_outlives_the_question_it_was_asked() {
+    if !python3_available() {
+        eprintln!("skipping a_session_outlives_the_question_it_was_asked: python3 not found");
+        return;
+    }
+    let env = TestEnv::new();
+    install_eliciting(&env, "com.test.elicit.alive");
+
+    let first = env.call_session("com.test.elicit.alive", "ask", "ALIVE");
+    assert!(first.status.success());
+    let second = env.call_session("com.test.elicit.alive", "ask", "ALIVE");
+    assert!(
+        second.status.success(),
+        "the session should still be usable after a prompt: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+/// The accept path, end to end through the real CLI: a driver that answers a
+/// question gets its answer all the way into the server.
+///
+/// This is the case the plain CLI cannot reach — with no channel to a human it
+/// declines — so it is the one that proves the exchange actually carries
+/// content rather than merely terminating. dmcp is spawned with piped stdio,
+/// exactly as dispatch would, and answered from the test.
+#[test]
+fn an_interactive_driver_answers_the_servers_question() {
+    if !python3_available() {
+        eprintln!("skipping an_interactive_driver_answers_the_servers_question: python3 not found");
+        return;
+    }
+    use std::io::{BufRead, BufReader, Write};
+
+    let env = TestEnv::new();
+    install_eliciting(&env, "com.test.elicit.interactive");
+
+    let mut child = env
+        .cmd()
+        .args([
+            "call",
+            "com.test.elicit.interactive",
+            "ask",
+            "--session",
+            "INTERACTIVE",
+            "--interactive",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dmcp call --interactive");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+
+    let mut saw_prompt = false;
+    let mut result_line = None;
+    while let Some(Ok(line)) = lines.next() {
+        let msg: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => panic!("interactive mode must emit JSON only, got: {}", line),
+        };
+        match msg["type"].as_str() {
+            Some("prompt") => {
+                saw_prompt = true;
+                // The question is attributed to the server that asked it, so a
+                // renderer never has to speak it in the assistant's voice.
+                assert_eq!(msg["server"], "com.test.elicit.interactive");
+                assert!(msg["message"].as_str().unwrap().contains("partition type"));
+                writeln!(
+                    stdin,
+                    r#"{{"action":"accept","content":{{"choice":"primary"}}}}"#
+                )
+                .expect("write answer");
+                stdin.flush().expect("flush answer");
+            }
+            Some("result") => {
+                result_line = Some(msg);
+                break;
+            }
+            other => panic!("unexpected message type {:?}", other),
+        }
+    }
+
+    let out = result_line.expect("a result must follow the prompt");
+    assert!(saw_prompt, "the server's question must reach the driver");
+    assert_eq!(
+        out["content"].as_str().unwrap(),
+        "accept:primary",
+        "the driver's answer must reach the server verbatim"
+    );
+    assert_eq!(out["isError"], false);
+    let _ = child.wait();
 }

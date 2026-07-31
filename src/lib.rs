@@ -10,6 +10,7 @@ pub mod connect;
 pub mod discovery;
 pub mod doc_comments;
 pub mod elevation;
+pub mod elicit;
 pub mod install;
 pub mod models;
 pub mod orchestrator;
