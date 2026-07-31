@@ -363,7 +363,10 @@ async fn call_tool_stdio(
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
-    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = crate::elicit::ServerClient::unattended(id)
+        .serve(transport)
+        .await
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let args_obj = arguments
         .and_then(|v| v.as_object().cloned())
@@ -399,7 +402,10 @@ async fn call_tool_remote(
 
     let transport = StreamableHttpClientTransport::from_uri(Arc::from(url));
 
-    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = crate::elicit::ServerClient::unattended(url)
+        .serve(transport)
+        .await
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let args_obj = arguments
         .and_then(|v| v.as_object().cloned())
@@ -452,7 +458,10 @@ async fn list_tools_stdio(
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
-    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = crate::elicit::ServerClient::unattended(id)
+        .serve(transport)
+        .await
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let tools = client
         .list_tools(Default::default())
@@ -470,7 +479,10 @@ async fn list_tools_remote(url: &str) -> Result<Vec<rmcp::model::Tool>, CallErro
 
     let transport = StreamableHttpClientTransport::from_uri(Arc::from(url));
 
-    let client = ().serve(transport).await.map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let client = crate::elicit::ServerClient::unattended(url)
+        .serve(transport)
+        .await
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
     let tools = client
         .list_tools(Default::default())
