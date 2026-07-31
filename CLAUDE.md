@@ -71,6 +71,42 @@ All paths are env-var-overridable before the XDG defaults apply
 `MCP_SYSTEM_INSTALL_DIR`, `MCP_VECTOR_INDEX_DIR`), loaded from `.env` via
 dotenvy.
 
+**System-scope elevation reaches the agent surface by delegation.** The one-shot
+`dmcp call` re-execs through pkexec before the runtime, so a system-scope
+**stdio** server's tools run as root. `dmcp serve` cannot re-exec *itself* — that
+would replace the daemon — but it does not need to: `call::call_tool` spawns a
+child `dmcp call`, which performs that re-exec on its own and lets polkit raise
+the prompt (the action sets `allow_gui`, precisely so a caller with no TTY can be
+answered graphically). The child runs the server as root, prints the result, and
+exits, so **the privilege dies with the command** instead of becoming a standing
+capability. Same shape dispatch already uses to reach dmcp.
+
+`plan_elevation` is the whole policy — pure, and keyed on the same
+`needs_system_elevation` predicate that drives the CLI's re-exec, so the two
+surfaces cannot drift on what "needs root" means:
+
+- **Direct** — user scope, a remote transport, or already root (the CLI by the
+  time it reaches `call_tool`; a `dmcp serve` deliberately started as root).
+- **Delegate** — unelevated + system scope + stdio: spawn the child.
+- **Refuse** — the child is *itself* a delegate (`DMCP_ELEVATION_DELEGATED`) and
+  still could not elevate. Without this a polkit denial would recurse.
+
+The child's exit carries the outcome exactly as `dmcp call` reports it: 0 is
+success, 2 is a tool-reported error (status rides the exit code, never a sentinel
+in the output), anything else is `ElevationFailed` with the child's stderr — so a
+polkit denial is reported rather than downgraded into an unprivileged run. polkit
+**denies a non-active session outright** (`allow_inactive: no`) rather than
+prompting, so SSH/headless/system-unit callers land here. An unanswered prompt is
+bounded by `DMCP_ELEVATION_TIMEOUT_SECS` (default 180); the child owns its
+process group and is killed on drop, so a timeout tears down the pkexec/server
+subtree instead of leaving a root process behind. The delegated argv carries no
+`--session`: an elevated server must not outlive the command that needed it,
+which is also why `--session` stays user-scope-only.
+
+`auth_admin_keep` in the policy means one password covers a short window; TLA
+still confirms each privileged command upstream, so informed consent is
+per-command and proof-of-presence is per-window.
+
 ### Server Types
 
 - **Local (stdio)**: Git repos cloned to disk, spawned as child processes
@@ -202,6 +238,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-30:* the agent surface elevates by delegation (#45). `call::call_tool` gates on `plan_elevation` (Direct / Delegate / Refuse) before spawning: a system-scope stdio server invoked from `dmcp serve` or `dispatch_tasks` is handed to a child `dmcp call`, which re-execs through pkexec itself and lets polkit prompt (`allow_gui` exists for exactly this caller), so the tool runs as root instead of silently at the invoking user's uid. `dmcp serve` cannot re-exec itself — it would replace the daemon — but spawning a child that elevates costs nothing, and the privilege dies with the command. `DMCP_ELEVATION_DELEGATED` stops a denied child from delegating again (a denial would otherwise recurse); `DMCP_ELEVATION_TIMEOUT_SECS` (default 180) bounds an unanswered prompt, with the child in its own process group and killed on drop. Exit 0/2 map to success / tool-reported error; anything else is `ElevationFailed` carrying the child's stderr, which is where a non-active session lands since polkit denies rather than prompts there. Keyed on the same `needs_system_elevation` predicate as the CLI's re-exec, so the two surfaces cannot disagree on what needs root; user-scope and remote transports are untouched, and introspection (`list_tools`) stays unprivileged. Verified end-to-end by driving a real `dmcp serve` as an unprivileged uid: the user-scope call returned its result, the system-scope call delegated and reported the elevation failure.
 
 *2026-07-25:* drift reaches the agent (#39, dmcp half). `serve.rs` gains `update_server` (id-only, mirroring `install_server`'s confinement) plus `serve::update_decision`, the extracted policy: disowned/`removed` → refuse + advise `uninstall_server`, no drift → up to date, drift → `update::refresh_install` with `ignore_platform: false` and an `old -> new` hash in the result; `deprecated` warns and proceeds because the update path uses `trust_gate_for_update` (CLI gate), not `agent_trust_gate`. `get_server_info` carries best-effort `update_available` / `revoked` / `trust_status` from a live registry read, omitted silently on any fetch failure. `update::tests` is `pub(crate)` so the serve tests reuse its `TempTree` + `file://` registry fixtures instead of copying them. The daemon-side half (a Project-JARVIS `update_server` action, the periodic `--check --all` sweep) is not in this repo.
 

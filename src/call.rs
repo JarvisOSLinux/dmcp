@@ -3,8 +3,10 @@
 //! Connects to a server via its transport (stdio, SSE, WebSocket) and invokes tools.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, CallToolResult};
+use rmcp::model::{CallToolRequestParams, CallToolResult, Content};
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 use tokio::process::Command;
@@ -22,6 +24,9 @@ pub enum CallError {
     NoTransports,
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
+    SystemScopeRequiresElevation(String),
+    ElevationFailed(String, String),
+    ElevationTimedOut(String, u64),
     RemoteNotSupported(String),
     ConnectionFailed(String),
     ToolCallFailed(String),
@@ -34,6 +39,29 @@ impl std::fmt::Display for CallError {
             CallError::NoTransports => write!(f, "No transports defined"),
             CallError::NoTransportForHost(e) => write!(f, "{}", e),
             CallError::NoStdioTransport => write!(f, "Server has no stdio transport"),
+            CallError::SystemScopeRequiresElevation(id) => write!(
+                f,
+                "System-scope server '{}' needs root and no elevation path is \
+                 available from here. Run it through the `dmcp call` CLI, or \
+                 use a user-scope server.",
+                id
+            ),
+            CallError::ElevationFailed(id, detail) => write!(
+                f,
+                "Elevation for system-scope server '{}' was not granted: {}. \
+                 polkit denies a non-active session (SSH, headless, a system \
+                 unit) outright and does not prompt; from a desktop session the \
+                 prompt may have been dismissed.",
+                id,
+                detail.trim()
+            ),
+            CallError::ElevationTimedOut(id, secs) => write!(
+                f,
+                "Elevation for system-scope server '{}' went unanswered for {}s \
+                 and was cancelled (set DMCP_ELEVATION_TIMEOUT_SECS to change). \
+                 The authentication prompt was never completed.",
+                id, secs
+            ),
             CallError::RemoteNotSupported(t) => {
                 write!(f, "Remote transport not yet supported: {}", t)
             }
@@ -67,6 +95,153 @@ impl From<crate::transport::SelectError> for CallError {
 /// transport nobody is about to spawn.
 fn needs_system_elevation(scope: Scope, selected: Option<&Transport>, elevated: bool) -> bool {
     !elevated && scope == Scope::System && matches!(selected, Some(Transport::Stdio { .. }))
+}
+
+/// Set on a child spawned purely to elevate, so it can never spawn another.
+/// If pkexec failed in the child, the answer is the refusal, not a second
+/// attempt — without this a denial would recurse until the box gave out.
+const DELEGATED_ENV: &str = "DMCP_ELEVATION_DELEGATED";
+
+/// What an unelevated caller should do about the server it is about to invoke.
+#[derive(Debug, PartialEq, Eq)]
+enum ElevationPlan {
+    /// Run it here: user scope, a remote transport, or we are already root.
+    Direct,
+    /// Spawn a child `dmcp call`, which re-execs through pkexec and prompts.
+    Delegate,
+    /// Elevation is needed but unreachable — report rather than mis-run.
+    Refuse,
+}
+
+/// Decide how a system-scope stdio server gets its root (#45).
+///
+/// `dmcp serve` cannot elevate *itself* — re-execing through pkexec would
+/// replace the daemon, and it may be headless. But it does not need to: it can
+/// spawn a **child** `dmcp call`, which re-execs through pkexec on its own and
+/// lets polkit raise the prompt (the action sets `allow_gui`, precisely so a
+/// caller with no TTY can be answered graphically). The child runs the server as
+/// root, prints the tool result, and exits — so the privilege dies with the
+/// command instead of becoming a standing capability. This is the same shape
+/// dispatch already uses to reach dmcp.
+///
+/// Two things must stay true. A child spawned to elevate never delegates again,
+/// or a polkit denial would recurse. And when polkit refuses outright — it
+/// denies a non-active session rather than prompting — the caller gets a clear
+/// error instead of a tool silently running at the invoking user's uid.
+///
+/// The predicate that decides the CLI's own re-exec decides this too, so the two
+/// surfaces cannot drift on what "needs root" means.
+fn plan_elevation(
+    scope: Scope,
+    selected: Option<&Transport>,
+    elevated: bool,
+    already_delegated: bool,
+) -> ElevationPlan {
+    if !needs_system_elevation(scope, selected, elevated) {
+        return ElevationPlan::Direct;
+    }
+    if already_delegated {
+        return ElevationPlan::Refuse;
+    }
+    ElevationPlan::Delegate
+}
+
+/// Argv (after the program name) for the delegated `dmcp call`. Mirrors the
+/// one-shot CLI invocation byte-for-byte — no `--session`, because an elevated
+/// server must not outlive the command that needed it.
+fn elevated_cli_args(
+    id: &str,
+    tool_name: &str,
+    arguments: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let mut args = vec!["call".to_string(), id.to_string(), tool_name.to_string()];
+    if let Some(v) = arguments {
+        if !v.is_null() && v != &serde_json::json!({}) {
+            args.push("--args".to_string());
+            args.push(v.to_string());
+        }
+    }
+    args
+}
+
+/// How long to wait for the human to answer polkit before giving up.
+fn elevation_timeout_secs() -> u64 {
+    std::env::var("DMCP_ELEVATION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(180)
+}
+
+/// Map the delegated CLI's exit into a tool result, mirroring how `dmcp call`
+/// reports: 0 is success, 2 is a tool-reported error (its status rides the exit
+/// code, never a sentinel in the output), anything else failed to elevate.
+fn result_from_cli_exit(
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    id: &str,
+) -> Result<CallToolResult, CallError> {
+    match code {
+        Some(0) => Ok(CallToolResult::success(vec![Content::text(stdout)])),
+        Some(2) => Ok(CallToolResult::error(vec![Content::text(stdout)])),
+        _ => {
+            let detail = if stderr.trim().is_empty() {
+                match code {
+                    Some(c) => format!("elevation helper exited with status {}", c),
+                    None => "elevation helper was killed by a signal".to_string(),
+                }
+            } else {
+                stderr
+            };
+            Err(CallError::ElevationFailed(id.to_string(), detail))
+        }
+    }
+}
+
+/// Run the tool through a child `dmcp call`, which elevates itself via pkexec.
+///
+/// The child owns its process group and is killed on drop, so a cancelled or
+/// timed-out call tears down the pkexec/server subtree instead of leaving a root
+/// process behind.
+async fn call_tool_elevated(
+    id: &str,
+    tool_name: &str,
+    arguments: Option<serde_json::Value>,
+) -> Result<CallToolResult, CallError> {
+    let exe = std::env::current_exe().map_err(|e| {
+        CallError::ElevationFailed(
+            id.to_string(),
+            format!("cannot locate the dmcp binary: {}", e),
+        )
+    })?;
+
+    let mut cmd = Command::new(exe);
+    cmd.args(elevated_cli_args(id, tool_name, arguments.as_ref()))
+        .env(DELEGATED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| CallError::ElevationFailed(id.to_string(), format!("cannot spawn: {}", e)))?;
+
+    let secs = elevation_timeout_secs();
+    let out = tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output())
+        .await
+        .map_err(|_| CallError::ElevationTimedOut(id.to_string(), secs))?
+        .map_err(|e| CallError::ElevationFailed(id.to_string(), e.to_string()))?;
+
+    result_from_cli_exit(
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        id,
+    )
 }
 
 /// Elevate a `dmcp call` on a system-scoped stdio server to root, mirroring
@@ -132,10 +307,27 @@ pub async fn call_tool(
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let (manifest, _) =
+    let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
     let primary = crate::transport::select(manifest.transports.as_deref())?;
+
+    // A system-scope stdio server's tools must run as root. The CLI has already
+    // re-exec'd by now; an unelevated caller (the agent surface) hands the call
+    // to a child that elevates itself, so the tool runs at the right uid instead
+    // of silently at the invoking user's (#45).
+    match plan_elevation(
+        scope,
+        Some(primary),
+        is_elevated(),
+        std::env::var_os(DELEGATED_ENV).is_some(),
+    ) {
+        ElevationPlan::Direct => {}
+        ElevationPlan::Delegate => return call_tool_elevated(id, tool_name, arguments).await,
+        ElevationPlan::Refuse => {
+            return Err(CallError::SystemScopeRequiresElevation(id.to_string()))
+        }
+    }
 
     match primary {
         Transport::Stdio { command, args, .. } => {
@@ -443,6 +635,137 @@ mod tests {
 
         let missing: CallError = crate::transport::select(None).unwrap_err().into();
         assert!(matches!(missing, CallError::NoTransports));
+    }
+
+    /// The agent surface is unprivileged, so a system-scope stdio server is
+    /// handed to a child that elevates itself — never run at the wrong uid (#45).
+    #[test]
+    fn agent_surface_delegates_unelevated_system_stdio() {
+        let transports = stdio();
+        assert_eq!(
+            plan_elevation(Scope::System, selected(&transports), false, false),
+            ElevationPlan::Delegate
+        );
+    }
+
+    /// A child spawned to elevate must never spawn another: if pkexec failed
+    /// there, delegating again would recurse until the box gave out.
+    #[test]
+    fn a_delegated_child_refuses_instead_of_recursing() {
+        let transports = stdio();
+        assert_eq!(
+            plan_elevation(Scope::System, selected(&transports), false, true),
+            ElevationPlan::Refuse
+        );
+    }
+
+    /// A serve deliberately started as root is already elevated — root is the
+    /// right uid for a system tool, so it runs in-process (as the CLI does).
+    #[test]
+    fn elevated_process_runs_system_stdio_directly() {
+        let transports = stdio();
+        assert_eq!(
+            plan_elevation(Scope::System, selected(&transports), true, false),
+            ElevationPlan::Direct
+        );
+    }
+
+    /// User-scope tools never elevate — the whole point of the scope split is
+    /// that they do not need root.
+    #[test]
+    fn user_scope_never_delegates() {
+        let transports = stdio();
+        assert_eq!(
+            plan_elevation(Scope::User, selected(&transports), false, false),
+            ElevationPlan::Direct
+        );
+        assert_eq!(
+            plan_elevation(Scope::User, selected(&transports), false, true),
+            ElevationPlan::Direct
+        );
+    }
+
+    /// A remote (SSE/WebSocket) system server holds no local process to run as
+    /// root, so it is never delegated — consistent with the CLI, which does not
+    /// elevate for a remote transport.
+    #[test]
+    fn system_remote_is_never_delegated() {
+        let sse = vec![Transport::Sse {
+            url: "http://example".into(),
+            description: None,
+            platforms: PlatformDecl::Absent,
+        }];
+        assert_eq!(
+            plan_elevation(Scope::System, selected(&sse), false, false),
+            ElevationPlan::Direct
+        );
+    }
+
+    /// The delegated argv is the one-shot CLI invocation — and carries no
+    /// `--session`, so an elevated server cannot outlive its command.
+    #[test]
+    fn delegated_argv_is_the_one_shot_cli_call() {
+        let args = elevated_cli_args("sys.server", "run", Some(&serde_json::json!({"a": 1})));
+        assert_eq!(args[0], "call");
+        assert_eq!(args[1], "sys.server");
+        assert_eq!(args[2], "run");
+        assert_eq!(args[3], "--args");
+        assert_eq!(args[4], r#"{"a":1}"#);
+        assert!(!args.iter().any(|a| a == "--session"));
+    }
+
+    /// Empty or absent arguments produce no `--args`, matching a hand-typed CLI
+    /// invocation.
+    #[test]
+    fn delegated_argv_omits_empty_arguments() {
+        assert_eq!(elevated_cli_args("s", "t", None).len(), 3);
+        assert_eq!(
+            elevated_cli_args("s", "t", Some(&serde_json::json!({}))).len(),
+            3
+        );
+        assert_eq!(
+            elevated_cli_args("s", "t", Some(&serde_json::Value::Null)).len(),
+            3
+        );
+    }
+
+    /// The child's exit code carries the tool's status, exactly as `dmcp call`
+    /// reports it: 0 success, 2 a tool-reported error whose output is preserved.
+    #[test]
+    fn delegated_exit_code_maps_to_the_tool_result() {
+        let ok = result_from_cli_exit(Some(0), "output".into(), String::new(), "s").unwrap();
+        assert!(!call_is_error(&ok));
+        assert_eq!(format_call_result(&ok), "output");
+
+        let tool_err = result_from_cli_exit(Some(2), "boom".into(), String::new(), "s").unwrap();
+        assert!(call_is_error(&tool_err));
+        assert_eq!(format_call_result(&tool_err), "boom");
+    }
+
+    /// A polkit denial is an elevation failure, not a tool result — and the
+    /// stderr explaining it reaches the caller.
+    #[test]
+    fn a_denied_elevation_is_reported_not_silently_run() {
+        let err = result_from_cli_exit(Some(127), String::new(), "Not authorized".into(), "sys")
+            .unwrap_err();
+        assert!(matches!(err, CallError::ElevationFailed(ref id, _) if id == "sys"));
+        let msg = err.to_string();
+        assert!(msg.contains("Not authorized"));
+        assert!(msg.contains("non-active session"));
+
+        // A signal kill still names the server rather than passing for success.
+        let killed = result_from_cli_exit(None, String::new(), String::new(), "sys").unwrap_err();
+        assert!(killed.to_string().contains("signal"));
+    }
+
+    /// The unanswered-prompt timeout is always positive, so a bad env value
+    /// cannot turn it into an instant or infinite wait.
+    #[test]
+    fn elevation_timeout_is_positive_and_named_in_the_error() {
+        assert!(elevation_timeout_secs() > 0);
+        let err = CallError::ElevationTimedOut("sys".into(), 180);
+        assert!(err.to_string().contains("180s"));
+        assert!(err.to_string().contains("DMCP_ELEVATION_TIMEOUT_SECS"));
     }
 
     #[test]
