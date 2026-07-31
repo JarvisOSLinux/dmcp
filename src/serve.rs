@@ -465,7 +465,11 @@ impl ServerHandler for DmcpServer {
                  server with update_available=true fails, run update_server once and retry; a revoked server \
                  should be uninstalled, not updated. \
                  For concurrent multitasking: dispatch_tasks spawns multiple tool calls in parallel and returns PIDs; \
-                 get_task_status returns completed/failed results; kill_task aborts a task by PID."
+                 get_task_status returns completed/failed results; kill_task aborts a task by PID. \
+                 A system-scope server's tools need root, so calling one asks the user to authenticate and the call \
+                 does not return until they do: prefer dispatch_tasks for it, so you get a PID immediately and poll \
+                 with get_task_status instead of blocking. If the result says elevation was not granted, the user \
+                 declined or this session cannot prompt at all - report that and do not retry in a loop."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
