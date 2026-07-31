@@ -255,3 +255,69 @@ fn a_failed_call_still_carries_the_servers_stderr_in_its_error() {
         stderr
     );
 }
+
+/// The retained failure detail is a bounded TAIL: a server that floods
+/// hundreds of KiB to stderr and then dies must yield an error text carrying
+/// the end of the flood (where the failure reason lives) behind an announced
+/// truncation — never the whole flood, because `dmcp serve` delivers that
+/// text verbatim to the LLM. The live relay stays uncapped: the entire flood,
+/// first marker included, still streams through to dmcp's own stderr.
+#[test]
+fn a_flooding_server_yields_a_bounded_tail_in_the_error() {
+    if !python3_available() {
+        eprintln!(
+            "skipping a_flooding_server_yields_a_bounded_tail_in_the_error: python3 not found"
+        );
+        return;
+    }
+    let env = TestEnv::new();
+    env.install("com.test.logging");
+
+    let out: Output = env
+        .cmd()
+        .args(["call", "com.test.logging", "flood_and_explode"])
+        .output()
+        .expect("run dmcp call");
+
+    assert!(
+        !out.status.success(),
+        "a dead server must not report success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The truncation marker splits the live stream from the error text: the
+    // server never writes it, so its one occurrence is the retained detail.
+    let marker = "[stderr truncated to last 64 KiB]";
+    let (live, detail) = stderr.split_once(marker).unwrap_or_else(|| {
+        panic!(
+            "the error text must announce the truncation with {:?}; stderr len {}, tail: {:?}",
+            marker,
+            stderr.len(),
+            &stderr[stderr.len().saturating_sub(512)..]
+        )
+    });
+
+    assert!(
+        live.contains("FLOOD_FIRST_MARKER") && live.contains("FLOOD_LAST_MARKER"),
+        "the live relay must stream the WHOLE flood through, uncapped"
+    );
+    assert!(
+        live.contains("server stderr:"),
+        "the error text must attribute the retained stderr, got: {}",
+        &live[live.len().saturating_sub(512)..]
+    );
+
+    assert!(
+        detail.contains("FLOOD_LAST_MARKER"),
+        "the retained detail must carry the tail of the flood"
+    );
+    assert!(
+        !detail.contains("FLOOD_FIRST_MARKER"),
+        "the retained detail must have dropped the head of the flood"
+    );
+    assert!(
+        detail.len() <= 70 * 1024,
+        "the retained detail must stay near the 64 KiB cap, got {} bytes",
+        detail.len()
+    );
+}

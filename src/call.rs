@@ -110,25 +110,70 @@ const DELEGATED_ENV: &str = "DMCP_ELEVATION_DELEGATED";
 /// and a pipe that will never close must not hang the call.
 const RELAY_DRAIN_SECS: u64 = 5;
 
+/// Cap on the stderr RETAINED for failure detail: the most recent 64 KiB.
+/// The tail is kept because the end of stderr is where the failure reason
+/// lives — the final traceback, the last error line — while the head is
+/// startup noise. Without the cap a flooding server balloons memory for the
+/// whole call and turns the error text (which `dmcp serve` delivers verbatim
+/// to the LLM as the tool-result error) into a prompt-sized payload. The live
+/// relay onto dmcp's own stderr is deliberately NOT capped: the caller
+/// consumes that stream incrementally, so it costs nothing to keep whole.
+const STDERR_RETAIN_MAX: usize = 64 * 1024;
+
+/// Prefixed to the failure detail when retention dropped earlier bytes, so a
+/// reader knows the text is a tail, not the whole story.
+const STDERR_TRUNCATION_MARKER: &str = "[stderr truncated to last 64 KiB]";
+
+/// The bounded tail of a child's stderr, kept for failure detail.
+#[derive(Debug, Default)]
+struct RetainedStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl RetainedStderr {
+    /// The failure-detail text: the retained tail, trimmed, prefixed with the
+    /// truncation marker when earlier bytes were dropped. `None` when nothing
+    /// beyond whitespace was retained.
+    fn detail(&self) -> Option<String> {
+        let text = String::from_utf8_lossy(&self.bytes);
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(if self.truncated {
+            format!("{} {}", STDERR_TRUNCATION_MARKER, text)
+        } else {
+            text.to_string()
+        })
+    }
+}
+
 /// Tee a child's stderr onto `sink` (dmcp's own stderr) as it arrives, while
-/// retaining every byte for failure detail (#49). Raw chunks, never lines: a
-/// prompt like "Proceed? [Y/n] " has no trailing newline and must still flow
-/// through promptly. The task also keeps draining after a failed sink write,
-/// so a caller that closed our stderr cannot back-pressure the child into a
-/// wedge — the old wait_with_output drained both pipes unconditionally too.
-fn relay_stderr<R, W>(mut source: R, mut sink: W) -> JoinHandle<Vec<u8>>
+/// retaining the most recent `STDERR_RETAIN_MAX` bytes for failure detail
+/// (#49). Raw chunks, never lines: a prompt like "Proceed? [Y/n] " has no
+/// trailing newline and must still flow through promptly. The task also keeps
+/// draining after a failed sink write, so a caller that closed our stderr
+/// cannot back-pressure the child into a wedge — the old wait_with_output
+/// drained both pipes unconditionally too.
+fn relay_stderr<R, W>(mut source: R, mut sink: W) -> JoinHandle<RetainedStderr>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut retained = Vec::new();
+        let mut retained = RetainedStderr::default();
         let mut buf = [0u8; 8192];
         loop {
             match source.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    retained.extend_from_slice(&buf[..n]);
+                    retained.bytes.extend_from_slice(&buf[..n]);
+                    if retained.bytes.len() > STDERR_RETAIN_MAX {
+                        let excess = retained.bytes.len() - STDERR_RETAIN_MAX;
+                        retained.bytes.drain(..excess);
+                        retained.truncated = true;
+                    }
                     if sink.write_all(&buf[..n]).await.is_ok() {
                         let _ = sink.flush().await;
                     }
@@ -142,16 +187,16 @@ where
 /// Collect what the relay retained. Bounded: past the drain window the relay
 /// is aborted rather than awaited, because the only way EOF is still pending
 /// is an fd held open by something that outlived the server.
-async fn finish_relay(relay: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+async fn finish_relay(relay: Option<JoinHandle<RetainedStderr>>) -> RetainedStderr {
     let Some(mut handle) = relay else {
-        return Vec::new();
+        return RetainedStderr::default();
     };
     match tokio::time::timeout(Duration::from_secs(RELAY_DRAIN_SECS), &mut handle).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => Vec::new(),
+        Ok(Ok(retained)) => retained,
+        Ok(Err(_)) => RetainedStderr::default(),
         Err(_) => {
             handle.abort();
-            Vec::new()
+            RetainedStderr::default()
         }
     }
 }
@@ -159,12 +204,10 @@ async fn finish_relay(relay: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
 /// Append the retained server stderr to a failed call's error text. Only the
 /// variants that mean "the server misbehaved" carry it — that is where the
 /// explanation (a traceback, a missing dependency) actually lives.
-fn attach_stderr_detail(err: CallError, stderr: &[u8]) -> CallError {
-    let text = String::from_utf8_lossy(stderr);
-    let text = text.trim();
-    if text.is_empty() {
+fn attach_stderr_detail(err: CallError, stderr: &RetainedStderr) -> CallError {
+    let Some(text) = stderr.detail() else {
         return err;
-    }
+    };
     match err {
         CallError::ConnectionFailed(d) => {
             CallError::ConnectionFailed(format!("{}; server stderr: {}", d, text))
@@ -333,7 +376,7 @@ async fn call_tool_elevated(
     result_from_cli_exit(
         status.code(),
         String::from_utf8_lossy(&stdout).trim_end().to_string(),
-        String::from_utf8_lossy(&stderr).to_string(),
+        stderr.detail().unwrap_or_default(),
         id,
     )
 }
@@ -922,7 +965,8 @@ mod tests {
         source_in.write_all(b"denied\n").await.unwrap();
         drop(source_in);
         let retained = handle.await.unwrap();
-        assert_eq!(retained, b"Proceed? [Y/n] denied\n");
+        assert_eq!(retained.bytes, b"Proceed? [Y/n] denied\n");
+        assert!(!retained.truncated);
     }
 
     /// A caller that closed our stderr must not cost the failure detail — the
@@ -937,7 +981,32 @@ mod tests {
 
         source_in.write_all(b"Traceback: boom").await.unwrap();
         drop(source_in);
-        assert_eq!(handle.await.unwrap(), b"Traceback: boom");
+        assert_eq!(handle.await.unwrap().bytes, b"Traceback: boom");
+    }
+
+    /// Retention is a bounded TAIL: a flooding server keeps only its most
+    /// recent 64 KiB — the end, where the failure reason lives — flagged as
+    /// truncated, so neither the call's memory nor the eventual error text
+    /// scales with how much the server wrote.
+    #[tokio::test]
+    async fn relay_retains_only_the_tail_of_a_flood() {
+        let (mut source_in, source_out) = tokio::io::duplex(8192);
+        let handle = relay_stderr(source_out, tokio::io::sink());
+
+        source_in.write_all(b"EARLY_MARKER\n").await.unwrap();
+        source_in
+            .write_all(&vec![b'x'; 3 * STDERR_RETAIN_MAX])
+            .await
+            .unwrap();
+        source_in.write_all(b"\nLATE_MARKER").await.unwrap();
+        drop(source_in);
+
+        let retained = handle.await.unwrap();
+        assert!(retained.truncated);
+        assert_eq!(retained.bytes.len(), STDERR_RETAIN_MAX);
+        assert!(retained.bytes.ends_with(b"LATE_MARKER"));
+        let early = b"EARLY_MARKER";
+        assert!(!retained.bytes.windows(early.len()).any(|w| w == early));
     }
 
     /// A stderr fd leaked into a grandchild never reaches EOF; the drain is
@@ -948,9 +1017,16 @@ mod tests {
         let (sink, _sink_out) = tokio::io::duplex(8);
         let handle = relay_stderr(source_out, sink);
 
-        let bytes = finish_relay(Some(handle)).await;
-        assert!(bytes.is_empty());
+        let retained = finish_relay(Some(handle)).await;
+        assert!(retained.bytes.is_empty());
         drop(source_in);
+    }
+
+    fn complete(bytes: &[u8]) -> RetainedStderr {
+        RetainedStderr {
+            bytes: bytes.to_vec(),
+            truncated: false,
+        }
     }
 
     /// The retained stderr lands in the failure a caller reads, on exactly the
@@ -959,27 +1035,49 @@ mod tests {
     fn failure_detail_carries_the_retained_stderr() {
         let err = attach_stderr_detail(
             CallError::ToolCallFailed("connection closed".into()),
-            b"Traceback: boom\n",
+            &complete(b"Traceback: boom\n"),
         );
         let msg = err.to_string();
         assert!(msg.contains("connection closed"));
         assert!(msg.contains("server stderr: Traceback: boom"));
+        assert!(!msg.contains(STDERR_TRUNCATION_MARKER));
 
-        let conn =
-            attach_stderr_detail(CallError::ConnectionFailed("broken pipe".into()), b"denied");
+        let conn = attach_stderr_detail(
+            CallError::ConnectionFailed("broken pipe".into()),
+            &complete(b"denied"),
+        );
         assert!(conn.to_string().contains("server stderr: denied"));
+    }
+
+    /// A truncated tail announces itself: the marker leads the detail, so a
+    /// reader knows the text is the end of a longer stream.
+    #[test]
+    fn truncated_detail_leads_with_the_marker() {
+        let retained = RetainedStderr {
+            bytes: b"tail of the flood".to_vec(),
+            truncated: true,
+        };
+        let err = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), &retained);
+        assert!(err.to_string().contains(&format!(
+            "server stderr: {} tail of the flood",
+            STDERR_TRUNCATION_MARKER
+        )));
     }
 
     /// Silence adds nothing: a server that wrote no stderr (or only whitespace)
     /// leaves the error text byte-identical to before the relay existed.
     #[test]
     fn empty_stderr_leaves_the_error_text_unchanged() {
-        let plain = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), b"");
+        let plain = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), &complete(b""));
         assert_eq!(plain.to_string(), "Tool call failed: boom");
-        let blank = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), b"  \n\t");
+        let blank = attach_stderr_detail(
+            CallError::ToolCallFailed("boom".into()),
+            &complete(b"  \n\t"),
+        );
         assert_eq!(blank.to_string(), "Tool call failed: boom");
 
-        let unrelated = attach_stderr_detail(CallError::ServerNotFound("s".into()), b"noise");
+        let unrelated =
+            attach_stderr_detail(CallError::ServerNotFound("s".into()), &complete(b"noise"));
         assert_eq!(unrelated.to_string(), "Server not found: s");
     }
 

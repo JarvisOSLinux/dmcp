@@ -14,6 +14,11 @@ standard library. Two tools, each proving one half of relay-and-buffer:
   * ``explode`` writes a traceback-shaped line to stderr and dies without
     answering, so the failed call's error text must carry that line as
     retained detail.
+  * ``flood_and_explode`` writes a first marker, several hundred KiB of
+    filler, and a last marker to stderr, then dies without answering — the
+    failed call's error text must carry only the bounded TAIL of that flood
+    (last marker present, first absent, truncation announced), while the
+    live relay still streams the whole flood through.
 """
 
 import json
@@ -33,6 +38,11 @@ TOOLS = [
     {
         "name": "explode",
         "description": "Log to stderr, then die without answering",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flood_and_explode",
+        "description": "Flood several hundred KiB to stderr, then die without answering",
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
@@ -93,6 +103,14 @@ def handle(msg):
             text_result(req_id, "unblocked")
         elif name == "explode":
             sys.stderr.write("FAKE_TRACEBACK: something terrible happened\n")
+            sys.stderr.flush()
+            os._exit(1)
+        elif name == "flood_and_explode":
+            # ~300 KiB between the markers: several times the 64 KiB the
+            # caller may retain, so only the tail can survive.
+            sys.stderr.write("FLOOD_FIRST_MARKER\n")
+            sys.stderr.write(("F" * 127 + "\n") * 2400)
+            sys.stderr.write("FLOOD_LAST_MARKER\n")
             sys.stderr.flush()
             os._exit(1)
         else:
