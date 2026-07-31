@@ -199,6 +199,14 @@ enum Commands {
         /// in-process state (a browser, a REPL) survives between calls.
         #[arg(long)]
         session: Option<String>,
+
+        /// Answer questions the server asks mid-call over stdio (requires
+        /// --session). Every stdout line becomes a JSON object tagged with
+        /// `type`: a `prompt` to answer by writing one JSON answer line to
+        /// stdin, then the final `result`. For a caller that drives dmcp as a
+        /// subprocess; without it, prompts are declined.
+        #[arg(long, requires = "session")]
+        interactive: bool,
     },
 
     /// Manage live server sessions (broker-backed stateful servers)
@@ -904,6 +912,7 @@ fn main() {
             tool,
             args,
             session,
+            interactive,
         } => {
             let args_val = args.as_deref().and_then(|s| serde_json::from_str(s).ok());
             if let Some(session_id) = session {
@@ -911,9 +920,34 @@ fn main() {
                 // process alive across calls. Gated on stateful + user scope; the
                 // output shape (and exit-2-on-tool-error) matches the one-shot
                 // path so callers can't tell the difference on success.
-                match dmcp::broker::session_call(&paths, &id, &tool, args_val, &session_id) {
+                // In interactive mode the caller reads a tagged JSON stream, so
+                // the result is emitted in that shape too rather than as bare
+                // text a reader would have to distinguish by guessing.
+                let driver = interactive.then_some(dmcp::broker::StdioPromptDriver);
+                let outcome = dmcp::broker::session_call_with(
+                    &paths,
+                    &id,
+                    &tool,
+                    args_val,
+                    &session_id,
+                    driver
+                        .as_ref()
+                        .map(|d| d as &dyn dmcp::broker::PromptDriver),
+                );
+                match outcome {
                     Ok(result) => {
-                        println!("{}", result.content);
+                        if interactive {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "type": "result",
+                                    "content": result.content,
+                                    "isError": result.is_error,
+                                })
+                            );
+                        } else {
+                            println!("{}", result.content);
+                        }
                         if result.is_error {
                             std::process::exit(2);
                         }

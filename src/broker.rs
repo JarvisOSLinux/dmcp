@@ -271,6 +271,55 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// Something that can answer a question a server asked mid-call.
+pub trait PromptDriver {
+    fn answer(&self, request: crate::elicit::PromptRequest) -> crate::elicit::PromptAnswer;
+}
+
+/// Answers prompts over dmcp's own stdio, for a caller that spawned it as a
+/// subprocess (dispatch, ultimately the daemon and the human behind it).
+///
+/// In this mode **every** line of stdout is a JSON object tagged with `type`,
+/// including the final result. Mixing a JSON prompt with a bare-text result on
+/// one stream would leave the reader guessing which it had; a caller that opts
+/// in gets one shape it can always parse. The default (non-interactive) output
+/// is untouched, so nothing that exists today has to change.
+pub struct StdioPromptDriver;
+
+impl StdioPromptDriver {
+    /// One line out, one line back. Any failure to read a usable answer is a
+    /// decline, so a caller that dies or answers nonsense unblocks the server
+    /// rather than parking it.
+    fn exchange(
+        request: crate::elicit::PromptRequest,
+    ) -> Result<crate::elicit::PromptAnswer, std::io::Error> {
+        use std::io::{BufRead, Write};
+        let mut out = std::io::stdout();
+        let line = serde_json::json!({
+            "type": "prompt",
+            "server": request.server,
+            "message": request.message,
+            "schema": request.schema,
+            "url": request.url,
+        });
+        writeln!(out, "{}", line)?;
+        out.flush()?;
+
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        Ok(
+            serde_json::from_str::<crate::elicit::PromptAnswer>(answer.trim())
+                .unwrap_or(crate::elicit::PromptAnswer::Decline),
+        )
+    }
+}
+
+impl PromptDriver for StdioPromptDriver {
+    fn answer(&self, request: crate::elicit::PromptRequest) -> crate::elicit::PromptAnswer {
+        Self::exchange(request).unwrap_or(crate::elicit::PromptAnswer::Decline)
+    }
+}
+
 /// A successful `--session` call: identical shape to the one-shot path so a
 /// caller cannot tell the two apart on success.
 pub struct SessionCallOk {
@@ -291,6 +340,23 @@ pub fn session_call(
     args: Option<Value>,
     session: &str,
 ) -> Result<SessionCallOk, SessionError> {
+    session_call_with(paths, id, tool, args, session, None)
+}
+
+/// A `--session` call whose prompts are answered by `driver`.
+///
+/// `None` declines every prompt — the honest reply when the caller has no
+/// channel to a human, and the behavior of the plain `session_call` above.
+/// `Some` is the interactive path: dmcp's own stdio becomes the prompt channel
+/// for whoever spawned it.
+pub fn session_call_with(
+    paths: &Paths,
+    id: &str,
+    tool: &str,
+    args: Option<Value>,
+    session: &str,
+    driver: Option<&dyn PromptDriver>,
+) -> Result<SessionCallOk, SessionError> {
     let (manifest, scope) = get_server(paths, id)
         .ok_or_else(|| SessionError::Gate(format!("Server not found: {}", id)))?;
     session_gate(scope, manifest.stateful).map_err(SessionError::Gate)?;
@@ -300,15 +366,16 @@ pub fn session_call(
         let dir = broker_dir();
         let sock = dir.join("broker.sock");
         ensure_broker_running(&dir, &sock)?;
-        let resp = send_request(
-            &sock,
-            &BrokerRequest::Call {
-                id: id.to_string(),
-                session: session.to_string(),
-                tool: tool.to_string(),
-                args,
-            },
-        )?;
+        let call = BrokerRequest::Call {
+            id: id.to_string(),
+            session: session.to_string(),
+            tool: tool.to_string(),
+            args,
+        };
+        let resp = match driver {
+            Some(d) => send_request_with(&sock, &call, |r| d.answer(r))?,
+            None => send_request(&sock, &call)?,
+        };
         if resp.ok {
             Ok(SessionCallOk {
                 content: resp.content.unwrap_or_default(),
@@ -323,7 +390,7 @@ pub fn session_call(
     }
     #[cfg(not(unix))]
     {
-        let _ = (session, tool, args);
+        let _ = (session, tool, args, driver);
         Err(SessionError::Unsupported)
     }
 }

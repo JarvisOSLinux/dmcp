@@ -984,3 +984,80 @@ fn a_session_outlives_the_question_it_was_asked() {
         String::from_utf8_lossy(&second.stderr)
     );
 }
+
+/// The accept path, end to end through the real CLI: a driver that answers a
+/// question gets its answer all the way into the server.
+///
+/// This is the case the plain CLI cannot reach — with no channel to a human it
+/// declines — so it is the one that proves the exchange actually carries
+/// content rather than merely terminating. dmcp is spawned with piped stdio,
+/// exactly as dispatch would, and answered from the test.
+#[test]
+fn an_interactive_driver_answers_the_servers_question() {
+    if !python3_available() {
+        eprintln!("skipping an_interactive_driver_answers_the_servers_question: python3 not found");
+        return;
+    }
+    use std::io::{BufRead, BufReader, Write};
+
+    let env = TestEnv::new();
+    install_eliciting(&env, "com.test.elicit.interactive");
+
+    let mut child = env
+        .cmd()
+        .args([
+            "call",
+            "com.test.elicit.interactive",
+            "ask",
+            "--session",
+            "INTERACTIVE",
+            "--interactive",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dmcp call --interactive");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+
+    let mut saw_prompt = false;
+    let mut result_line = None;
+    while let Some(Ok(line)) = lines.next() {
+        let msg: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => panic!("interactive mode must emit JSON only, got: {}", line),
+        };
+        match msg["type"].as_str() {
+            Some("prompt") => {
+                saw_prompt = true;
+                // The question is attributed to the server that asked it, so a
+                // renderer never has to speak it in the assistant's voice.
+                assert_eq!(msg["server"], "com.test.elicit.interactive");
+                assert!(msg["message"].as_str().unwrap().contains("partition type"));
+                writeln!(
+                    stdin,
+                    r#"{{"action":"accept","content":{{"choice":"primary"}}}}"#
+                )
+                .expect("write answer");
+                stdin.flush().expect("flush answer");
+            }
+            Some("result") => {
+                result_line = Some(msg);
+                break;
+            }
+            other => panic!("unexpected message type {:?}", other),
+        }
+    }
+
+    let out = result_line.expect("a result must follow the prompt");
+    assert!(saw_prompt, "the server's question must reach the driver");
+    assert_eq!(
+        out["content"].as_str().unwrap(),
+        "accept:primary",
+        "the driver's answer must reach the server verbatim"
+    );
+    assert_eq!(out["isError"], false);
+    let _ = child.wait();
+}

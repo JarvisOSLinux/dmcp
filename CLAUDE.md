@@ -58,6 +58,7 @@ src/
 ├── models.rs         Core data structures (Index, Manifest, Transport)
 ├── platform.rs       Host platform identity + the registry `platforms` gate
 ├── elevation.rs      Privilege elevation for system scope (Linux: pkexec/polkit; macOS: sudo/osascript)
+├── elicit.rs         Inbound `elicitation/create`: a server asking for input mid-tool-call
 └── transport.rs      Per-host transport selection + transport-type extraction
 ```
 
@@ -153,6 +154,54 @@ serializes concurrent calls to one session. `--session` is gated to **stateful +
 user scope** (system-scope sessions are refused — elevation safety); without it,
 the one-shot path is untouched. See `src/broker.rs`.
 
+### Mid-call elicitation (a server asking a question)
+
+Some operations cannot be made non-interactive and cannot be answered up front,
+because they ask a **sequence** of questions that only appears as the work
+unfolds — `fdisk`, `mysql_secure_installation`, a REPL, an installer with no
+`-y`. `--noconfirm` handles the single-prompt case and cannot get past step 1 of
+a wizard. MCP's `elicitation/create` is the answer: the tool call does **not**
+return while the question is outstanding, so the process stays alive and there
+is nothing to reattach to.
+
+`src/elicit.rs` is dmcp's client side. Two rules:
+
+- **Only advertise it where it can be answered.** Capability negotiation is a
+  promise a server checks before asking. The one-shot `dmcp call` path spawns,
+  calls once, and exits with nobody to ask, so `ServerClient::unattended`
+  declares nothing and declines. Only the brokered path uses `attended`, and it
+  declares **form mode only** — URL mode asks the client to open a browser,
+  which a headless daemon cannot promise.
+- **The prompt text is untrusted.** It is authored by whoever wrote the server.
+  Every `PromptRequest` carries the id of the server that asked, so a renderer
+  attributes the question instead of speaking it in JARVIS's voice. Nothing here
+  invents an answer; a password-shaped prompt is a human's decision upstream.
+
+**Every path ends in an answer.** No driver, a dropped channel, a hung-up
+socket, a malformed reply, or a spent budget all resolve to a *decline* — a real
+protocol outcome the server must already handle — because silence would park the
+session on a question nobody will ever see. `DMCP_ELICIT_MAX_PROMPTS`
+(default 16) bounds one server's questions so a looping server cannot hold a
+session, or the human's attention, hostage.
+
+**In the broker**, the prompt receiver lives beside the cached client in the
+session slot (the client outlives any one connection; calls to a session are
+serialized, so exactly one in-flight call drains it). `drive_call` selects over
+the call future and the prompt channel **concurrently** — a server that elicits
+is blocked until answered, so awaiting the call first would deadlock against the
+question that has to be answered to finish it. The select is `biased` so a
+finished call wins a race with a late prompt.
+
+On the wire a call becomes an exchange: interim `prompt` responses out
+(`BrokerResponse::is_prompt`), `answer` ops back, then the final response.
+
+**For a caller driving dmcp as a subprocess**, `dmcp call --session <sid>
+--interactive` turns stdio into that channel: every stdout line is a JSON object
+tagged `type` (`prompt`, then `result`), and one JSON answer line on stdin
+resolves each prompt. All-JSON is deliberate — mixing a JSON prompt with a
+bare-text result on one stream would leave the reader guessing. Without the
+flag, output is byte-identical to today and prompts are declined.
+
 ### Platform support (registry `platforms`)
 
 A registry entry may declare `platforms` — `"linux"` | `"darwin"` | `"windows"` —
@@ -238,6 +287,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-30:* mid-call elicitation (Project-JARVIS#210, dmcp half). `src/elicit.rs` added: `ServerClient` replaces the `()` client handler at every site, `unattended` (one-shot: declares nothing, declines) vs `attended` (brokered: declares form-mode elicitation and routes prompts to a driver), `PromptRequest`/`PromptAnswer` wire types carrying the asking server's id for provenance, and a `DMCP_ELICIT_MAX_PROMPTS` budget claimed via `fetch_update`. The broker keeps each session's prompt receiver beside its cached client and `drive_call` drains it concurrently with the in-flight call (biased select) — awaiting the call first would deadlock against the question that must be answered to finish it. `BrokerRequest::Answer` + an interim `BrokerResponse.prompt` make a call a multi-message exchange; `send_request_with` / `PromptDriver` let a caller answer, and `dmcp call --session --interactive` exposes that over stdio as a tagged JSON stream. Every failure mode resolves to a decline rather than a hang. Verified with `tests/fixtures/fake_eliciting_server.py`, which issues a real `elicitation/create` mid-`tools/call` and blocks on the reply: 4 integration tests cover decline, a three-round wizard, session survival, and the interactive accept path carrying content verbatim into the server.
 
 *2026-07-30:* the agent surface elevates by delegation (#45). `call::call_tool` gates on `plan_elevation` (Direct / Delegate / Refuse) before spawning: a system-scope stdio server invoked from `dmcp serve` or `dispatch_tasks` is handed to a child `dmcp call`, which re-execs through pkexec itself and lets polkit prompt (`allow_gui` exists for exactly this caller), so the tool runs as root instead of silently at the invoking user's uid. `dmcp serve` cannot re-exec itself — it would replace the daemon — but spawning a child that elevates costs nothing, and the privilege dies with the command. `DMCP_ELEVATION_DELEGATED` stops a denied child from delegating again (a denial would otherwise recurse); `DMCP_ELEVATION_TIMEOUT_SECS` (default 180) bounds an unanswered prompt, with the child in its own process group and killed on drop. Exit 0/2 map to success / tool-reported error; anything else is `ElevationFailed` carrying the child's stderr, which is where a non-active session lands since polkit denies rather than prompts there. Keyed on the same `needs_system_elevation` predicate as the CLI's re-exec, so the two surfaces cannot disagree on what needs root; user-scope and remote transports are untouched, and introspection (`list_tools`) stays unprivileged. Verified end-to-end by driving a real `dmcp serve` as an unprivileged uid: the user-scope call returned its result, the system-scope call delegated and reported the elevation failure.
 
