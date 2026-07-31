@@ -195,12 +195,22 @@ finished call wins a race with a late prompt.
 On the wire a call becomes an exchange: interim `prompt` responses out
 (`BrokerResponse::is_prompt`), `answer` ops back, then the final response.
 
-**For a caller driving dmcp as a subprocess**, `dmcp call --session <sid>
+**For a caller driving dmcp as a subprocess**, `dmcp call <id> <tool>
 --interactive` turns stdio into that channel: every stdout line is a JSON object
 tagged `type` (`prompt`, then `result`), and one JSON answer line on stdin
 resolves each prompt. All-JSON is deliberate — mixing a JSON prompt with a
 bare-text result on one stream would leave the reader guessing. Without the
 flag, output is byte-identical to today and prompts are declined.
+
+`--interactive` works **with or without `--session`**. The session form routes
+through the broker (attended there). The one-shot form (`call_tool_interactive`)
+is how a **system-scope (root) command's** prompts are answered: sessions are
+user-scope only, so the elevated one-shot call is the sole path to a system
+server — and `elevate_call_for_system_scope` re-execs the whole argv, `--interactive`
+included, through pkexec, which passes stdio through, so the prompt stream
+reaches the caller even from root. `drive_interactive_over_stdio` runs the call
+and drains its prompt channel concurrently (biased select), same deadlock reason
+as the broker.
 
 ### Platform support (registry `platforms`)
 

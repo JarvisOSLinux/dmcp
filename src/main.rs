@@ -200,12 +200,14 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
 
-        /// Answer questions the server asks mid-call over stdio (requires
-        /// --session). Every stdout line becomes a JSON object tagged with
-        /// `type`: a `prompt` to answer by writing one JSON answer line to
-        /// stdin, then the final `result`. For a caller that drives dmcp as a
-        /// subprocess; without it, prompts are declined.
-        #[arg(long, requires = "session")]
+        /// Answer questions the server asks mid-call over stdio. Every stdout
+        /// line becomes a JSON object tagged with `type`: a `prompt` to answer
+        /// by writing one JSON answer line to stdin, then the final `result`.
+        /// For a caller that drives dmcp as a subprocess; without it, prompts
+        /// are declined. Works with or without --session — the one-shot form is
+        /// how a system-scope (root) command's prompts are answered, since
+        /// sessions are user-scope only.
+        #[arg(long)]
         interactive: bool,
     },
 
@@ -958,24 +960,53 @@ fn main() {
                     }
                 }
             } else {
-                // One-shot path (unchanged): a system-scoped stdio server's tools
-                // must run as root; re-exec via pkexec/polkit before any work,
-                // mirroring `dmcp run` (#33).
+                // One-shot path: a system-scoped stdio server's tools must run
+                // as root; re-exec via pkexec/polkit before any work, mirroring
+                // `dmcp run` (#33). The re-exec carries the whole argv —
+                // including `--interactive` — and pkexec passes stdio through, so
+                // an interactive call keeps its prompt channel across elevation
+                // and a root command can still be answered (#210).
                 call::elevate_call_for_system_scope(&paths, &id);
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-                match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
-                    Ok(result) => {
-                        println!("{}", call::format_call_result(&result));
-                        // Signal a tool-reported error via the exit code, out-of-band
-                        // from the output stream, so a caller (e.g. dispatch) reads
-                        // status structurally instead of sniffing the output text.
-                        if call::call_is_error(&result) {
-                            std::process::exit(2);
+                if interactive {
+                    // Prompts and the result are one tagged JSON stream on
+                    // stdout, answers one JSON line each on stdin — the same
+                    // shape as the session interactive path.
+                    match rt.block_on(call::call_tool_interactive(&paths, &id, &tool, args_val)) {
+                        Ok(result) => {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "type": "result",
+                                    "content": call::format_call_result(&result),
+                                    "isError": call::call_is_error(&result),
+                                })
+                            );
+                            if call::call_is_error(&result) {
+                                std::process::exit(2);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                } else {
+                    match rt.block_on(call::call_tool(&paths, &id, &tool, args_val)) {
+                        Ok(result) => {
+                            println!("{}", call::format_call_result(&result));
+                            // Signal a tool-reported error via the exit code,
+                            // out-of-band from the output stream, so a caller
+                            // (e.g. dispatch) reads status structurally instead
+                            // of sniffing the output text.
+                            if call::call_is_error(&result) {
+                                std::process::exit(2);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }

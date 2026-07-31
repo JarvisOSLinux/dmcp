@@ -1061,3 +1061,77 @@ fn an_interactive_driver_answers_the_servers_question() {
     assert_eq!(out["isError"], false);
     let _ = child.wait();
 }
+
+/// The one-shot interactive path — no session — is how a system-scope (root)
+/// command's prompts get answered, since sessions are user-scope only. A server
+/// that elicits during a plain `dmcp call --interactive` is answered over stdio
+/// exactly as the session path is, so the elevated re-exec (which carries
+/// --interactive through pkexec) can relay a root command's question too.
+#[test]
+fn a_one_shot_interactive_call_answers_the_servers_question() {
+    if !python3_available() {
+        eprintln!(
+            "skipping a_one_shot_interactive_call_answers_the_servers_question: python3 not found"
+        );
+        return;
+    }
+    use std::io::{BufRead, BufReader, Write};
+
+    let env = TestEnv::new();
+    // Not stateful, not a session: the plain one-shot path.
+    env.install_with_transports(
+        "com.test.elicit.oneshot",
+        "user",
+        false,
+        serde_json::json!([{
+            "type": "stdio",
+            "command": "python3",
+            "args": [eliciting_fixture_path().to_string_lossy()],
+        }]),
+    );
+
+    let mut child = env
+        .cmd()
+        .args(["call", "com.test.elicit.oneshot", "ask", "--interactive"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dmcp call --interactive (one-shot)");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+
+    let mut saw_prompt = false;
+    let mut result_line = None;
+    while let Some(Ok(line)) = lines.next() {
+        let msg: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|_| panic!("interactive mode must emit JSON only, got: {}", line));
+        match msg["type"].as_str() {
+            Some("prompt") => {
+                saw_prompt = true;
+                assert_eq!(msg["server"], "com.test.elicit.oneshot");
+                writeln!(
+                    stdin,
+                    r#"{{"action":"accept","content":{{"choice":"primary"}}}}"#
+                )
+                .and_then(|_| stdin.flush())
+                .expect("write answer");
+            }
+            Some("result") => {
+                result_line = Some(msg);
+                break;
+            }
+            other => panic!("unexpected message type {:?}", other),
+        }
+    }
+
+    let out = result_line.expect("a result must follow the prompt");
+    assert!(
+        saw_prompt,
+        "the server's question must reach the driver with no session"
+    );
+    assert_eq!(out["content"].as_str().unwrap(), "accept:primary");
+    assert_eq!(out["isError"], false);
+    let _ = child.wait();
+}

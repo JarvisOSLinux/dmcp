@@ -339,6 +339,7 @@ pub async fn call_tool(
                 args.as_deref(),
                 tool_name,
                 arguments,
+                None,
             )
             .await
         }
@@ -349,6 +350,132 @@ pub async fn call_tool(
     }
 }
 
+/// Call a tool, answering any question the server asks over this process's own
+/// stdio (the `--interactive` one-shot path).
+///
+/// This is what lets a **root** command prompt and be answered: system-scope
+/// tools cannot use the broker (sessions are user-scope for elevation safety),
+/// so the elevated one-shot call is the only path to them — and it re-execs
+/// through pkexec carrying `--interactive`, which pkexec passes stdio through,
+/// so the prompt stream reaches whoever spawned dmcp (dispatch) even from root.
+///
+/// Elevation composes: a system-scope stdio server invoked unelevated is handed
+/// to a child `dmcp call --interactive` (the child re-execs through pkexec and
+/// relays the same stdio), so delegation carries interactivity rather than
+/// dropping it. On the CLI path elevation already happened via re-exec before
+/// this runs, so the plan is Direct.
+pub async fn call_tool_interactive(
+    paths: &Paths,
+    id: &str,
+    tool_name: &str,
+    arguments: Option<serde_json::Value>,
+) -> Result<CallToolResult, CallError> {
+    let (manifest, scope) =
+        get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
+
+    let primary = crate::transport::select(manifest.transports.as_deref())?;
+
+    // The CLI re-execs the whole process (argv carrying `--interactive`) through
+    // pkexec *before* this runs, so on that path elevation is already done and
+    // the plan is Direct. Delegate/Refuse are the unelevated system-scope cases,
+    // which the interactive one-shot never reaches from the CLI; treat them as
+    // the refusal rather than silently declining every prompt.
+    match plan_elevation(
+        scope,
+        Some(primary),
+        is_elevated(),
+        std::env::var_os(DELEGATED_ENV).is_some(),
+    ) {
+        ElevationPlan::Direct => {}
+        ElevationPlan::Delegate | ElevationPlan::Refuse => {
+            return Err(CallError::SystemScopeRequiresElevation(id.to_string()))
+        }
+    }
+
+    match primary {
+        Transport::Stdio { command, args, .. } => {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let call = call_tool_stdio(
+                paths,
+                &manifest,
+                id,
+                command,
+                args.as_deref(),
+                tool_name,
+                arguments,
+                Some(tx),
+            );
+            drive_interactive_over_stdio(call, rx).await
+        }
+        // A remote server could elicit too, but the one-shot remote path holds
+        // no long-lived channel and dispatch reaches remote servers the same
+        // way; leave it unattended, matching call_tool.
+        Transport::Sse { url, .. } => call_tool_remote(url, "sse", tool_name, arguments).await,
+        Transport::WebSocket { ws_url, .. } => {
+            call_tool_remote(ws_url, "websocket", tool_name, arguments).await
+        }
+    }
+}
+
+/// Run `call` while relaying each prompt it raises to this process's stdout as a
+/// tagged JSON line and reading the answer back from stdin — the same tagged
+/// stream the broker's `--interactive` path speaks, so a driver (dispatch) reads
+/// one shape whether or not a session is involved.
+///
+/// The prompt channel is drained CONCURRENTLY with the call, biased so a
+/// finished call wins a race with a late prompt: a server that elicits is
+/// blocked until answered, so awaiting the call first would deadlock against the
+/// question that must be answered to finish it. A closed or unreadable stdin
+/// resolves to a decline, so the server unblocks rather than the call hanging.
+async fn drive_interactive_over_stdio<F>(
+    call: F,
+    mut prompts: tokio::sync::mpsc::Receiver<crate::elicit::Prompt>,
+) -> Result<CallToolResult, CallError>
+where
+    F: std::future::Future<Output = Result<CallToolResult, CallError>>,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut stdout = tokio::io::stdout();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    tokio::pin!(call);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut call => return out,
+            got = prompts.recv() => {
+                let Some(prompt) = got else { continue };
+                let line = serde_json::json!({
+                    "type": "prompt",
+                    "server": prompt.request.server,
+                    "message": prompt.request.message,
+                    "schema": prompt.request.schema,
+                    "url": prompt.request.url,
+                });
+                let answer = if stdout
+                    .write_all(format!("{}\n", line).as_bytes())
+                    .await
+                    .is_ok()
+                    && stdout.flush().await.is_ok()
+                {
+                    match stdin.next_line().await {
+                        Ok(Some(l)) => serde_json::from_str(l.trim())
+                            .unwrap_or(crate::elicit::PromptAnswer::Decline),
+                        _ => crate::elicit::PromptAnswer::Decline,
+                    }
+                } else {
+                    crate::elicit::PromptAnswer::Decline
+                };
+                let _ = prompt.answer.send(answer);
+            }
+        }
+    }
+}
+
+// One spawn helper covers both the plain and interactive stdio paths, so its
+// argument list is legitimately wide; grouping them behind a struct would only
+// move the noise to the call sites.
+#[allow(clippy::too_many_arguments)]
 async fn call_tool_stdio(
     paths: &Paths,
     manifest: &Manifest,
@@ -357,13 +484,21 @@ async fn call_tool_stdio(
     args: Option<&[String]>,
     tool_name: &str,
     arguments: Option<serde_json::Value>,
+    prompts: Option<tokio::sync::mpsc::Sender<crate::elicit::Prompt>>,
 ) -> Result<CallToolResult, CallError> {
     let cmd = build_stdio_command(paths, manifest, id, command, args)?;
 
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
 
-    let client = crate::elicit::ServerClient::unattended(id)
+    // Attended only when there is somewhere for a prompt to go (the interactive
+    // one-shot path). Otherwise the server sees no elicitation capability and
+    // its questions are declined — today's behavior, unchanged.
+    let handler = match prompts {
+        Some(sink) => crate::elicit::ServerClient::attended(id, sink),
+        None => crate::elicit::ServerClient::unattended(id),
+    };
+    let client = handler
         .serve(transport)
         .await
         .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
