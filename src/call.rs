@@ -9,7 +9,9 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content};
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::discovery::{get_manifest_path, get_server, Scope};
 use crate::elevation::{is_elevated, re_exec_with_pkexec};
@@ -101,6 +103,78 @@ fn needs_system_elevation(scope: Scope, selected: Option<&Transport>, elevated: 
 /// If pkexec failed in the child, the answer is the refusal, not a second
 /// attempt — without this a denial would recurse until the box gave out.
 const DELEGATED_ENV: &str = "DMCP_ELEVATION_DELEGATED";
+
+/// How long to wait for the relay to hand back its retained bytes once the
+/// child is gone. EOF normally arrives instantly then; the bound exists
+/// because a server can leak its stderr fd into a longer-lived grandchild,
+/// and a pipe that will never close must not hang the call.
+const RELAY_DRAIN_SECS: u64 = 5;
+
+/// Tee a child's stderr onto `sink` (dmcp's own stderr) as it arrives, while
+/// retaining every byte for failure detail (#49). Raw chunks, never lines: a
+/// prompt like "Proceed? [Y/n] " has no trailing newline and must still flow
+/// through promptly. The task also keeps draining after a failed sink write,
+/// so a caller that closed our stderr cannot back-pressure the child into a
+/// wedge — the old wait_with_output drained both pipes unconditionally too.
+fn relay_stderr<R, W>(mut source: R, mut sink: W) -> JoinHandle<Vec<u8>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut retained = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match source.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    retained.extend_from_slice(&buf[..n]);
+                    if sink.write_all(&buf[..n]).await.is_ok() {
+                        let _ = sink.flush().await;
+                    }
+                }
+            }
+        }
+        retained
+    })
+}
+
+/// Collect what the relay retained. Bounded: past the drain window the relay
+/// is aborted rather than awaited, because the only way EOF is still pending
+/// is an fd held open by something that outlived the server.
+async fn finish_relay(relay: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    let Some(mut handle) = relay else {
+        return Vec::new();
+    };
+    match tokio::time::timeout(Duration::from_secs(RELAY_DRAIN_SECS), &mut handle).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            handle.abort();
+            Vec::new()
+        }
+    }
+}
+
+/// Append the retained server stderr to a failed call's error text. Only the
+/// variants that mean "the server misbehaved" carry it — that is where the
+/// explanation (a traceback, a missing dependency) actually lives.
+fn attach_stderr_detail(err: CallError, stderr: &[u8]) -> CallError {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return err;
+    }
+    match err {
+        CallError::ConnectionFailed(d) => {
+            CallError::ConnectionFailed(format!("{}; server stderr: {}", d, text))
+        }
+        CallError::ToolCallFailed(d) => {
+            CallError::ToolCallFailed(format!("{}; server stderr: {}", d, text))
+        }
+        other => other,
+    }
+}
 
 /// What an unelevated caller should do about the server it is about to invoke.
 #[derive(Debug, PartialEq, Eq)]
@@ -226,20 +300,40 @@ async fn call_tool_elevated(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| CallError::ElevationFailed(id.to_string(), format!("cannot spawn: {}", e)))?;
 
+    // The child's stderr — polkit chatter plus whatever its server relays — is
+    // teed onto our own as it arrives instead of sitting invisible until exit,
+    // while the retained copy still becomes the ElevationFailed detail (#49).
+    let relay = child
+        .stderr
+        .take()
+        .map(|s| relay_stderr(s, tokio::io::stderr()));
+
     let secs = elevation_timeout_secs();
-    let out = tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output())
-        .await
-        .map_err(|_| CallError::ElevationTimedOut(id.to_string(), secs))?
-        .map_err(|e| CallError::ElevationFailed(id.to_string(), e.to_string()))?;
+    // stdout is read to EOF before the wait, concurrently with the stderr
+    // relay task — the same both-pipes-at-once guarantee wait_with_output
+    // gave, so neither pipe filling up can wedge the call.
+    let (status, stdout) = tokio::time::timeout(Duration::from_secs(secs), async {
+        let mut stdout = Vec::new();
+        if let Some(mut out) = child.stdout.take() {
+            out.read_to_end(&mut stdout).await?;
+        }
+        let status = child.wait().await?;
+        std::io::Result::Ok((status, stdout))
+    })
+    .await
+    .map_err(|_| CallError::ElevationTimedOut(id.to_string(), secs))?
+    .map_err(|e| CallError::ElevationFailed(id.to_string(), e.to_string()))?;
+
+    let stderr = finish_relay(relay).await;
 
     result_from_cli_exit(
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
+        status.code(),
+        String::from_utf8_lossy(&stdout).trim_end().to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
         id,
     )
 }
@@ -360,9 +454,31 @@ async fn call_tool_stdio(
 ) -> Result<CallToolResult, CallError> {
     let cmd = build_stdio_command(paths, manifest, id, command, args)?;
 
-    let transport =
-        TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    // Piped instead of rmcp's inherited default: the relay keeps the same live
+    // view a caller had under inheritance, and the retained copy lets a failed
+    // call say why instead of pointing at a log nobody captured (#49). The
+    // JSON-RPC wire (stdout) is untouched.
+    let (transport, child_stderr) = TokioChildProcess::builder(cmd)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let relay = child_stderr.map(|s| relay_stderr(s, tokio::io::stderr()));
 
+    let outcome = drive_stdio_call(transport, id, tool_name, arguments).await;
+
+    // The server is gone by now (cancelled, or its transport dropped and the
+    // child reaped), so the relay is at EOF; draining it here keeps trailing
+    // stderr ahead of the result we are about to report.
+    let retained = finish_relay(relay).await;
+    outcome.map_err(|e| attach_stderr_detail(e, &retained))
+}
+
+async fn drive_stdio_call(
+    transport: TokioChildProcess,
+    id: &str,
+    tool_name: &str,
+    arguments: Option<serde_json::Value>,
+) -> Result<CallToolResult, CallError> {
     let client = crate::elicit::ServerClient::unattended(id)
         .serve(transport)
         .await
@@ -384,11 +500,13 @@ async fn call_tool_stdio(
             task: None,
         })
         .await
-        .map_err(|e| CallError::ToolCallFailed(e.to_string()))?;
+        .map_err(|e| CallError::ToolCallFailed(e.to_string()));
 
+    // Cancelled on the error path too, not just success: the relay behind this
+    // call drains at EOF, and EOF only comes once the child is gone.
     client.cancel().await.ok();
 
-    Ok(result)
+    result
 }
 
 async fn call_tool_remote(
@@ -778,6 +896,91 @@ mod tests {
         let err = CallError::ElevationTimedOut("sys".into(), 180);
         assert!(err.to_string().contains("180s"));
         assert!(err.to_string().contains("DMCP_ELEVATION_TIMEOUT_SECS"));
+    }
+
+    /// The elevated path and the one-shot path share `relay_stderr`; these
+    /// unit tests are the elevated half's coverage, since pkexec cannot be
+    /// driven end to end from a test suite.
+    ///
+    /// A newline-less chunk (an interactive prompt) must reach the sink while
+    /// the source is still open — before EOF, before any line terminator — or
+    /// the relay is buffering exactly the way #49 forbids.
+    #[tokio::test]
+    async fn relay_forwards_a_partial_line_before_eof_and_retains_it() {
+        let (mut source_in, source_out) = tokio::io::duplex(64);
+        let (sink, mut sink_out) = tokio::io::duplex(64);
+        let handle = relay_stderr(source_out, sink);
+
+        source_in.write_all(b"Proceed? [Y/n] ").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), sink_out.read(&mut buf))
+            .await
+            .expect("the chunk must arrive while the source is still open")
+            .unwrap();
+        assert_eq!(&buf[..n], b"Proceed? [Y/n] ");
+
+        source_in.write_all(b"denied\n").await.unwrap();
+        drop(source_in);
+        let retained = handle.await.unwrap();
+        assert_eq!(retained, b"Proceed? [Y/n] denied\n");
+    }
+
+    /// A caller that closed our stderr must not cost the failure detail — the
+    /// relay keeps reading (so the child cannot wedge on a full pipe) and keeps
+    /// retaining (so the error text still says why).
+    #[tokio::test]
+    async fn relay_survives_a_closed_sink_and_still_retains() {
+        let (mut source_in, source_out) = tokio::io::duplex(64);
+        let (sink, sink_out) = tokio::io::duplex(16);
+        drop(sink_out);
+        let handle = relay_stderr(source_out, sink);
+
+        source_in.write_all(b"Traceback: boom").await.unwrap();
+        drop(source_in);
+        assert_eq!(handle.await.unwrap(), b"Traceback: boom");
+    }
+
+    /// A stderr fd leaked into a grandchild never reaches EOF; the drain is
+    /// bounded so that cannot hang the call after its server is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_never_sees_eof_cannot_hang_the_call() {
+        let (source_in, source_out) = tokio::io::duplex(8);
+        let (sink, _sink_out) = tokio::io::duplex(8);
+        let handle = relay_stderr(source_out, sink);
+
+        let bytes = finish_relay(Some(handle)).await;
+        assert!(bytes.is_empty());
+        drop(source_in);
+    }
+
+    /// The retained stderr lands in the failure a caller reads, on exactly the
+    /// variants that mean the server misbehaved.
+    #[test]
+    fn failure_detail_carries_the_retained_stderr() {
+        let err = attach_stderr_detail(
+            CallError::ToolCallFailed("connection closed".into()),
+            b"Traceback: boom\n",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("connection closed"));
+        assert!(msg.contains("server stderr: Traceback: boom"));
+
+        let conn =
+            attach_stderr_detail(CallError::ConnectionFailed("broken pipe".into()), b"denied");
+        assert!(conn.to_string().contains("server stderr: denied"));
+    }
+
+    /// Silence adds nothing: a server that wrote no stderr (or only whitespace)
+    /// leaves the error text byte-identical to before the relay existed.
+    #[test]
+    fn empty_stderr_leaves_the_error_text_unchanged() {
+        let plain = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), b"");
+        assert_eq!(plain.to_string(), "Tool call failed: boom");
+        let blank = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), b"  \n\t");
+        assert_eq!(blank.to_string(), "Tool call failed: boom");
+
+        let unrelated = attach_stderr_detail(CallError::ServerNotFound("s".into()), b"noise");
+        assert_eq!(unrelated.to_string(), "Server not found: s");
     }
 
     #[test]
