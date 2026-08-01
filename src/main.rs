@@ -401,8 +401,10 @@ fn main() {
     // the environment, so it cannot ride an env var): if present, this is the
     // now-root child announcing it is past authentication — emit the sentinel
     // the parent watches for, then strip the flag so clap never sees it (#51).
+    // args_os() rather than args() so a non-UTF-8 argv element passes through
+    // instead of panicking the process before clap can handle it.
     let (raw_args, delegated_authenticated) =
-        strip_elevation_sentinel_flag(std::env::args().collect());
+        strip_elevation_sentinel_flag(std::env::args_os().collect());
     if delegated_authenticated {
         emit_elevation_sentinel();
     }

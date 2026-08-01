@@ -2,6 +2,7 @@
 //!
 //! Connects to a server via its transport (stdio, SSE, WebSocket) and invokes tools.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -129,13 +130,15 @@ pub const ELEVATION_SENTINEL: &str = "\u{1}dmcp:elevation-authenticated\u{1}\n";
 /// Remove the delegation sentinel flag from a process's argv, reporting whether
 /// it was present. `main` runs this before `Cli::parse_from` so the internal
 /// flag never reaches clap; a present flag means "this process is the now-root
-/// end of a delegated elevation — emit the sentinel."
-pub fn strip_elevation_sentinel_flag(args: Vec<String>) -> (Vec<String>, bool) {
+/// end of a delegated elevation — emit the sentinel." Operates on `OsString`
+/// so a non-UTF-8 argv element passes through untouched instead of panicking,
+/// as clap's own `args_os()` parsing would tolerate it.
+pub fn strip_elevation_sentinel_flag(args: Vec<OsString>) -> (Vec<OsString>, bool) {
     let mut found = false;
-    let kept: Vec<String> = args
+    let kept: Vec<OsString> = args
         .into_iter()
         .filter(|a| {
-            if a == ELEVATION_SENTINEL_FLAG {
+            if a.as_os_str() == OsStr::new(ELEVATION_SENTINEL_FLAG) {
                 found = true;
                 false
             } else {
@@ -1177,26 +1180,35 @@ mod tests {
     /// never sees it and only a real delegated re-exec emits the sentinel (#51).
     #[test]
     fn strip_delegation_flag_only_when_present() {
-        let with = vec![
-            "dmcp".to_string(),
-            "call".to_string(),
-            "sys.server".to_string(),
-            "run".to_string(),
-            ELEVATION_SENTINEL_FLAG.to_string(),
-        ];
+        let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+
+        let with = os(&["dmcp", "call", "sys.server", "run", ELEVATION_SENTINEL_FLAG]);
         let (kept, found) = strip_elevation_sentinel_flag(with);
         assert!(found);
-        assert_eq!(kept, vec!["dmcp", "call", "sys.server", "run"]);
+        assert_eq!(kept, os(&["dmcp", "call", "sys.server", "run"]));
 
-        let without = vec![
-            "dmcp".to_string(),
-            "call".to_string(),
-            "s".to_string(),
-            "t".to_string(),
-        ];
+        let without = os(&["dmcp", "call", "s", "t"]);
         let (kept, found) = strip_elevation_sentinel_flag(without.clone());
         assert!(!found);
         assert_eq!(kept, without);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn strip_preserves_a_non_utf8_argv_element() {
+        use std::os::unix::ffi::OsStringExt;
+        // An argv element that is not valid UTF-8 (e.g. a byte-oriented filename)
+        // must pass through rather than abort the process — the regression that
+        // `std::env::args()` (String, panics) introduced over `args_os()`.
+        let bad = OsString::from_vec(vec![0x66, 0x80, 0x81]);
+        let args = vec![
+            OsString::from("dmcp"),
+            bad.clone(),
+            OsString::from(ELEVATION_SENTINEL_FLAG),
+        ];
+        let (kept, found) = strip_elevation_sentinel_flag(args);
+        assert!(found);
+        assert_eq!(kept, vec![OsString::from("dmcp"), bad]);
     }
 
     const SENT: &[u8] = b"<SENT>";
