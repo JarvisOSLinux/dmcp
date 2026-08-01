@@ -101,12 +101,30 @@ stderr is teed onto dmcp's own in raw chunks as it arrives (`call::relay_stderr`
 while a retained copy still supplies the failure detail, so a caller tailing dmcp
 (dispatch's live task tail) sees the chatter mid-call, not after it. polkit
 **denies a non-active session outright** (`allow_inactive: no`) rather than
-prompting, so SSH/headless/system-unit callers land here. An unanswered prompt is
-bounded by `DMCP_ELEVATION_TIMEOUT_SECS` (default 180); the child owns its
-process group and is killed on drop, so a timeout tears down the pkexec/server
-subtree instead of leaving a root process behind. The delegated argv carries no
-`--session`: an elevated server must not outlive the command that needed it,
-which is also why `--session` stays user-scope-only.
+prompting, so SSH/headless/system-unit callers land here. `DMCP_ELEVATION_TIMEOUT_SECS`
+(default 180) bounds **only the pre-authentication window**, not the command's
+own runtime: the re-exec'd, now-root child emits an internal sentinel to stderr
+the moment it is past pkexec, and the parent's relay cancels the deadline on
+seeing it (and strips it from what it tees onward), so an authorized long-running
+job — `pacman -Syu` — runs to completion instead of being killed at 180s with a
+false "auth never completed". The deadline firing therefore means authentication
+genuinely did not complete, and its message says so; the child owns its process
+group and is killed on drop, but a job holder that detached itself (double-fork +
+setsid) can outlive that kill, which the message also states rather than implying
+the operation stopped. The delegated argv carries no `--session`: an elevated
+server must not outlive the command that needed it, which is also why `--session`
+stays user-scope-only.
+
+The re-exec itself is `pkexec <dmcp> <args>`, **not** `pkexec env HOME=… <dmcp> …`:
+pkexec matches its polkit action by the program it is asked to exec, so the env
+wrapper matched `/usr/bin/env`, never the annotated `/usr/bin/dmcp`, and the
+custom action (`allow_gui`, `auth_admin_keep`) never fired. HOME is instead
+restored **inside** dmcp — `elevation::restore_invoking_user_home`, the first
+statement of `main` (before dotenvy, `Paths::resolve`, and any thread), maps
+`PKEXEC_UID` back to the invoking user's home so config resolution reads their
+`~/.config/mcp/sources.list`, not `/root`'s. It is guarded on euid 0 + a present
+`PKEXEC_UID`, so a deliberately-root `dmcp serve` is untouched, and any
+unresolvable uid leaves HOME as-is rather than forcing `/root`.
 
 `auth_admin_keep` in the policy means one password covers a short window; TLA
 still confirms each privileged command upstream, so informed consent is
@@ -291,6 +309,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-08-01:* two elevation fixes (#52 polkit action, #51 timeout scope). **#52:** the polkit action never matched. `elevation::re_exec_with_pkexec` invoked `pkexec env HOME=… dmcp …`, so pkexec mapped the action by `/usr/bin/env`, not the `/usr/bin/dmcp` the policy annotates — `org.jarvisos.dmcp.run-system-server` (its `allow_gui` and `auth_admin_keep`) never fired and elevation fell back to the generic exec action, losing the graphical prompt a TTY-less `dmcp serve`/dispatch caller needs and the one-password window. The re-exec now runs `pkexec <dmcp> <args>` directly (`current_exe()` → `/proc/self/exe` → the annotated path for a packaged install); pointing the annotation at `/usr/bin/env` instead was rejected as it would grant the keep-window to every `pkexec env …` on the box. HOME — which the env wrapper carried so the elevated dmcp read the user's `sources.list`, not `/root`'s — is restored **inside** dmcp: `restore_invoking_user_home`, the first statement of `main` (before dotenvy, `Paths::resolve`, any thread; `set_var` is process-global), maps `PKEXEC_UID` back to a home via getpwuid (`nix`), guarded on euid 0 + a present `PKEXEC_UID` so a deliberately-root serve is untouched, and leaving HOME as-is (never `/root`) on any unresolvable uid. The pure `restored_home(euid, pkexec_uid, lookup)` carries the guard/fallbacks and is unit-tested without a real user database. **#51:** `DMCP_ELEVATION_TIMEOUT_SECS` bounded the whole call, not the auth. `call_tool_elevated` wrapped the child's stdout-read-to-EOF in the timeout, and stdout only EOFs when the child exits — so any system-scope job over 180s (`pacman -Syu`) died with a false "authentication prompt was never completed" ~179s after auth actually succeeded, while the double-forked + setsid jarvis-shell holder survived the process-group kill and kept running as root. Now the re-exec'd, now-root child emits an internal sentinel (`ELEVATION_SENTINEL`, `\x01`-bracketed) to stderr once past pkexec — carried on the argv (`--dmcp-internal-elevation-authenticated`, stripped in `main` before clap) since pkexec sanitizes the environment, gated on `DELEGATED_ENV` so a human `dmcp call`/`install` never emits it. `relay_stderr_watching_sentinel` notifies on the marker and strips it from both the teed stream and the retained detail; `wait_for_auth_or_deadline` races the sentinel, completion, and the deadline, so the deadline bounds only the pre-auth window and an authorized long run finishes unbounded. A genuine timeout now says authentication did not complete and warns that a detached holder may have outlived the kill, rather than implying the operation stopped. Exit-code mapping (0/2/else) and the retained-stderr failure detail are unchanged. Verified without pkexec: `restored_home` guard/fallbacks, `scan_sentinel` boundary cases, the sentinel-stripping relay (auth fires, marker absent from sink and retained), `wait_for_auth_or_deadline` under a paused clock (sentinel-before-deadline completes past the old 180s; no-sentinel times out; a fast call is taken directly), the honest timeout message, and an end-to-end `tests/elevation_sentinel.rs` that the flag emits the sentinel and never reaches clap.
 
 *2026-07-31:* the retained stderr is a bounded tail. `call::relay_stderr` now keeps only the most recent 64 KiB (`STDERR_RETAIN_MAX`) of a child's stderr for failure detail — the end is where the failure reason lives, and the previous retain-everything let a flooding server balloon memory for the whole call and turn the error text (which `dmcp serve` delivers verbatim to the LLM as the tool-result error) into a prompt-sized payload. When bytes were dropped, the detail is prefixed with `[stderr truncated to last 64 KiB]` so a reader knows it is a tail, not the whole story; both retained consumers get this — `attach_stderr_detail` (`ConnectionFailed`/`ToolCallFailed`) and the delegated path's `ElevationFailed` detail. The live relay onto dmcp's own stderr stays an uncapped stream on purpose: the caller consumes it incrementally, so it costs nothing to keep whole. Verified by `flood_and_explode` in the fake logging server (~300 KiB flooded mid-call, then death without an answer): the error text carries the flood's last marker behind the truncation notice, never its first, and stays near the cap, while the full flood — first marker included — still reaches dmcp's stderr through the stream.
 
