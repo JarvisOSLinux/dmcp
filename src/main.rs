@@ -1,8 +1,11 @@
 //! dmcp - MCP Manager CLI
 
 use clap::{Parser, Subcommand};
+use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag};
 use dmcp::config;
-use dmcp::elevation::{is_elevated, is_system_scope, re_exec_with_pkexec};
+use dmcp::elevation::{
+    is_elevated, is_system_scope, re_exec_with_pkexec, restore_invoking_user_home,
+};
 use dmcp::{
     add_source, call, connect, discovery, fetch_server_from_registry, filter_servers_by_keywords,
     get_server, install, list_registry_servers, list_registry_servers_from_url, list_servers,
@@ -388,8 +391,26 @@ enum SourcesAction {
 }
 
 fn main() {
+    // FIRST, before dotenvy, Paths::resolve, and any thread/runtime: a pkexec
+    // re-exec lands here with HOME reset to root's; restore the invoking user's
+    // HOME from PKEXEC_UID so config resolution reads their sources.list, not
+    // /root's (issue #52). set_var is process-global — sound only single-threaded.
+    restore_invoking_user_home();
+
+    // A delegated elevation re-exec carries an internal flag (pkexec/sudo strip
+    // the environment, so it cannot ride an env var): if present, this is the
+    // now-root child announcing it is past authentication — emit the sentinel
+    // the parent watches for, then strip the flag so clap never sees it (#51).
+    // args_os() rather than args() so a non-UTF-8 argv element passes through
+    // instead of panicking the process before clap can handle it.
+    let (raw_args, delegated_authenticated) =
+        strip_elevation_sentinel_flag(std::env::args_os().collect());
+    if delegated_authenticated {
+        emit_elevation_sentinel();
+    }
+
     dotenvy::dotenv().ok();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(raw_args);
     let paths = Paths::resolve();
     let debug = cli.debug;
 

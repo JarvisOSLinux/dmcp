@@ -2,6 +2,7 @@
 //!
 //! Connects to a server via its transport (stdio, SSE, WebSocket) and invokes tools.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -59,9 +60,13 @@ impl std::fmt::Display for CallError {
             ),
             CallError::ElevationTimedOut(id, secs) => write!(
                 f,
-                "Elevation for system-scope server '{}' went unanswered for {}s \
-                 and was cancelled (set DMCP_ELEVATION_TIMEOUT_SECS to change). \
-                 The authentication prompt was never completed.",
+                "Authentication for system-scope server '{}' did not complete \
+                 within {}s (set DMCP_ELEVATION_TIMEOUT_SECS to change). This \
+                 bounds only the pre-authentication window, not the command's \
+                 own runtime — a long-running authorized job is not affected. \
+                 The elevation subtree was killed, but a job holder that \
+                 detached itself (double-fork + setsid) may have outlived that \
+                 kill and could still be running as root.",
                 id, secs
             ),
             CallError::RemoteNotSupported(t) => {
@@ -102,7 +107,57 @@ fn needs_system_elevation(scope: Scope, selected: Option<&Transport>, elevated: 
 /// Set on a child spawned purely to elevate, so it can never spawn another.
 /// If pkexec failed in the child, the answer is the refusal, not a second
 /// attempt — without this a denial would recurse until the box gave out.
-const DELEGATED_ENV: &str = "DMCP_ELEVATION_DELEGATED";
+/// `pub(crate)` so `elevation::re_exec_with_pkexec` can gate the delegation
+/// sentinel flag on it (see below).
+pub(crate) const DELEGATED_ENV: &str = "DMCP_ELEVATION_DELEGATED";
+
+/// Argv flag `re_exec_with_pkexec` appends when re-execing a *delegated*
+/// elevation, so the now-root process announces (via `emit_elevation_sentinel`)
+/// that it is past authentication. pkexec/sudo strip the environment, so this
+/// hand-off cannot ride an env var — it rides the argv, and `main` strips it
+/// back off with `strip_elevation_sentinel_flag` before clap ever sees it.
+pub const ELEVATION_SENTINEL_FLAG: &str = "--dmcp-internal-elevation-authenticated";
+
+/// The line the re-exec'd, now-root delegated process writes to stderr once it
+/// is past pkexec and about to do its work (issue #51). The parent's stderr
+/// relay watches for exactly these bytes to cancel the pre-auth deadline, then
+/// strips them so they never reach the caller's stderr. The `\x01` (SOH)
+/// bracketing makes collision with real server stderr effectively impossible,
+/// and the trailing newline is part of the marker so stripping removes the
+/// whole line, leaving no blank behind.
+pub const ELEVATION_SENTINEL: &str = "\u{1}dmcp:elevation-authenticated\u{1}\n";
+
+/// Remove the delegation sentinel flag from a process's argv, reporting whether
+/// it was present. `main` runs this before `Cli::parse_from` so the internal
+/// flag never reaches clap; a present flag means "this process is the now-root
+/// end of a delegated elevation — emit the sentinel." Operates on `OsString`
+/// so a non-UTF-8 argv element passes through untouched instead of panicking,
+/// as clap's own `args_os()` parsing would tolerate it.
+pub fn strip_elevation_sentinel_flag(args: Vec<OsString>) -> (Vec<OsString>, bool) {
+    let mut found = false;
+    let kept: Vec<OsString> = args
+        .into_iter()
+        .filter(|a| {
+            if a.as_os_str() == OsStr::new(ELEVATION_SENTINEL_FLAG) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (kept, found)
+}
+
+/// Write the elevation sentinel to stderr and flush it, so the parent's relay
+/// sees it promptly. Called from `main` only when the delegation flag was
+/// present, i.e. only in the re-exec'd, now-root delegated process.
+pub fn emit_elevation_sentinel() {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = err.write_all(ELEVATION_SENTINEL.as_bytes());
+    let _ = err.flush();
+}
 
 /// How long to wait for the relay to hand back its retained bytes once the
 /// child is gone. EOF normally arrives instantly then; the bound exists
@@ -132,6 +187,18 @@ struct RetainedStderr {
 }
 
 impl RetainedStderr {
+    /// Append bytes, keeping only the most recent `STDERR_RETAIN_MAX` (the tail,
+    /// where the failure reason lives) and flagging that earlier bytes were
+    /// dropped. Shared by both relays so the cap behaves identically.
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.len() > STDERR_RETAIN_MAX {
+            let excess = self.bytes.len() - STDERR_RETAIN_MAX;
+            self.bytes.drain(..excess);
+            self.truncated = true;
+        }
+    }
+
     /// The failure-detail text: the retained tail, trimmed, prefixed with the
     /// truncation marker when earlier bytes were dropped. `None` when nothing
     /// beyond whitespace was retained.
@@ -168,16 +235,106 @@ where
             match source.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    retained.bytes.extend_from_slice(&buf[..n]);
-                    if retained.bytes.len() > STDERR_RETAIN_MAX {
-                        let excess = retained.bytes.len() - STDERR_RETAIN_MAX;
-                        retained.bytes.drain(..excess);
-                        retained.truncated = true;
-                    }
+                    retained.push(&buf[..n]);
                     if sink.write_all(&buf[..n]).await.is_ok() {
                         let _ = sink.flush().await;
                     }
                 }
+            }
+        }
+        retained
+    })
+}
+
+/// First index at which `needle` occurs in `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Length of the longest proper prefix of `sentinel` that `tail` ends with —
+/// the number of trailing bytes that might be the start of a sentinel finishing
+/// in the next read, and so must be held back. Zero for ordinary text, which is
+/// why non-sentinel stderr flows through with no delay.
+fn trailing_prefix_len(tail: &[u8], sentinel: &[u8]) -> usize {
+    let max = tail.len().min(sentinel.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|&k| tail[tail.len() - k..] == sentinel[..k])
+        .unwrap_or(0)
+}
+
+/// Split accumulated stderr into (bytes safe to emit now, bytes still pending,
+/// whether a full sentinel was removed). Every complete `sentinel` occurrence is
+/// excised; of what remains, only a trailing partial-sentinel prefix is held
+/// back, so a sentinel straddling two reads is still caught while all other
+/// bytes pass through immediately. Pure, so the boundary cases are unit-tested.
+fn scan_sentinel(pending: &[u8], sentinel: &[u8]) -> (Vec<u8>, Vec<u8>, bool) {
+    let mut emit = Vec::new();
+    let mut rest = pending;
+    let mut found = false;
+    while let Some(pos) = find_subslice(rest, sentinel) {
+        emit.extend_from_slice(&rest[..pos]);
+        rest = &rest[pos + sentinel.len()..];
+        found = true;
+    }
+    let hold = trailing_prefix_len(rest, sentinel);
+    let (now, keep) = rest.split_at(rest.len() - hold);
+    emit.extend_from_slice(now);
+    (emit, keep.to_vec(), found)
+}
+
+/// Like [`relay_stderr`], but for the delegated-elevation stream: it also
+/// watches for the [`ELEVATION_SENTINEL`] the now-root child emits once past
+/// pkexec, notifies `on_authenticated` the first time it sees it, and strips it
+/// from both the teed output and the retained failure detail — the marker is
+/// internal and must never reach the caller's stderr. Everything else is
+/// forwarded raw and retained exactly as the plain relay does.
+fn relay_stderr_watching_sentinel<R, W>(
+    mut source: R,
+    mut sink: W,
+    sentinel: &'static [u8],
+    on_authenticated: std::sync::Arc<tokio::sync::Notify>,
+) -> JoinHandle<RetainedStderr>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut retained = RetainedStderr::default();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut fired = false;
+        loop {
+            match source.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&buf[..n]);
+                    let (emit, keep, found) = scan_sentinel(&pending, sentinel);
+                    pending = keep;
+                    if found && !fired {
+                        fired = true;
+                        on_authenticated.notify_one();
+                    }
+                    if !emit.is_empty() {
+                        retained.push(&emit);
+                        if sink.write_all(&emit).await.is_ok() {
+                            let _ = sink.flush().await;
+                        }
+                    }
+                }
+            }
+        }
+        // EOF: whatever is still held back can no longer complete a sentinel, so
+        // flush it rather than swallow a trailing sentinel-prefix of real text.
+        if !pending.is_empty() {
+            retained.push(&pending);
+            if sink.write_all(&pending).await.is_ok() {
+                let _ = sink.flush().await;
             }
         }
         retained
@@ -316,11 +473,48 @@ fn result_from_cli_exit(
     }
 }
 
+/// Outcome of the pre-authentication race in [`wait_for_auth_or_deadline`].
+#[derive(Debug, PartialEq, Eq)]
+enum PreAuth<T> {
+    /// The whole call finished before we saw the sentinel or the deadline (a
+    /// fast tool, or a child that failed before running its server).
+    Completed(T),
+    /// The child crossed pkexec and emitted the sentinel: authentication
+    /// succeeded, so the pre-auth deadline no longer applies.
+    Authenticated,
+    /// No sentinel within the window: authentication genuinely never completed.
+    TimedOut,
+}
+
+/// Bound ONLY the pre-authentication phase (issue #51). The elevation timeout
+/// used to wrap the child's stdout-read-to-EOF, which only reaches EOF when the
+/// child exits — so it bounded the entire tool call, and any authorized job
+/// running past the window (`pacman -Syu`) died with a false "auth never
+/// completed" while its detached holder kept going as root. Here the deadline
+/// races the sentinel (auth succeeded, drop it) and completion (a fast call);
+/// only its expiry with neither means authentication really failed.
+///
+/// `complete` is a reborrow (`Pin<&mut _>`), so on `Authenticated` the caller
+/// keeps the partially-driven future and awaits it with no further deadline.
+async fn wait_for_auth_or_deadline<F: std::future::Future>(
+    complete: std::pin::Pin<&mut F>,
+    authenticated: &tokio::sync::Notify,
+    deadline: Duration,
+) -> PreAuth<F::Output> {
+    tokio::select! {
+        biased;
+        out = complete => PreAuth::Completed(out),
+        _ = authenticated.notified() => PreAuth::Authenticated,
+        _ = tokio::time::sleep(deadline) => PreAuth::TimedOut,
+    }
+}
+
 /// Run the tool through a child `dmcp call`, which elevates itself via pkexec.
 ///
 /// The child owns its process group and is killed on drop, so a cancelled or
 /// timed-out call tears down the pkexec/server subtree instead of leaving a root
-/// process behind.
+/// process behind — with the one caveat the timeout message spells out: a
+/// double-forked + setsid job holder can detach from that subtree.
 async fn call_tool_elevated(
     id: &str,
     tool_name: &str,
@@ -350,26 +544,52 @@ async fn call_tool_elevated(
     // The child's stderr — polkit chatter plus whatever its server relays — is
     // teed onto our own as it arrives instead of sitting invisible until exit,
     // while the retained copy still becomes the ElevationFailed detail (#49).
-    let relay = child
-        .stderr
-        .take()
-        .map(|s| relay_stderr(s, tokio::io::stderr()));
+    // This relay also watches for the elevation sentinel and strips it: the
+    // parent must not forward the internal marker to its own stderr.
+    let authenticated = std::sync::Arc::new(tokio::sync::Notify::new());
+    let relay = child.stderr.take().map(|s| {
+        relay_stderr_watching_sentinel(
+            s,
+            tokio::io::stderr(),
+            ELEVATION_SENTINEL.as_bytes(),
+            authenticated.clone(),
+        )
+    });
 
     let secs = elevation_timeout_secs();
     // stdout is read to EOF before the wait, concurrently with the stderr
     // relay task — the same both-pipes-at-once guarantee wait_with_output
     // gave, so neither pipe filling up can wedge the call.
-    let (status, stdout) = tokio::time::timeout(Duration::from_secs(secs), async {
+    let complete = async {
         let mut stdout = Vec::new();
         if let Some(mut out) = child.stdout.take() {
             out.read_to_end(&mut stdout).await?;
         }
         let status = child.wait().await?;
         std::io::Result::Ok((status, stdout))
-    })
+    };
+    tokio::pin!(complete);
+
+    let raw = match wait_for_auth_or_deadline(
+        complete.as_mut(),
+        &authenticated,
+        Duration::from_secs(secs),
+    )
     .await
-    .map_err(|_| CallError::ElevationTimedOut(id.to_string(), secs))?
-    .map_err(|e| CallError::ElevationFailed(id.to_string(), e.to_string()))?;
+    {
+        PreAuth::Completed(res) => res,
+        // Past authentication: re-authenticating later is acceptable (like
+        // sudo), so the command's own runtime is no longer bounded.
+        PreAuth::Authenticated => complete.await,
+        // Genuine auth failure. Returning drops `complete` (releasing its
+        // borrow of `child`) and then `child` — kill_on_drop tears down the
+        // pkexec/server subtree, save for a detached holder the message warns
+        // about.
+        PreAuth::TimedOut => return Err(CallError::ElevationTimedOut(id.to_string(), secs)),
+    };
+
+    let (status, stdout) =
+        raw.map_err(|e| CallError::ElevationFailed(id.to_string(), e.to_string()))?;
 
     let stderr = finish_relay(relay).await;
 
@@ -939,6 +1159,190 @@ mod tests {
         let err = CallError::ElevationTimedOut("sys".into(), 180);
         assert!(err.to_string().contains("180s"));
         assert!(err.to_string().contains("DMCP_ELEVATION_TIMEOUT_SECS"));
+    }
+
+    /// The timeout now bounds only the pre-auth window, so its message must say
+    /// authentication did not complete — distinct from a long-running job — and
+    /// warn that a detached holder may have outlived the kill (issue #51).
+    #[test]
+    fn timeout_message_is_about_authentication_and_warns_of_a_detached_holder() {
+        let msg = CallError::ElevationTimedOut("sys".into(), 180).to_string();
+        assert!(msg.contains("Authentication"));
+        assert!(msg.contains("did not complete"));
+        assert!(msg.contains("pre-authentication window"));
+        assert!(msg.contains("not the command's own runtime"));
+        // Do not imply the operation stopped: name the escape hatch.
+        assert!(msg.contains("setsid"));
+        assert!(msg.contains("outlived"));
+    }
+
+    /// The delegation flag is removed from argv exactly when present, so clap
+    /// never sees it and only a real delegated re-exec emits the sentinel (#51).
+    #[test]
+    fn strip_delegation_flag_only_when_present() {
+        let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+
+        let with = os(&["dmcp", "call", "sys.server", "run", ELEVATION_SENTINEL_FLAG]);
+        let (kept, found) = strip_elevation_sentinel_flag(with);
+        assert!(found);
+        assert_eq!(kept, os(&["dmcp", "call", "sys.server", "run"]));
+
+        let without = os(&["dmcp", "call", "s", "t"]);
+        let (kept, found) = strip_elevation_sentinel_flag(without.clone());
+        assert!(!found);
+        assert_eq!(kept, without);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn strip_preserves_a_non_utf8_argv_element() {
+        use std::os::unix::ffi::OsStringExt;
+        // An argv element that is not valid UTF-8 (e.g. a byte-oriented filename)
+        // must pass through rather than abort the process — the regression that
+        // `std::env::args()` (String, panics) introduced over `args_os()`.
+        let bad = OsString::from_vec(vec![0x66, 0x80, 0x81]);
+        let args = vec![
+            OsString::from("dmcp"),
+            bad.clone(),
+            OsString::from(ELEVATION_SENTINEL_FLAG),
+        ];
+        let (kept, found) = strip_elevation_sentinel_flag(args);
+        assert!(found);
+        assert_eq!(kept, vec![OsString::from("dmcp"), bad]);
+    }
+
+    const SENT: &[u8] = b"<SENT>";
+
+    /// A full sentinel is excised and the surrounding bytes pass through.
+    #[test]
+    fn scan_sentinel_strips_a_full_occurrence() {
+        let (emit, keep, found) = scan_sentinel(b"before<SENT>after", SENT);
+        assert!(found);
+        assert_eq!(emit, b"beforeafter");
+        assert!(keep.is_empty());
+    }
+
+    /// Ordinary text flows straight through: nothing found, nothing held back.
+    #[test]
+    fn scan_sentinel_passes_plain_text_through() {
+        let (emit, keep, found) = scan_sentinel(b"just some text", SENT);
+        assert!(!found);
+        assert_eq!(emit, b"just some text");
+        assert!(keep.is_empty());
+    }
+
+    /// A trailing partial sentinel is the only thing held back, so a sentinel
+    /// straddling two reads is still caught on the next read.
+    #[test]
+    fn scan_sentinel_reassembles_across_reads() {
+        let (emit, keep, found) = scan_sentinel(b"x<SE", SENT);
+        assert!(!found);
+        assert_eq!(emit, b"x");
+        assert_eq!(keep, b"<SE");
+
+        let mut acc = keep;
+        acc.extend_from_slice(b"NT>y");
+        let (emit, keep, found) = scan_sentinel(&acc, SENT);
+        assert!(found);
+        assert_eq!(emit, b"y");
+        assert!(keep.is_empty());
+    }
+
+    /// The elevated relay strips the sentinel from BOTH the teed sink and the
+    /// retained failure detail, and signals authentication the first time it
+    /// sees it — the marker is internal and must never reach the caller (#51).
+    #[tokio::test]
+    async fn elevated_relay_strips_the_sentinel_and_signals_auth() {
+        let sentinel = ELEVATION_SENTINEL.as_bytes();
+        let (mut source_in, source_out) = tokio::io::duplex(512);
+        let (sink, mut sink_out) = tokio::io::duplex(512);
+        let authenticated = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle =
+            relay_stderr_watching_sentinel(source_out, sink, sentinel, authenticated.clone());
+
+        source_in.write_all(b"polkit chatter\n").await.unwrap();
+        source_in.write_all(sentinel).await.unwrap();
+        source_in.write_all(b"server output\n").await.unwrap();
+        drop(source_in);
+
+        tokio::time::timeout(Duration::from_secs(5), authenticated.notified())
+            .await
+            .expect("the sentinel must fire authentication");
+
+        let retained = handle.await.unwrap();
+        let retained_text = String::from_utf8_lossy(&retained.bytes);
+        assert!(retained_text.contains("polkit chatter"));
+        assert!(retained_text.contains("server output"));
+        assert!(!retained_text.contains("dmcp:elevation-authenticated"));
+
+        let mut sunk = Vec::new();
+        sink_out.read_to_end(&mut sunk).await.unwrap();
+        let sunk_text = String::from_utf8_lossy(&sunk);
+        assert!(sunk_text.contains("polkit chatter"));
+        assert!(sunk_text.contains("server output"));
+        assert!(!sunk_text.contains("dmcp:elevation-authenticated"));
+        assert!(!sunk_text.contains('\u{1}'));
+    }
+
+    /// The sentinel cancels the deadline, and the call then runs to completion
+    /// with NO further bound — even far past the old 180s that used to kill it.
+    #[tokio::test(start_paused = true)]
+    async fn auth_sentinel_cancels_the_deadline_and_the_job_runs_past_it() {
+        let authenticated = std::sync::Arc::new(tokio::sync::Notify::new());
+        // A job that finishes long after the old whole-call timeout.
+        let complete = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            7i32
+        };
+        tokio::pin!(complete);
+
+        let auth2 = authenticated.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            auth2.notify_one();
+        });
+
+        let phase =
+            wait_for_auth_or_deadline(complete.as_mut(), &authenticated, Duration::from_secs(180))
+                .await;
+        assert_eq!(phase, PreAuth::Authenticated);
+
+        // No deadline now: the long job completes rather than being killed.
+        assert_eq!(complete.await, 7);
+    }
+
+    /// With no sentinel, the pre-auth deadline fires: authentication really did
+    /// not complete, and the outcome is TimedOut (mapped to the honest message).
+    #[tokio::test(start_paused = true)]
+    async fn no_auth_sentinel_times_out_in_the_pre_auth_window() {
+        let authenticated = std::sync::Arc::new(tokio::sync::Notify::new());
+        let complete = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            7i32
+        };
+        tokio::pin!(complete);
+
+        let phase =
+            wait_for_auth_or_deadline(complete.as_mut(), &authenticated, Duration::from_secs(180))
+                .await;
+        assert_eq!(phase, PreAuth::TimedOut);
+    }
+
+    /// A call that finishes before either the sentinel or the deadline is taken
+    /// directly — the pre-auth race must not block a fast, already-done call.
+    #[tokio::test(start_paused = true)]
+    async fn a_fast_call_completes_without_waiting_on_the_deadline() {
+        let authenticated = std::sync::Arc::new(tokio::sync::Notify::new());
+        let complete = async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            7i32
+        };
+        tokio::pin!(complete);
+
+        let phase =
+            wait_for_auth_or_deadline(complete.as_mut(), &authenticated, Duration::from_secs(180))
+                .await;
+        assert_eq!(phase, PreAuth::Completed(7));
     }
 
     /// The elevated path and the one-shot path share `relay_stderr`; these

@@ -37,22 +37,91 @@ fn current_exe_and_args() -> (std::path::PathBuf, Vec<String>) {
     (exe, args)
 }
 
+/// Whether this re-exec is a *delegated* elevation — one `dmcp serve`'s call
+/// path spawned to reach root (marked by [`crate::call::DELEGATED_ENV`]). Only
+/// then does the re-exec ask the now-root process to emit the elevation
+/// sentinel; a human `dmcp call`/`install --system` must never see the marker.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_delegated_elevation() -> bool {
+    std::env::var_os(crate::call::DELEGATED_ENV).is_some()
+}
+
+/// Restore HOME to the *invoking* user's home directory when this process is a
+/// pkexec re-exec (issue #52). pkexec resets HOME to root's, but dmcp must read
+/// the invoking user's `~/.config/mcp/sources.list`, not `/root/.config` — the
+/// old `pkexec env HOME=… dmcp …` carried it across, but that made pkexec match
+/// the action by `/usr/bin/env` rather than the annotated `/usr/bin/dmcp`, so
+/// the custom action never fired. pkexec sets `PKEXEC_UID` to the caller; we map
+/// it back to a home. Guarded on euid 0 **and** a present `PKEXEC_UID`, so a
+/// dmcp deliberately started as root (a system-unit `dmcp serve`) is untouched.
+/// Any failure to resolve leaves HOME as-is — never forced to `/root`.
+///
+/// MUST run as the first thing in `main`, before dotenvy, `Paths::resolve`, and
+/// any thread or async runtime: `set_var` is process-global and only sound
+/// while the process is single-threaded.
+#[cfg(target_os = "linux")]
+pub fn restore_invoking_user_home() {
+    let euid = nix::unistd::geteuid().as_raw();
+    let pkexec_uid = std::env::var("PKEXEC_UID").ok();
+    if let Some(home) = restored_home(euid, pkexec_uid.as_deref(), home_for_uid) {
+        std::env::set_var("HOME", home);
+    }
+}
+
+/// The home directory for `uid` from the password database, or `None` if it has
+/// no entry. Split from [`restore_invoking_user_home`] so the policy below is
+/// testable without a real user database.
+#[cfg(target_os = "linux")]
+fn home_for_uid(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.dir.to_string_lossy().into_owned())
+}
+
+/// Pure policy for [`restore_invoking_user_home`]: `Some(home)` to set HOME, or
+/// `None` to leave it as-is. `None` unless euid is 0 (elevated) and `PKEXEC_UID`
+/// both is present and parses to a uid the lookup can resolve — every other
+/// case falls back to leaving HOME untouched rather than guessing.
+#[cfg(target_os = "linux")]
+fn restored_home(
+    euid: u32,
+    pkexec_uid: Option<&str>,
+    lookup: impl Fn(u32) -> Option<String>,
+) -> Option<String> {
+    if euid != 0 {
+        return None;
+    }
+    let uid: u32 = pkexec_uid?.parse().ok()?;
+    lookup(uid)
+}
+
+/// Non-Linux hosts do not go through pkexec (`re_exec_with_pkexec` uses sudo/
+/// osascript, which preserve HOME), so there is nothing to restore.
+#[cfg(not(target_os = "linux"))]
+pub fn restore_invoking_user_home() {}
+
 /// Re-execute the current binary with pkexec for elevation.
 /// Passes through all current args. Exits with the child's exit code.
-/// Preserves HOME so the elevated process can read the invoking user's config (sources.list).
+///
+/// pkexec maps a program to its polkit action by the executable it is asked to
+/// exec, so it MUST exec dmcp directly. The old `pkexec env HOME=… dmcp …`
+/// matched the action for `/usr/bin/env`, never the `/usr/bin/dmcp` the policy
+/// annotates — so `org.jarvisos.dmcp.run-system-server` (its `allow_gui` and
+/// `auth_admin_keep`) never fired and elevation silently fell back to the
+/// generic exec action (issue #52). HOME is restored inside dmcp instead, from
+/// `PKEXEC_UID` (see [`restore_invoking_user_home`]).
 #[cfg(target_os = "linux")]
 pub fn re_exec_with_pkexec() -> ! {
     let (exe, args) = current_exe_and_args();
 
-    // Pass HOME so elevated process reads user's ~/.config/mcp/sources.list, not /root/.config
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let mut cmd = process::Command::new("pkexec");
+    cmd.arg(&exe).args(&args);
+    if is_delegated_elevation() {
+        cmd.arg(crate::call::ELEVATION_SENTINEL_FLAG);
+    }
 
-    let status = process::Command::new("pkexec")
-        .arg("env")
-        .arg(format!("HOME={}", home))
-        .arg(&exe)
-        .args(&args)
-        .status();
+    let status = cmd.status();
 
     match status {
         Ok(s) => process::exit(s.code().unwrap_or(1)),
@@ -80,16 +149,21 @@ pub fn re_exec_with_pkexec() -> ! {
 
     let (exe, args) = current_exe_and_args();
     let home = std::env::var("HOME").unwrap_or_default();
+    let delegated = is_delegated_elevation();
 
     let status = if std::io::stdin().is_terminal() {
-        process::Command::new("sudo")
-            .arg("-E")
-            .arg(&exe)
-            .args(&args)
-            .status()
+        let mut cmd = process::Command::new("sudo");
+        cmd.arg("-E").arg(&exe).args(&args);
+        if delegated {
+            cmd.arg(crate::call::ELEVATION_SENTINEL_FLAG);
+        }
+        cmd.status()
     } else {
         let mut parts = vec![shell_quote(&exe.to_string_lossy())];
         parts.extend(args.iter().map(|a| shell_quote(a)));
+        if delegated {
+            parts.push(shell_quote(crate::call::ELEVATION_SENTINEL_FLAG));
+        }
         if !home.is_empty() {
             parts.insert(0, format!("HOME={}", shell_quote(&home)));
         }
@@ -183,5 +257,55 @@ pub fn remove_dir_elevated(path: &Path) -> std::io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         std::fs::remove_dir_all(path)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// An unelevated process never rewrites HOME, even if a PKEXEC_UID is set:
+    /// the guard is euid 0 first.
+    #[test]
+    fn unelevated_process_leaves_home_untouched() {
+        assert_eq!(
+            restored_home(1000, Some("1000"), |_| Some("/home/alice".into())),
+            None
+        );
+    }
+
+    /// A deliberately-root `dmcp serve` (started under systemd, not via pkexec)
+    /// has no PKEXEC_UID, so its HOME is left exactly as configured.
+    #[test]
+    fn root_without_pkexec_uid_is_left_untouched() {
+        assert_eq!(restored_home(0, None, |_| Some("/home/alice".into())), None);
+    }
+
+    /// The pkexec case: euid 0 with a resolvable PKEXEC_UID restores the
+    /// invoking user's home, so config resolution reads their sources.list.
+    #[test]
+    fn root_via_pkexec_restores_the_invoking_users_home() {
+        let home = restored_home(0, Some("1000"), |uid| {
+            assert_eq!(uid, 1000);
+            Some("/home/alice".into())
+        });
+        assert_eq!(home, Some("/home/alice".to_string()));
+    }
+
+    /// A uid with no password-database entry falls back to leaving HOME as-is —
+    /// never forced to /root.
+    #[test]
+    fn an_unresolvable_uid_leaves_home_untouched() {
+        assert_eq!(restored_home(0, Some("4242"), |_| None), None);
+    }
+
+    /// A non-numeric PKEXEC_UID cannot be trusted; leave HOME untouched rather
+    /// than guess.
+    #[test]
+    fn a_non_numeric_pkexec_uid_leaves_home_untouched() {
+        assert_eq!(
+            restored_home(0, Some("not-a-uid"), |_| Some("/home/x".into())),
+            None
+        );
     }
 }
