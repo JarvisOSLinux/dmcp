@@ -226,10 +226,53 @@ sudo install -m 644 policy/org.jarvisos.dmcp.policy /usr/share/polkit-1/actions/
 ```
 
 On Arch-based systems the PKGBUILD installs the policy file automatically;
-the manual copy above is only needed for non-packaged installs.  The companion JS rules
-in `packages/polkit/org.jarvisos.jarvis.rules` can be extended to grant `YES` for
-members of the `jarvis-elevated` group, removing the password prompt for trusted
-service accounts.
+the manual copy above is only needed for non-packaged installs.
+
+### Headless and service deployments
+
+The action declares `allow_inactive: no`, so polkit **denies a non-active
+session outright rather than prompting**.  A session is "active" only when it
+owns a seat, which an SSH login (seatless) and a systemd service (no login
+session at all) never do — `loginctl enable-linger` does not change this, since
+lingering keeps user units alive without conferring a seat.  System-scope tool
+calls therefore fail on a headless box: not an auth refusal, but a structural
+denial that no amount of retrying or password-typing resolves.
+
+To authorize a headless deployment, a human with root installs a polkit rule
+granting the action to a dedicated group:
+
+```bash
+sudo groupadd -f jarvis-elevated
+sudo usermod -aG jarvis-elevated <jarvis-service-user>
+sudo tee /etc/polkit-1/rules.d/49-jarvis-dmcp.rules >/dev/null <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.jarvisos.dmcp.run-system-server" &&
+        subject.isInGroup("jarvis-elevated")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+```
+
+Two properties make this the recommended mechanism rather than a config flag:
+
+- **It is scoped.**  Only that group, only that one action — unlike
+  `allow_inactive: yes`, which would hand every inactive caller on the box root
+  for this action.
+- **The agent cannot install it.**  `/etc/polkit-1/rules.d/` is root-owned and
+  polkit reads rules from nowhere else, whereas dmcp's own config, `.env` and
+  environment are owned by the unprivileged user an agent's file tools run as.
+  A "disable the prompt" setting in *that* surface would be a self-escalation
+  primitive: compromise the agent, have it write the setting, and it has root
+  without a human ever acting.  Keeping the decision in polkit means granting it
+  already requires the root it would grant.
+
+Understand what it costs: the OS password gate is gone for that group, so the
+per-command TLA confirmation upstream becomes the only remaining barrier.  Use a
+dedicated, minimally-privileged service account — never a human's login, which
+would hand that person passwordless root for the action.  Do **not** solve this
+by running the daemon as root: that makes the entire tool surface privileged and
+discards the "privilege dies with the command" property this design rests on.
 
 ## LLM Integration
 

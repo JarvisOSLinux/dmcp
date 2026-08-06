@@ -54,7 +54,13 @@ impl std::fmt::Display for CallError {
                 "Elevation for system-scope server '{}' was not granted: {}. \
                  polkit denies a non-active session (SSH, headless, a system \
                  unit) outright and does not prompt; from a desktop session the \
-                 prompt may have been dismissed.",
+                 prompt may have been dismissed. On a headless or service \
+                 deployment this is structural, not a dismissed prompt: a human \
+                 with root can authorize it by installing a polkit rule for \
+                 org.jarvisos.dmcp.run-system-server (see the Elevation section \
+                 of the README). That rule lives in root-owned \
+                 /etc/polkit-1/rules.d/, so an agent cannot install it for \
+                 itself — which is the point.",
                 id,
                 detail.trim()
             ),
