@@ -496,22 +496,18 @@ fn main() {
                                 std::process::exit(1);
                             }
                         }
+                    } else if json {
+                        let output = serde_json::to_string_pretty(&manifest.config).unwrap();
+                        println!("{output}");
+                    } else if manifest.config.is_empty() {
+                        println!("No config set.");
                     } else {
-                        if json {
-                            let output = serde_json::to_string_pretty(&manifest.config).unwrap();
-                            println!("{output}");
-                        } else {
-                            if manifest.config.is_empty() {
-                                println!("No config set.");
-                            } else {
-                                for (k, v) in &manifest.config {
-                                    let val: String = v
-                                        .as_str()
-                                        .map(String::from)
-                                        .unwrap_or_else(|| v.to_string());
-                                    println!("{} = {}", k, val);
-                                }
-                            }
+                        for (k, v) in &manifest.config {
+                            let val: String = v
+                                .as_str()
+                                .map(String::from)
+                                .unwrap_or_else(|| v.to_string());
+                            println!("{} = {}", k, val);
                         }
                     }
                 }
@@ -1081,12 +1077,10 @@ fn main() {
                 let results = index.search(&query, top_k, min_score);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&results).unwrap());
+                } else if results.is_empty() {
+                    println!("No results above min-score {:.2}.", min_score);
                 } else {
-                    if results.is_empty() {
-                        println!("No results above min-score {:.2}.", min_score);
-                    } else {
-                        print_vector_results(&results);
-                    }
+                    print_vector_results(&results);
                 }
                 return;
             }
