@@ -107,6 +107,12 @@ fn connect_manifest(
 
     manifest["installDir"] = serde_json::Value::String(install_dir.to_string_lossy().to_string());
     manifest["id"] = serde_json::Value::String(id.clone());
+    // A connected server has no registry entry, so no tier was ever reviewed —
+    // and the fetched manifest is attacker-controlled, so a trustStatus it
+    // carries must not survive to disk (a URL manifest could otherwise
+    // self-declare "official" and be believed by everything that reads the
+    // installed manifest). "unknown" is the established no-registry spelling.
+    manifest["trustStatus"] = serde_json::Value::String("unknown".to_string());
 
     if let Some(n) = name {
         manifest["name"] = serde_json::Value::String(n.to_string());
@@ -255,6 +261,7 @@ fn connect_raw(
         "version": version.unwrap_or("1.0.0"),
         "transports": [transport],
         "installDir": install_dir.to_string_lossy(),
+        "trustStatus": "unknown",
         "config": config_obj
     });
 
@@ -546,6 +553,31 @@ mod tests {
             ),
             Some("setup.ps1"),
             "never hand setup.sh to PowerShell when a .ps1 was shipped"
+        );
+    }
+
+    /// A fetched manifest is attacker-controlled: a trustStatus it carries must
+    /// not survive to disk, or a URL install could self-declare "official" and
+    /// be believed by everything that reads the installed manifest.
+    #[test]
+    fn a_url_manifests_self_declared_tier_does_not_survive() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let mut m = manifest(None, None);
+        m["trustStatus"] = serde_json::json!("official");
+        connect_with(&paths, m, false, false).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                paths
+                    .user_install_dir()
+                    .join("com.test.connected/manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            written["trustStatus"], "unknown",
+            "no registry reviewed a connected server, whatever its manifest claims"
         );
     }
 }

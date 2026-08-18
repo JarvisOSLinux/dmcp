@@ -80,6 +80,13 @@ pub struct Manifest {
     /// the broker. Absent or false means stateless — the default one-shot path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stateful: Option<bool>,
+    /// Trust tier recorded at install time: the registry entry's tier for
+    /// by-id installs ("community"/"official"/"deprecated"/"removed"),
+    /// "unknown" for URL/connect installs that no registry ever reviewed.
+    /// Absent on manifests written before the field existed — readers must
+    /// treat absence exactly like "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_status: Option<String>,
     /// Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`.
     /// Absent means unrestricted — dmcp installs and runs it on any host.
     ///
@@ -254,6 +261,22 @@ mod tests {
         assert_eq!(
             out["transports"][0]["platforms"],
             serde_json::json!("windows")
+        );
+    }
+
+    #[test]
+    fn trust_status_reads_when_present_and_absence_stays_absent() {
+        let with: Manifest =
+            serde_json::from_str(r#"{"id":"com.test.s","trustStatus":"community"}"#).unwrap();
+        assert_eq!(with.trust_status.as_deref(), Some("community"));
+
+        let without: Manifest = serde_json::from_str(r#"{"id":"com.test.s"}"#).unwrap();
+        assert!(without.trust_status.is_none());
+        assert!(
+            !serde_json::to_string(&without)
+                .unwrap()
+                .contains("trustStatus"),
+            "absence must not be written back as null"
         );
     }
 }
