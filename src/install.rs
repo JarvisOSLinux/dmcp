@@ -76,6 +76,13 @@ pub fn install(
     // Build manifest
     let mut manifest = server.clone();
     manifest["installDir"] = serde_json::Value::String(install_dir.to_string_lossy().to_string());
+    // Record the tier the trust gate resolved, not whatever the merge left:
+    // the registry entry is authoritative for by-id installs, the absent case
+    // normalizes to "community" (same default the gate itself applies), and
+    // clients scaling behavior by tier get one deliberate contract instead of
+    // a merge accident. Install-time snapshot by design — a later promotion
+    // or revocation reaches this file only through an applied update.
+    manifest["trustStatus"] = serde_json::Value::String(trust_status(&server).to_string());
     if manifest.get("config").is_none() {
         manifest["config"] = serde_json::json!({});
     }
@@ -1485,5 +1492,51 @@ mod tests {
             verify_rev(got, want).unwrap_err(),
             InstallError::SourceRevMismatch { .. }
         ));
+    }
+
+    /// The tier written to disk is the gate-resolved one: recorded verbatim
+    /// when the entry declares it, normalized to "community" when it does not
+    /// (the same default the trust gate applies) — so readers scaling behavior
+    /// by tier get a deliberate contract, not a merge accident.
+    #[test]
+    fn install_records_the_gate_resolved_tier() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let mut declared = remote_server("");
+        declared["trustStatus"] = serde_json::json!("official");
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(declared),
+            false,
+            false,
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.user_install_dir().join("test.server/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["trustStatus"], "official");
+
+        let tree2 = TempTree::new();
+        let paths2 = tree2.paths();
+        install(
+            &paths2,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server("")),
+            false,
+            false,
+        )
+        .unwrap();
+        let manifest2: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths2.user_install_dir().join("test.server/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest2["trustStatus"], "community",
+            "an entry with no recorded tier must normalize to the gate default"
+        );
     }
 }
