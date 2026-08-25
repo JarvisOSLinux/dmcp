@@ -300,7 +300,11 @@ enum Commands {
     },
 
     /// Show resolved paths (for debugging)
-    Paths,
+    Paths {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -415,16 +419,21 @@ fn main() {
     let debug = cli.debug;
 
     match cli.command {
-        Commands::Paths => {
-            println!("User install dir:  {}", paths.user_install_dir().display());
-            println!(
-                "System install dir: {}",
-                paths.system_install_dir().display()
-            );
-            let user_index = paths.user_install_dir().join("index.json");
-            let system_index = paths.system_install_dir().join("index.json");
-            println!("User index exists:  {}", user_index.exists());
-            println!("System index exists: {}", system_index.exists());
+        Commands::Paths { json } => {
+            if json {
+                let output = serde_json::to_string_pretty(&paths.as_json()).unwrap();
+                println!("{output}");
+            } else {
+                println!("User install dir:  {}", paths.user_install_dir().display());
+                println!(
+                    "System install dir: {}",
+                    paths.system_install_dir().display()
+                );
+                let user_index = paths.user_install_dir().join("index.json");
+                let system_index = paths.system_install_dir().join("index.json");
+                println!("User index exists:  {}", user_index.exists());
+                println!("System index exists: {}", system_index.exists());
+            }
         }
         Commands::List { user, system, json } => {
             let include_user = user || !system;

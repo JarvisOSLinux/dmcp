@@ -16,6 +16,21 @@ pub struct Paths {
     pub vector_index_dir: PathBuf,
 }
 
+/// Resolved paths rendered as absolute strings for machine consumers
+/// (`dmcp paths --json`).
+#[derive(Debug, serde::Serialize)]
+pub struct PathsJson {
+    /// Base directory that contains `installed/` and `vector_index/` — the
+    /// parent of the user install dir. Downstream tooling reads this to locate
+    /// installed server manifests on every OS, so it must stay the parent of
+    /// `install_dir` rather than a hardcoded guess.
+    pub data_dir: String,
+    pub config_dir: String,
+    pub install_dir: String,
+    pub vector_index_dir: String,
+    pub system_install_dir: String,
+}
+
 impl Paths {
     /// Resolve paths from environment, falling back to .env.example, then XDG/defaults.
     pub fn resolve() -> Self {
@@ -89,6 +104,27 @@ impl Paths {
     pub fn vector_index_path(&self) -> PathBuf {
         self.vector_index_dir.join("index.json")
     }
+
+    /// Resolved paths for machine consumers. `data_dir` is derived as the parent
+    /// of the user install dir (and `config_dir` as the parent of the user
+    /// sources file) so an `MCP_USER_INSTALL_DIR` override moves both together
+    /// instead of the JSON pointing at a stale default.
+    pub fn as_json(&self) -> PathsJson {
+        PathsJson {
+            data_dir: parent_or_self(&self.user_install_dir),
+            config_dir: parent_or_self(&self.user_sources),
+            install_dir: self.user_install_dir.display().to_string(),
+            vector_index_dir: self.vector_index_dir.display().to_string(),
+            system_install_dir: self.system_install_dir.display().to_string(),
+        }
+    }
+}
+
+/// A path's parent as a string, falling back to the path itself when it has no
+/// parent (e.g. a filesystem root or a bare filename), so a JSON value is never
+/// empty.
+fn parent_or_self(path: &Path) -> String {
+    path.parent().unwrap_or(path).display().to_string()
 }
 
 fn resolve_path(
@@ -212,4 +248,61 @@ fn parse_env_file(path: &Path) -> std::io::Result<HashMap<String, String>> {
 fn expand_tilde(path: &str) -> PathBuf {
     let expanded = shellexpand::tilde(path);
     PathBuf::from(expanded.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_paths() -> Paths {
+        Paths {
+            user_sources: PathBuf::from("/home/u/.config/mcp/sources.list"),
+            user_install_dir: PathBuf::from("/home/u/.local/share/mcp/installed"),
+            system_sources: PathBuf::from("/etc/mcp/sources.list"),
+            system_install_dir: PathBuf::from("/usr/share/mcp/installed"),
+            vector_index_dir: PathBuf::from("/home/u/.local/share/mcp/vector_index"),
+        }
+    }
+
+    #[test]
+    fn as_json_data_dir_is_parent_of_install_dir() {
+        let json = sample_paths().as_json();
+
+        // The load-bearing invariant PJ relies on: data_dir is the parent of
+        // install_dir and the base that contains installed/ and vector_index/.
+        assert_eq!(json.install_dir, "/home/u/.local/share/mcp/installed");
+        assert_eq!(json.data_dir, "/home/u/.local/share/mcp");
+        assert_eq!(
+            Path::new(&json.install_dir).parent().unwrap(),
+            Path::new(&json.data_dir)
+        );
+        assert!(json.data_dir.ends_with("/mcp"));
+
+        assert_eq!(json.config_dir, "/home/u/.config/mcp");
+        assert_eq!(
+            json.vector_index_dir,
+            "/home/u/.local/share/mcp/vector_index"
+        );
+        assert_eq!(json.system_install_dir, "/usr/share/mcp/installed");
+    }
+
+    #[test]
+    fn as_json_serializes_all_keys_as_absolute_strings() {
+        let value = serde_json::to_value(sample_paths().as_json()).unwrap();
+        let obj = value.as_object().unwrap();
+
+        for key in [
+            "data_dir",
+            "config_dir",
+            "install_dir",
+            "vector_index_dir",
+            "system_install_dir",
+        ] {
+            let s = obj.get(key).unwrap().as_str().unwrap();
+            assert!(
+                Path::new(s).is_absolute(),
+                "{key} should be absolute, got {s}"
+            );
+        }
+    }
 }
