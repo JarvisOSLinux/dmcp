@@ -6,29 +6,80 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Windows runners default to PowerShell; one shell keeps the build steps
+# identical across every leg of the matrix.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # `asset` is a contract: the JarvisOS ISO bake script and the website
+        # download these by exact name. Add rows, never rename one.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: dmcp
+            asset: dmcp-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: dmcp.exe
+            asset: dmcp-windows-x86_64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: dmcp
+            asset: dmcp-macos-aarch64
+          # Cross-built on the same arm64 runner: between Apple architectures
+          # the stock toolchain needs nothing but the target.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: dmcp
+            asset: dmcp-macos-x86_64
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
 
-      - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      # Build only. Tests run in CI; `cargo test` does not build on Windows.
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/x86_64-unknown-linux-musl/release/dmcp dmcp-linux-x86_64
+        run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dmcp-linux-x86_64
+          files: dist/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

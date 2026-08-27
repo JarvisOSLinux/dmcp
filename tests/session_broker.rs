@@ -8,6 +8,8 @@
 //!
 //! Every test skips gracefully when `python3` is not on PATH.
 
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
