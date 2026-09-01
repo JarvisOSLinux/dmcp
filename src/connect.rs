@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::manifest_io::{create_install_dir, write_manifest_atomic, Readers};
 use crate::paths::Paths;
 use crate::setup;
 
@@ -102,8 +103,9 @@ fn connect_manifest(
         crate::discovery::Scope::User => paths.user_install_dir().join(&id),
         crate::discovery::Scope::System => paths.system_install_dir().join(&id),
     };
+    let readers = Readers::for_scope(scope);
 
-    std::fs::create_dir_all(&install_dir).map_err(ConnectError::CreateDir)?;
+    create_install_dir(&install_dir, readers).map_err(ConnectError::CreateDir)?;
 
     manifest["installDir"] = serde_json::Value::String(install_dir.to_string_lossy().to_string());
     manifest["id"] = serde_json::Value::String(id.clone());
@@ -144,7 +146,8 @@ fn connect_manifest(
 
     let manifest_path = install_dir.join("manifest.json");
     let output = serde_json::to_string_pretty(&manifest).map_err(ConnectError::Serialize)?;
-    std::fs::write(&manifest_path, output).map_err(ConnectError::WriteManifest)?;
+    write_manifest_atomic(&manifest_path, output.as_bytes(), readers)
+        .map_err(ConnectError::WriteManifest)?;
 
     // Run setup script if present — the one this host runs, chosen by the same
     // selector `install` and `dmcp setup` use, so a manifest that ships only
@@ -234,8 +237,9 @@ fn connect_raw(
         crate::discovery::Scope::User => paths.user_install_dir().join(&id),
         crate::discovery::Scope::System => paths.system_install_dir().join(&id),
     };
+    let readers = Readers::for_scope(scope);
 
-    std::fs::create_dir_all(&install_dir).map_err(ConnectError::CreateDir)?;
+    create_install_dir(&install_dir, readers).map_err(ConnectError::CreateDir)?;
 
     let transport = if transport_type == "websocket" {
         serde_json::json!({
@@ -267,7 +271,8 @@ fn connect_raw(
 
     let manifest_path = install_dir.join("manifest.json");
     let output = serde_json::to_string_pretty(&manifest).map_err(ConnectError::Serialize)?;
-    std::fs::write(&manifest_path, output).map_err(ConnectError::WriteManifest)?;
+    write_manifest_atomic(&manifest_path, output.as_bytes(), readers)
+        .map_err(ConnectError::WriteManifest)?;
 
     crate::install::update_index_add(paths, &id, &manifest_path, scope, &[])
         .map_err(|e| ConnectError::IndexError(e.to_string()))?;
@@ -579,5 +584,45 @@ mod tests {
             written["trustStatus"], "unknown",
             "no registry reviewed a connected server, whatever its manifest claims"
         );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// `dmcp connect --config token=…` writes the same credential store the
+    /// install path does, by either route — a fetched manifest or a raw
+    /// endpoint — so both must leave it owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_connected_servers_credential_store_is_private() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+
+        connect_with(&paths, manifest(None, None), false, false).unwrap();
+        let from_manifest = paths.user_install_dir().join("com.test.connected");
+        assert_eq!(mode_of(&from_manifest.join("manifest.json")), 0o600);
+        assert_eq!(mode_of(&from_manifest), 0o700);
+
+        connect_raw(
+            &paths,
+            "wss://example.invalid/ws",
+            Some("com.test.raw"),
+            None,
+            None,
+            None,
+            &[("token".to_string(), "ghp_secret".to_string())],
+            crate::discovery::Scope::User,
+        )
+        .unwrap();
+        let from_raw = paths.user_install_dir().join("com.test.raw");
+        assert_eq!(
+            mode_of(&from_raw.join("manifest.json")),
+            0o600,
+            "a raw connect stores --config values verbatim; they are secrets too"
+        );
+        assert_eq!(mode_of(&from_raw), 0o700);
     }
 }

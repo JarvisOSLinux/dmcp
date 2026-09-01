@@ -6,6 +6,7 @@ use dmcp::config;
 use dmcp::elevation::{
     is_elevated, is_system_scope, re_exec_with_pkexec, restore_invoking_user_home,
 };
+use dmcp::manifest_io::{write_manifest_atomic, Readers};
 use dmcp::{
     add_source, call, connect, discovery, fetch_server_from_registry, filter_servers_by_keywords,
     get_server, install, list_registry_servers, list_registry_servers_from_url, list_servers,
@@ -887,11 +888,26 @@ fn main() {
                                                     .as_ref()
                                                     .map(|s| serde_json::Value::String(s.clone()))
                                                     .unwrap_or(serde_json::json!("1.0.0"));
-                                                let _ = std::fs::write(
-                                                    &manifest_path,
-                                                    serde_json::to_string_pretty(&m)
-                                                        .unwrap_or_default(),
-                                                );
+                                                // Rewrites the whole manifest,
+                                                // config block included, so it
+                                                // goes through the same guarded
+                                                // write as `config set`. Skipped
+                                                // entirely if serialization
+                                                // fails: an empty string here
+                                                // would replace the manifest
+                                                // with nothing.
+                                                if let Ok(output) = serde_json::to_string_pretty(&m)
+                                                {
+                                                    let readers = Readers::for_manifest_path(
+                                                        &paths,
+                                                        &manifest_path,
+                                                    );
+                                                    let _ = write_manifest_atomic(
+                                                        &manifest_path,
+                                                        output.as_bytes(),
+                                                        readers,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
