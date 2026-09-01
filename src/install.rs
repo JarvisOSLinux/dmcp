@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::discovery;
 use crate::elevation::{remove_dir_elevated, write_file_elevated};
+use crate::manifest_io::{create_install_dir, write_manifest_atomic, Readers};
 use crate::paths::Paths;
 use crate::setup;
 use crate::sources::list_sources;
@@ -42,11 +43,12 @@ pub fn install(
         crate::discovery::Scope::User => paths.user_install_dir().join(id),
         crate::discovery::Scope::System => paths.system_install_dir().join(id),
     };
+    let readers = Readers::for_scope(scope);
 
     // Clear any stale files from a previous failed install so that
     // copy_dir_all never hits EACCES on read-only remnants.
     let _ = std::fs::remove_dir_all(&install_dir);
-    std::fs::create_dir_all(&install_dir).map_err(InstallError::CreateDir)?;
+    create_install_dir(&install_dir, readers).map_err(InstallError::CreateDir)?;
 
     let transports = server
         .get("transports")
@@ -152,7 +154,8 @@ pub fn install(
     }
 
     let output = serde_json::to_string_pretty(&manifest).map_err(InstallError::Serialize)?;
-    std::fs::write(&manifest_path, output).map_err(InstallError::WriteManifest)?;
+    write_manifest_atomic(&manifest_path, output.as_bytes(), readers)
+        .map_err(InstallError::WriteManifest)?;
 
     // Update index with keywords
     let keywords: Vec<String> = manifest
@@ -1537,6 +1540,76 @@ mod tests {
         assert_eq!(
             manifest2["trustStatus"], "community",
             "an entry with no recorded tier must normalize to the gate default"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The installed manifest is the per-server credential store — its `config`
+    /// block becomes the server's environment at spawn — so a fresh install must
+    /// leave it readable only by its owner, inside directories no other local
+    /// account can traverse.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_install_leaves_the_credential_store_private() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server("")),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let server_dir = paths.user_install_dir().join("test.server");
+        assert_eq!(
+            mode_of(&server_dir.join("manifest.json")),
+            0o600,
+            "a manifest holding API tokens must not be world-readable"
+        );
+        assert_eq!(
+            mode_of(&server_dir),
+            0o700,
+            "the per-server install dir must not be traversable by other accounts"
+        );
+        assert_eq!(
+            mode_of(paths.user_install_dir()),
+            0o700,
+            "installed/ is created by the same call and holds every server's dir"
+        );
+    }
+
+    /// Re-installing over an existing server rewrites the manifest; the mode
+    /// must not drift back to the umask default on that second write.
+    #[cfg(unix)]
+    #[test]
+    fn reinstalling_keeps_the_manifest_private() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+
+        for _ in 0..2 {
+            install(
+                &paths,
+                "test.server",
+                crate::discovery::Scope::User,
+                Some(remote_server("")),
+                false,
+                false,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            mode_of(&paths.user_install_dir().join("test.server/manifest.json")),
+            0o600
         );
     }
 }

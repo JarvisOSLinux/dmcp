@@ -31,6 +31,19 @@ cp .env.example .env
 
 See [MCP-SYSTEM-SPEC.md](MCP-SYSTEM-SPEC.md) for the full specification and [MCP-REGISTRY-GUIDE.md](MCP-REGISTRY-GUIDE.md) for registry format and install flow.
 
+### Where per-server credentials live
+
+`dmcp config <id> set` stores values in `installed/<id>/manifest.json` — the same
+file `install` and `connect` write — and dmcp hands them to the server as
+environment variables when it spawns. On unix a **user-scope** manifest is
+written mode `0600` inside directories created `0700`, and every write goes to a
+temp file that is renamed over the target, so an interrupted write leaves the
+previous manifest (and the token in it) intact rather than truncated.
+System-scope manifests under `/usr/share/mcp/installed/` keep their existing
+modes: that tree is visible to every user on the machine by design. Modes are
+applied where dmcp creates a file or directory; a directory that already exists
+is left exactly as it is, including one you widened on purpose.
+
 ## Build & Run
 
 Requires [Rust](https://rustup.rs/).
@@ -77,6 +90,7 @@ src/
 ├── discovery.rs # List servers, get_server, load index/manifests
 ├── sources.rs   # Registry sources (sources.list)
 ├── config.rs    # Config get/set
+├── manifest_io.rs # Atomic, owner-only writes for manifests holding credentials
 ├── install.rs   # Install, uninstall
 ├── run.rs       # Run servers (stdio spawn, SSE/WS URL)
 ├── setup.rs     # Setup script execution

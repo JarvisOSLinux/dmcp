@@ -48,6 +48,7 @@ src/
 ├── connect.rs        Add remote servers (manifest URL or raw endpoint)
 ├── doc_comments.rs   Extract @mcp.tool docstrings from Python servers (description fallback for the search index)
 ├── config.rs         Per-server config get/set
+├── manifest_io.rs    Atomic, owner-only writes for the manifests that hold server credentials
 ├── run.rs            Spawn stdio servers, print SSE/WS URLs
 ├── setup.rs          Execute setup scripts
 ├── call.rs           Call tools on MCP servers
