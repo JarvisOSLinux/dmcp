@@ -183,6 +183,7 @@ mod tests {
                 None => PlatformDecl::Absent,
                 Some(_) => PlatformDecl::from_names(&names),
             },
+            execution: None,
         }
     }
 
