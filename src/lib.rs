@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod doc_comments;
 pub mod elevation;
 pub mod elicit;
+pub mod execution;
 pub mod install;
 pub mod manifest_io;
 pub mod models;

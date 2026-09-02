@@ -182,6 +182,7 @@ Structure matches the registry server entry, plus:
 - `command`: Executable (e.g. `python3`, `node`)
 - `args`: Arguments, relative to project root (install dir)
 - Process is spawned with `cwd` = install dir
+- `execution` (optional): run that launch line somewhere other than the host — see 6.1.1
 
 **sse (remote):**
 
@@ -201,6 +202,68 @@ Structure matches the registry server entry, plus:
   "wsUrl": "wss://api.example.com/mcp/ws"
 }
 ```
+
+#### 6.1.1 Execution Backends (stdio only, optional)
+
+A stdio transport may carry an `execution` object — a sibling of `command`,
+`args` and `platforms` — saying where that launch line runs. Absent (the
+default) means directly on the host, exactly as before the field existed.
+
+**docker:**
+
+```json
+{
+  "type": "stdio",
+  "command": "python3",
+  "args": ["/srv/app/server.py"],
+  "execution": {
+    "type": "docker",
+    "image": "python:3-slim",
+    "mountInstallDir": "ro",
+    "extraArgs": ["--cpus", "1"]
+  }
+}
+```
+
+- `image` (required)
+- `mountInstallDir`: `"ro"` (default) | `"rw"` | `"none"`
+- `extraArgs` (optional): inserted into `docker run` **before** the image
+
+Spawned as:
+
+```
+docker run -i --rm [-v <installDir>:<installDir>:<mode>] -w <installDir> \
+           [-e KEY ...] [extraArgs ...] <image> <command> <args ...>
+```
+
+One `-e KEY` per config key, in the **bare** form: docker forwards the value
+from its own environment, which dmcp sets, so config **values** never appear in
+the command line. A key that is empty or contains `=` is not forwarded (it would
+turn the bare form back into `-e KEY=VALUE`).
+
+**wrapper:**
+
+```json
+{"execution": {"wrapper": ["ssh", "build-host", "--"]}}
+```
+
+Spawned as `wrapper... <command> <args ...>`. dmcp knows nothing about the
+wrapper; the config environment is set on the wrapper process only, and a
+wrapper that crosses a machine boundary (`ssh`) does not carry it further by
+itself.
+
+In both forms `cwd` stays the host `installDir` (docker's `-w` governs the path
+inside the container; a wrapper needs it so relative paths resolve).
+
+**Rejected, at parse time and never ignored:** both forms in one object, an
+empty `wrapper`, `docker` without an `image`, and any unknown key inside
+`execution`. A typo (`"imgae"`) must not degrade into an unwrapped host spawn,
+so the whole manifest fails to parse instead; `uninstall` reads the index rather
+than the manifest, so such a server is still removable.
+
+**Not supported in system scope.** A system-scope server is launched by
+re-execing dmcp through pkexec, whose semantics inside a container or behind a
+wrapper are undefined; the combination is refused before any spawn or prompt.
 
 ### 6.2 Source (for stdio)
 
@@ -331,7 +394,7 @@ When spawning a stdio server:
 2. Load manifest.json
 3. Get the primary transport: the first entry in `transports` whose `platforms` include the host (an entry without `platforms` matches every host) with `type == "stdio"`. If no entry covers the host, the invocation fails naming the platforms the manifest declares
 4. `cwd` = `installDir` from manifest (or dir containing manifest.json)
-5. Execute `command` with `args`
+5. Execute `command` with `args`, through the transport's `execution` backend when it declares one (§6.1.1)
 6. Config is delivered via environment variables (the manifest `config` map, keys verbatim)
 
 Environment: inherit from parent, plus the injected config variables.

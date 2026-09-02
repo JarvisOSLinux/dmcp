@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::execution::Execution;
 use crate::platform::PlatformDecl;
 
 /// Index file at `<base>/mcp/installed/index.json`
@@ -134,6 +135,12 @@ pub enum Transport {
         /// manifest launching exactly as before.
         #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
         platforms: PlatformDecl,
+        /// Where this launch line runs: in a container, behind an argv prefix,
+        /// or — absent, the default — directly on the host. Per-transport like
+        /// `platforms`, because the backend belongs to the launch line it wraps.
+        /// See `crate::execution`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<Execution>,
     },
     Sse {
         url: String,
@@ -162,6 +169,16 @@ impl Transport {
             Transport::Stdio { platforms, .. }
             | Transport::Sse { platforms, .. }
             | Transport::WebSocket { platforms, .. } => platforms,
+        }
+    }
+
+    /// The execution backend this transport declares, if any. Only a stdio
+    /// transport has a process to place: a remote endpoint is already running
+    /// wherever its owner put it.
+    pub fn execution(&self) -> Option<&Execution> {
+        match self {
+            Transport::Stdio { execution, .. } => execution.as_ref(),
+            _ => None,
         }
     }
 }
