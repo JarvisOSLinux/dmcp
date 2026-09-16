@@ -876,34 +876,139 @@ fn epoch_to_datetime(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     (y, m, d, hour, min, sec)
 }
 
+/// Civil date from a day count since the Unix epoch.
+///
+/// Howard Hinnant's `civil_from_days`. The era is shifted so a year starts on
+/// 1 March, which is what makes the leap day fall at the end of a year and so
+/// need no special case anywhere — but it also means `day_of_year` below counts
+/// from 1 March, not 1 January. Converting it with a January-first month table
+/// is the mistake this function used to make: every date it produced landed 59
+/// or 60 days early, because that is what January and February are worth.
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    let days = days + 719468;
-    let era = days / 146097;
-    let day_of_era = days - era * 146097;
+    let z = days + 719468;
+    // Floor division, not truncating: an era before 1970 is negative, and
+    // `-1 / 146097 == 0` in Rust would put it in the wrong era.
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let day_of_era = z - era * 146097; // [0, 146096]
     let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365; // [0, 399]
     let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let (month, day) = doy_to_md(day_of_year as u32);
-    (year, month, day)
-}
-
-fn doy_to_md(doy: u32) -> (u32, u32) {
-    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut d = doy + 1;
-    for (i, &dim) in days_in_month.iter().enumerate() {
-        if d <= dim {
-            return ((i + 1) as u32, d);
-        }
-        d -= dim;
-    }
-    (12, 31)
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365], from 1 March
+    let mp = (5 * day_of_year + 2) / 153; // [0, 11], months since March
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+                                                                // January and February belong to the calendar year after the March-based one.
+    (year + i64::from(month <= 2), month, day)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// What `epoch_to_datetime` returns: (year, month, day, hour, minute, second).
+    type CivilDate = (i64, u32, u32, u32, u32, u32);
+
+    /// Known epoch-second -> civil-date pairs, each chosen for something the
+    /// March-based era arithmetic has to get right. Every one of these was
+    /// wrong before: the old conversion read a March-based day-of-year with a
+    /// January-first month table, so it reported dates 59 or 60 days early.
+    #[test]
+    fn epoch_seconds_convert_to_the_right_civil_date() {
+        let cases: [(i64, CivilDate); 12] = [
+            // The epoch itself.
+            (0, (1970, 1, 1, 0, 0, 0)),
+            (86399, (1970, 1, 1, 23, 59, 59)),
+            (86400, (1970, 1, 2, 0, 0, 0)),
+            // 1 March: day_of_year 0 in the shifted era, which the old table
+            // read as 1 January.
+            (68256000, (1972, 3, 1, 0, 0, 0)),
+            // 29 February of a leap year: the day the old code could not
+            // represent at all, since its month table always had 28.
+            (68169600, (1972, 2, 29, 0, 0, 0)),
+            // 1 January and 31 December: the two ends of the year-boundary
+            // correction (`year + (month <= 2)`).
+            (1735689600, (2025, 1, 1, 0, 0, 0)),
+            (1767225599, (2025, 12, 31, 23, 59, 59)),
+            // 2000 was a leap year (divisible by 400); 1900 and 2100 are not.
+            (951782400, (2000, 2, 29, 0, 0, 0)),
+            (4107542400, (2100, 3, 1, 0, 0, 0)),
+            (4107456000, (2100, 2, 28, 0, 0, 0)),
+            // A century boundary that is not a leap year, crossed forwards.
+            (4102444800, (2100, 1, 1, 0, 0, 0)),
+            // The value this bug was found on.
+            (1789523391, (2026, 9, 16, 1, 49, 51)),
+        ];
+
+        for (secs, expected) in cases {
+            assert_eq!(
+                epoch_to_datetime(secs),
+                expected,
+                "epoch second {secs} must be {expected:?}"
+            );
+        }
+    }
+
+    /// Walk every day for eight years across two leap years and a century
+    /// boundary, checking the sequence never skips, repeats, or produces an
+    /// impossible day. A table of fixed cases can miss a systematic drift;
+    /// this cannot.
+    #[test]
+    fn consecutive_days_advance_by_exactly_one_day() {
+        let days_in_month = |y: i64, m: u32| -> u32 {
+            match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+                _ => 28,
+            }
+        };
+
+        // 1 Jan 2098 through the end of 2105: spans 2100 (not a leap year)
+        // and 2104 (one).
+        let start = 4039372800i64;
+        let (mut y, mut m, mut d, ..) = epoch_to_datetime(start);
+        assert_eq!((y, m, d), (2098, 1, 1));
+
+        for step in 1..=(8 * 366) {
+            d += 1;
+            if d > days_in_month(y, m) {
+                d = 1;
+                m += 1;
+                if m > 12 {
+                    m = 1;
+                    y += 1;
+                }
+            }
+            let got = epoch_to_datetime(start + step * 86400);
+            assert_eq!(
+                (got.0, got.1, got.2),
+                (y, m, d),
+                "day {step} after the start"
+            );
+        }
+    }
+
+    /// The format itself: zero-padded, nanosecond-precision, Zulu.
+    #[test]
+    fn rfc3339_now_is_well_formed() {
+        let s = rfc3339_now();
+        assert_eq!(s.len(), 30, "{s}");
+        assert!(s.ends_with('Z'), "{s}");
+        let (date, rest) = s.split_once('T').expect("a T separator");
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 4);
+        let year: i64 = parts[0].parse().expect("a numeric year");
+        // Comfortably after this code was written and before it stops mattering
+        // — enough to catch a conversion that is off by months or years.
+        assert!((2020..2200).contains(&year), "{s}");
+        let month: u32 = parts[1].parse().expect("a numeric month");
+        let day: u32 = parts[2].parse().expect("a numeric day");
+        assert!((1..=12).contains(&month), "{s}");
+        assert!((1..=31).contains(&day), "{s}");
+        assert!(rest.contains('.'), "nanoseconds are present: {s}");
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
