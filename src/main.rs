@@ -13,7 +13,7 @@ use dmcp::{
     list_sources, remove_source, run, run_setup, scope_from_registry_server, set_config_value,
     uninstall, Paths,
 };
-use dmcp::{sync_index, VectorEntry, VectorIndex};
+use dmcp::{sync_index, Fixtures, VectorEntry, VectorIndex};
 
 #[derive(Parser)]
 #[command(name = "dmcp")]
@@ -263,6 +263,13 @@ enum Commands {
         /// Minimum cosine similarity score 0.0–1.0 (default: 0.0)
         #[arg(long, default_value = "0.0")]
         min_score: f32,
+
+        /// Include servers the registry flagged as test fixtures. They are
+        /// dropped from vector search by default: a fixture exists to exercise
+        /// the registry's gates, not to answer a query, and one that ranks has
+        /// taken a slot from a real server.
+        #[arg(long)]
+        include_fixtures: bool,
     },
 
     /// Count visible MCP servers (local + reachable registries)
@@ -1077,7 +1084,13 @@ fn main() {
             vectors,
             top_k,
             min_score,
+            include_fixtures,
         } => {
+            let fixtures = if include_fixtures {
+                Fixtures::Include
+            } else {
+                Fixtures::Exclude
+            };
             // Vector search mode: search the local index, bypass registry
             if let Some(ref vec_str) = vector {
                 let query: Vec<f32> = match serde_json::from_str(vec_str) {
@@ -1099,7 +1112,7 @@ fn main() {
                     eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
                     std::process::exit(1);
                 }
-                let results = index.search(&query, top_k, min_score);
+                let results = index.search(&query, top_k, min_score, fixtures);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&results).unwrap());
                 } else if results.is_empty() {
@@ -1133,7 +1146,7 @@ fn main() {
                     eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
                     std::process::exit(1);
                 }
-                let batch = index.search_batch(&queries, top_k, min_score);
+                let batch = index.search_batch(&queries, top_k, min_score, fixtures);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&batch).unwrap());
                 } else {
@@ -1338,6 +1351,7 @@ fn main() {
                         // reading an absent `platforms` gets everywhere else.
                         platforms: None,
                         platforms_malformed: false,
+                        fixture: false,
                     });
                 }
             }
@@ -1364,6 +1378,7 @@ fn main() {
                                 source: "local".to_string(),
                                 platforms: None,
                                 platforms_malformed: false,
+                                fixture: false,
                             });
                         }
                     }
