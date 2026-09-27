@@ -920,23 +920,15 @@ mod server {
             session_gate(scope, manifest.stateful)?;
             let primary = crate::transport::select(manifest.transports.as_deref())
                 .map_err(|e| e.to_string())?;
-            let (command, args) =
-                match primary {
-                    Transport::Stdio { command, args, .. } => (command.clone(), args.clone()),
-                    _ => return Err(
-                        "session broker supports stdio (local) servers only; remote servers are \
-                         already long-lived"
-                            .to_string(),
-                    ),
-                };
-            let cmd = crate::call::build_stdio_command(
-                &self.paths,
-                &manifest,
-                id,
-                &command,
-                args.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
+            if !matches!(primary, Transport::Stdio { .. }) {
+                return Err(
+                    "session broker supports stdio (local) servers only; remote servers are \
+                     already long-lived"
+                        .to_string(),
+                );
+            }
+            let cmd = crate::call::build_stdio_command(&self.paths, &manifest, id, scope, primary)
+                .map_err(|e| e.to_string())?;
             // `TokioChildProcess::new` spawns the child immediately; `serve`
             // then blocks on the MCP `initialize` handshake. Bound that await:
             // on timeout the serve future (owning `transport`) is dropped, and

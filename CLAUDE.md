@@ -60,6 +60,7 @@ src/
 ├── platform.rs       Host platform identity + the registry `platforms` gate
 ├── elevation.rs      Privilege elevation for system scope (Linux: pkexec/polkit; macOS: sudo/osascript)
 ├── elicit.rs         Inbound `elicitation/create`: a server asking for input mid-tool-call
+├── execution.rs      Execution backends: the parsed `execution` block + the one stdio spawn plan
 └── transport.rs      Per-host transport selection + transport-type extraction
 ```
 
@@ -268,6 +269,56 @@ three call sites (`install`, `connect`, `dmcp setup`) and delivered through the
 one SHA-256 gate in `install.rs`. On Unix the script's shebang decides `sh` vs
 `bash`, with `sh` as the announced fallback where bash is not installed.
 
+### Execution backends (`execution` on a transport)
+
+A stdio transport may declare **where** its launch line runs. `src/execution.rs`
+is the whole feature: the parsed block, the argv it produces, and the one
+`SpawnPlan` every stdio spawn site builds its process from
+(`call::stdio_spawn_plan` → the one-shot `call`, `tools`, `run`, and the session
+broker). Per-transport, like `platforms`, because the backend belongs to the
+launch line it modifies.
+
+Two mutually exclusive forms:
+
+```json
+"execution": {"type": "docker", "image": "python:3-slim",
+              "mountInstallDir": "ro", "extraArgs": ["--cpus", "1"]}
+"execution": {"wrapper": ["ssh", "build-host", "--"]}
+```
+
+- **docker** → `docker run -i --rm [-v <dir>:<dir>:ro|rw] -w <dir> [-e KEY …]
+  [extraArgs …] <image> <command> <args …>`. `mountInstallDir` defaults to
+  `"ro"`; `"none"` omits the volume but keeps `-w`. One **bare** `-e KEY` per
+  config key: docker forwards the value from its own environment (which
+  `Command::envs` sets), so config **values** never enter argv and therefore
+  never `/proc/<pid>/cmdline`. Keys are sorted for a reproducible argv, and a key
+  that is empty or contains `=` is not forwarded — it would turn the bare form
+  back into `-e KEY=VALUE`.
+- **wrapper** → `wrapper… <command> <args …>`, an argv prefix dmcp knows nothing
+  about. The config env is set on the **wrapper** process and goes no further by
+  itself: an `ssh` hop does not carry it, and saying so is the contract.
+
+`cwd` stays the host install dir in both cases — harmless under docker (`-w`
+governs inside) and needed so a relative wrapper script resolves.
+
+**Parse-level rejection, never silent ignore** (`deny_unknown_fields` on the
+execution struct, plus form validation): both forms at once, an empty `wrapper`,
+`docker` without `image`, docker-only keys beside `wrapper`, an unsupported
+`type`, neither form, or an unknown key. This is deliberately stricter than
+`platforms`, which degrades to "covers no host": absence of `execution` means
+"spawn unwrapped on the host", so a typo (`"imgae"`) reading as absent is the one
+outcome a manifest asking for a container must never get. The cost is that such a
+manifest does not parse at all — `dmcp list` warns by name, and `uninstall` reads
+the index, so the server is still removable.
+
+**System scope + `execution` is refused** (`execution::system_scope_refusal`),
+before any spawn *and* before the pkexec re-exec, on all of `call`, `tools` and
+`run`: a system-scope server is launched by re-execing dmcp through pkexec, and
+the elevated process would be the docker client or the wrapper, not the server,
+so "the tool runs as root" would silently stop being true. `needs_system_elevation`
+is unchanged — the guard stops the re-exec, rather than the predicate quietly
+deciding such a server no longer needs root.
+
 ### Drift on the agent surface (`dmcp serve`)
 
 Detection (`update.rs`) reaches the agent through two places in `src/serve.rs`,
@@ -310,6 +361,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-09-01:* execution backends (#62). `src/execution.rs` added: `Execution` (validated `Docker`/`Wrapper` variants, parsed through a `deny_unknown_fields` repr so a typo can never read as "no backend"), `plan_spawn` → `SpawnPlan` (program, argv, cwd, env), and `system_scope_refusal`. `Transport::Stdio` gains `execution` plus a `Transport::execution()` accessor; `call::stdio_spawn_plan` is the single decision `build_stdio_command` (one-shot `call`, `tools`, the broker) and `run::run_stdio` both build from, so `dmcp run` cannot be the one surface that ignores a container. Docker argv is `run -i --rm [-v dir:dir:ro|rw] -w dir [-e KEY …] [extraArgs …] image command args…`, with config **values** carried by the environment (bare `-e KEY`, keys sorted, `=`-bearing keys dropped) rather than argv; a wrapper is a plain prefix and the config env stops at the wrapper process. System scope plus a backend is refused before the spawn and before the pkexec re-exec in `call_tool`, `elevate_call_for_system_scope` and `run`, so nobody authenticates their way to a refusal. Verified red-then-green: the integration file does not compile against the pre-feature source; targeted mutations (dropping `deny_unknown_fields`, the mutual-exclusion arm, the required-field checks, the bare `-e` form, the `extraArgs` position, the scope guard, and honouring `execution` at all) each fail exactly the test that names the behaviour, while the no-execution regression pin keeps passing. `tests/execution_backends.rs` runs a real container when `docker ps` works and the image is present or pullable (skips cleanly otherwise), asserting the launch line ran inside the container, the install dir is mounted and current, the config value arrived, and the value is absent from argv.
 
 *2026-08-01:* two elevation fixes (#52 polkit action, #51 timeout scope). **#52:** the polkit action never matched. `elevation::re_exec_with_pkexec` invoked `pkexec env HOME=… dmcp …`, so pkexec mapped the action by `/usr/bin/env`, not the `/usr/bin/dmcp` the policy annotates — `org.jarvisos.dmcp.run-system-server` (its `allow_gui` and `auth_admin_keep`) never fired and elevation fell back to the generic exec action, losing the graphical prompt a TTY-less `dmcp serve`/dispatch caller needs and the one-password window. The re-exec now runs `pkexec <dmcp> <args>` directly (`current_exe()` → `/proc/self/exe` → the annotated path for a packaged install); pointing the annotation at `/usr/bin/env` instead was rejected as it would grant the keep-window to every `pkexec env …` on the box. HOME — which the env wrapper carried so the elevated dmcp read the user's `sources.list`, not `/root`'s — is restored **inside** dmcp: `restore_invoking_user_home`, the first statement of `main` (before dotenvy, `Paths::resolve`, any thread; `set_var` is process-global), maps `PKEXEC_UID` back to a home via getpwuid (`nix`), guarded on euid 0 + a present `PKEXEC_UID` so a deliberately-root serve is untouched, and leaving HOME as-is (never `/root`) on any unresolvable uid. The pure `restored_home(euid, pkexec_uid, lookup)` carries the guard/fallbacks and is unit-tested without a real user database. **#51:** `DMCP_ELEVATION_TIMEOUT_SECS` bounded the whole call, not the auth. `call_tool_elevated` wrapped the child's stdout-read-to-EOF in the timeout, and stdout only EOFs when the child exits — so any system-scope job over 180s (`pacman -Syu`) died with a false "authentication prompt was never completed" ~179s after auth actually succeeded, while the double-forked + setsid jarvis-shell holder survived the process-group kill and kept running as root. Now the re-exec'd, now-root child emits an internal sentinel (`ELEVATION_SENTINEL`, `\x01`-bracketed) to stderr once past pkexec — carried on the argv (`--dmcp-internal-elevation-authenticated`, stripped in `main` before clap) since pkexec sanitizes the environment, gated on `DELEGATED_ENV` so a human `dmcp call`/`install` never emits it. `relay_stderr_watching_sentinel` notifies on the marker and strips it from both the teed stream and the retained detail; `wait_for_auth_or_deadline` races the sentinel, completion, and the deadline, so the deadline bounds only the pre-auth window and an authorized long run finishes unbounded. A genuine timeout now says authentication did not complete and warns that a detached holder may have outlived the kill, rather than implying the operation stopped. Exit-code mapping (0/2/else) and the retained-stderr failure detail are unchanged. Verified without pkexec: `restored_home` guard/fallbacks, `scan_sentinel` boundary cases, the sentinel-stripping relay (auth fires, marker absent from sink and retained), `wait_for_auth_or_deadline` under a paused clock (sentinel-before-deadline completes past the old 180s; no-sentinel times out; a fast call is taken directly), the honest timeout message, and an end-to-end `tests/elevation_sentinel.rs` that the flag emits the sentinel and never reaches clap.
 

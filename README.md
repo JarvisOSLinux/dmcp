@@ -105,6 +105,7 @@ src/
 ├── vector_index.rs # Semantic search (cosine similarity over embeddings)
 ├── doc_comments.rs # Extract @mcp.tool docstrings from Python servers (search-index fallback)
 ├── elevation.rs # Privilege elevation (Linux: pkexec/polkit; macOS: sudo/osascript)
+├── execution.rs # Execution backends (docker / wrapper) for a stdio launch line
 └── models.rs    # Index, Manifest, Transport structs
 ```
 
@@ -186,6 +187,91 @@ name — PowerShell runs nothing but a `.ps1`, so the entry is what is missing a
 `setupScriptWindows`. On Unix a `#!/usr/bin/env bash` shebang is honoured
 rather than forcing every script through `sh`; a host with no bash falls back to
 `sh` with a warning, so a POSIX script carrying a bash shebang still installs.
+
+## Execution backends
+
+A stdio transport says *what* to launch. An optional `execution` object on that
+transport says *where* it runs — in a container, or behind an argv prefix of the
+manifest's choosing. Absent, the default, means directly on the host, exactly as
+before the field existed.
+
+It sits on the transport, beside `command`, `args` and `platforms`, because the
+backend belongs to the launch line it wraps: the same server can run in a
+container on Linux and natively elsewhere.
+
+**Docker.**
+
+```json
+"transports": [{
+  "type": "stdio",
+  "command": "python3",
+  "args": ["/srv/app/server.py"],
+  "execution": {
+    "type": "docker",
+    "image": "python:3-slim",
+    "mountInstallDir": "ro",
+    "extraArgs": ["--cpus", "1"]
+  }
+}]
+```
+
+`image` is required; `mountInstallDir` is `"ro"` (default), `"rw"` or `"none"`;
+`extraArgs` are inserted into `docker run` before the image. dmcp spawns:
+
+```
+docker run -i --rm -v <installDir>:<installDir>:ro -w <installDir> \
+           -e KEY … --cpus 1 python:3-slim python3 /srv/app/server.py
+```
+
+The install dir is mounted at the same path it has on the host and is the
+working directory inside the container, so `args` need no rewriting. Each config
+key becomes a **bare** `-e KEY`: docker forwards the value from its own
+environment, which dmcp has set, so a token never appears in a command line that
+every local account can read out of `/proc`. (A config key that is empty or
+contains `=` is not forwarded — it would put the value back in argv.)
+
+**Wrapper.**
+
+```json
+"execution": {"wrapper": ["ssh", "build-host", "--"]}
+```
+
+A generic argv prefix: dmcp runs `ssh build-host -- python3 server.py` and knows
+nothing else about it. **The config environment does not cross a wrapper.** It
+is set on the wrapper process, which is as far as dmcp can take it; forwarding
+it onward (`ssh -o SendEnv`, a `sudo -E`, a script that re-exports) is the
+wrapper's job. A server that needs its API key on the far side of an `ssh` hop
+must arrange that itself.
+
+In both forms the working directory stays the host install dir — harmless under
+docker, where `-w` governs the path inside, and necessary for a wrapper so a
+relative script resolves against the server's own directory.
+
+**Trust.** A wrapper is trusted exactly as far as its manifest is: the manifest
+is SHA-256 verified against the registry entry at install and gated by the same
+trust tier as every other server. An execution block grants a manifest no reach
+it did not already have through `command` — it could always have named `docker`
+there. What it buys is validation, the plumbing above, and keeping secrets out of
+the process table.
+
+**Malformed blocks are refused, never ignored.** Both forms at once, an empty
+`wrapper`, `docker` with no `image`, or any unknown key inside `execution` is a
+parse error. A typo like `"imgae"` must not quietly become "no backend declared"
+and start a containerized server's launch line on the host, so the whole manifest
+fails to parse instead: `dmcp list` warns by name that it does not parse, and
+`uninstall` reads the index rather than the manifest, so the server is still
+removable.
+
+**Not available in system scope.** A system-scope server is launched by
+re-execing dmcp through pkexec, and what that means once the launch line is
+inside a container or on the far side of an ssh hop is undefined — the elevated
+process would be the backend, not the server. `call`, `tools` and `run` all
+refuse the combination before any spawn, and before the polkit prompt, so nobody
+authenticates their way to a refusal.
+
+Every spawn site honours the same plan: the one-shot `call`, `tools`, `run` and
+the session broker all build their process from `call::stdio_spawn_plan`, so a
+container cannot be honoured on one path and skipped on another.
 
 ## System-scoped servers
 
@@ -317,6 +403,8 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 
 ## Changelog — corrected claims
+
+*2026-09-01:* execution backends (#62) — a stdio transport may declare `execution`, either `{"type": "docker", …}` or `{"wrapper": [...]}`, and every spawn site (`call`, `tools`, `run`, the session broker) builds its process from the same plan. Config values reach a container through bare `-e KEY` flags rather than argv; a wrapper does not forward the config environment by itself, which the section above states plainly; a malformed `execution` block is a parse error rather than a silent unwrapped host spawn; and system scope plus a backend is refused before any spawn or polkit prompt.
 
 *2026-07-25:* semantic search carries the platform state too — `sync-index` copies each entry's `platforms` into the vector index and `browse --vector`/`--vectors` mark `unsupported_on_host` in the table and in `--json`, the surface an agent reaches through dispatch. Re-run `dmcp sync-index` to fill an older index. A Windows host with no `setupScriptWindows` now refuses by name instead of handing `setup.sh` to PowerShell.
 

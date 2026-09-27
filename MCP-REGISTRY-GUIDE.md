@@ -211,6 +211,7 @@ Runs as a local process. The `command` and `args` are executed from the project 
 | `args`        | array  | Arguments, relative to project root.          |
 | `description` | string | Optional description of this entrypoint.       |
 | `platforms`   | array  | Platforms this entrypoint is for (`"linux"`, `"darwin"`, `"windows"`). Omit to match every host. See Per-transport platforms below. |
+| `execution`   | object | Where this launch line runs — a container, or an argv prefix. Omit to run it on the host. See Execution backends below. |
 
 ### sse (Server-Sent Events)
 
@@ -267,6 +268,45 @@ would launch elsewhere instead of blanking it out — they describe the entry,
 they do not start it. This is per-transport dispatch, not a second trust
 decision — the top-level `platforms` list is what decides whether the server may
 be installed here at all.
+
+### Execution backends
+
+A stdio transport says what to launch; an optional `execution` object on the
+same transport says **where** it runs. Omitting it — the default — runs the
+launch line on the host, exactly as before the field existed. Two mutually
+exclusive forms:
+
+```json
+"execution": {"type": "docker", "image": "python:3-slim",
+              "mountInstallDir": "ro", "extraArgs": ["--cpus", "1"]}
+
+"execution": {"wrapper": ["ssh", "build-host", "--"]}
+```
+
+**docker** — `image` is required, `mountInstallDir` is `"ro"` (default), `"rw"`
+or `"none"`, and `extraArgs` are inserted before the image. dmcp spawns
+`docker run -i --rm [-v <installDir>:<installDir>:<mode>] -w <installDir>
+[-e KEY …] [extraArgs …] <image> <command> <args …>`, so the install dir is
+mounted at the same path it has on the host and is the working directory inside
+the container — `args` need no rewriting. Each config key is passed as a **bare**
+`-e KEY`, which forwards the value from dmcp's own environment, so config values
+never appear in a command line.
+
+**wrapper** — a plain argv prefix; dmcp runs `wrapper… <command> <args …>` and
+knows nothing more about it. **The config environment does not cross a wrapper**:
+it is set on the wrapper process, and carrying it further (an `ssh -o SendEnv`, a
+script that re-exports) is the wrapper's job.
+
+A wrapper is trusted exactly as far as its manifest — hash-verified against the
+registry's `integrity` entry and gated by the same trust tier — and grants no
+reach a manifest did not already have through `command`.
+
+Malformed blocks are refused rather than ignored: both forms at once, an empty
+`wrapper`, `docker` without an `image`, and any unknown key inside `execution`
+are parse errors, because a typo silently reading as "no backend" would start a
+containerized server's launch line on the host. Execution backends are not
+supported for **system-scope** servers; that combination is refused before any
+spawn.
 
 ### Legacy Format (unsupported)
 
