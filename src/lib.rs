@@ -44,4 +44,6 @@ pub use setup::run_setup;
 pub use sources::{add_source, list_sources, remove_source, SourceScope, SourcesError};
 pub use sync_index::{sync_index, SyncResult};
 pub use update::{assess_servers, refresh_install, AssessedServer, DriftReport, UpdateError};
-pub use vector_index::{EmbeddingSpec, Fixtures, SearchResult, VectorEntry, VectorIndex};
+pub use vector_index::{
+    mark_installed, EmbeddingSpec, Fixtures, SearchResult, VectorEntry, VectorIndex,
+};
