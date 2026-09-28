@@ -1091,6 +1091,17 @@ fn main() {
             } else {
                 Fixtures::Exclude
             };
+            // Same scope rule keyword browse applies below. Computed here because
+            // both vector branches return before reaching it -- which is how the
+            // vector results came to carry no install status at all.
+            let installed_ids = || -> std::collections::HashSet<String> {
+                let include_user = user || !system;
+                let include_system = system || !user;
+                list_servers(&paths, include_user, include_system, false)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect()
+            };
             // Vector search mode: search the local index, bypass registry
             if let Some(ref vec_str) = vector {
                 let query: Vec<f32> = match serde_json::from_str(vec_str) {
@@ -1112,7 +1123,8 @@ fn main() {
                     eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
                     std::process::exit(1);
                 }
-                let results = index.search(&query, top_k, min_score, fixtures);
+                let mut results = index.search(&query, top_k, min_score, fixtures);
+                dmcp::mark_installed(&mut results, &installed_ids());
                 if json {
                     println!("{}", serde_json::to_string_pretty(&results).unwrap());
                 } else if results.is_empty() {
@@ -1146,7 +1158,11 @@ fn main() {
                     eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
                     std::process::exit(1);
                 }
-                let batch = index.search_batch(&queries, top_k, min_score, fixtures);
+                let mut batch = index.search_batch(&queries, top_k, min_score, fixtures);
+                let installed = installed_ids();
+                for results in &mut batch {
+                    dmcp::mark_installed(results, &installed);
+                }
                 if json {
                     println!("{}", serde_json::to_string_pretty(&batch).unwrap());
                 } else {

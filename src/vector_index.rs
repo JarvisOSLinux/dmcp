@@ -120,6 +120,22 @@ pub struct SearchResult {
     /// it vouches for nothing readable. Omitted for every well-formed entry.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub platforms_malformed: bool,
+    /// Whether this server is installed on this host, at either scope. Always
+    /// serialized: JARVIS labels each hit [INSTALLED] or [available] and its
+    /// planner installs whatever reads as available, so a missing flag does
+    /// not read as "unknown" -- it reads as "not installed", and the agent
+    /// re-installs a server it already has on every query. The index cannot
+    /// know this (it is a cache of the registry, carried between hosts), so
+    /// `search` leaves it false and the caller marks it with [`mark_installed`],
+    /// exactly as keyword browse fills `RegistryServer::installed`.
+    pub installed: bool,
+}
+
+/// Set `installed` on search results from the ids installed on this host.
+pub fn mark_installed(results: &mut [SearchResult], installed: &std::collections::HashSet<String>) {
+    for result in results {
+        result.installed = installed.contains(&result.server_id);
+    }
 }
 
 impl VectorIndex {
@@ -206,6 +222,7 @@ impl VectorIndex {
                 platforms: entry.platforms.clone(),
                 unsupported_on_host: entry.unsupported_on(host),
                 platforms_malformed: entry.platforms_malformed,
+                installed: false,
             })
             .collect()
     }
@@ -403,6 +420,35 @@ mod tests {
         let mut results = index.search(&[1.0, 0.0], 5, 0.0, Fixtures::Exclude);
         assert_eq!(results.len(), 1);
         results.remove(0)
+    }
+
+    /// The index is a registry cache carried between hosts, so it cannot know
+    /// what is installed here; `search` must leave that to the caller rather
+    /// than guess. `mark_installed` then sets it from the host's install set,
+    /// and overwrites a stale `true` as readily as it sets one.
+    #[test]
+    fn install_status_is_left_to_the_caller_and_marked_both_ways() {
+        let mut results =
+            index(vec![entry(None, false)]).search(&[1.0, 0.0], 5, 0.0, Fixtures::Exclude);
+        assert!(!results[0].installed, "search leaves install status unset");
+
+        let mut here = std::collections::HashSet::new();
+        here.insert("com.example.mcp.thing".to_string());
+        mark_installed(&mut results, &here);
+        assert!(results[0].installed);
+
+        mark_installed(&mut results, &std::collections::HashSet::new());
+        assert!(
+            !results[0].installed,
+            "an uninstalled server is cleared, not left stale"
+        );
+
+        let json = serde_json::to_value(&results[0]).unwrap();
+        assert_eq!(
+            json["installed"],
+            serde_json::json!(false),
+            "false is stated, not omitted: an absent flag is read as not installed"
+        );
     }
 
     /// The `--json` payload of `dmcp browse --vector` is what JARVIS's
