@@ -96,6 +96,54 @@ pub struct Manifest {
     /// pass the gate — an unreadable declaration covers no host.
     #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
     pub platforms: PlatformDecl,
+    /// Signed-in accounts this server needs, and which config keys dmcp fills
+    /// from them at spawn (Project-JARVIS#229). Read leniently: a malformed
+    /// declaration reads as none, so it can cost the server its token but
+    /// never make the manifest unloadable.
+    #[serde(
+        default,
+        deserialize_with = "lenient_credentials",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub credentials: Vec<CredentialDecl>,
+    /// A server that signs in its own way names the tool that does it.
+    #[serde(
+        default,
+        deserialize_with = "lenient_login",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub login: Option<LoginDecl>,
+}
+
+/// One `credentials` entry: an account at `provider` with at least `scopes`,
+/// delivered into the config keys `inject` maps to credential fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialDecl {
+    pub provider: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub inject: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginDecl {
+    pub tool: String,
+}
+
+fn lenient_credentials<'de, D>(deserializer: D) -> Result<Vec<CredentialDecl>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+fn lenient_login<'de, D>(deserializer: D) -> Result<Option<LoginDecl>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// One user-facing configuration field declared by a server manifest.

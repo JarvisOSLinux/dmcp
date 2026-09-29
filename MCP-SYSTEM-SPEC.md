@@ -65,6 +65,14 @@ Default for `$XDG_DATA_HOME`: `~/.local/share`.
 Registries themselves are fetched live on each browse/install — there is no
 registry JSON cache.
 
+### 2.4 Signed-in Accounts
+
+| Path | Purpose |
+|------|---------|
+| `$XDG_CONFIG_HOME/mcp/accounts.json` (beside `sources.list`) | Signed-in accounts (provider, account, scopes, which store holds the token) and grants (server → provider → account). Nothing secret. Mode `0600`. |
+| OS keyring, service `dmcp`, user `<provider>/<account>` | The token: `{access_token, refresh_token?, expires_at?}` |
+| `$XDG_DATA_HOME/mcp/credentials.json` (beside `installed/`) | File fallback for the token when no keyring is available. Mode `0600`. |
+
 **Env overrides:** all paths are overridable via `MCP_USER_SOURCES_PATH`,
 `MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`, `MCP_SYSTEM_INSTALL_DIR`,
 and `MCP_VECTOR_INDEX_DIR` (loaded from `.env` via dotenvy).
@@ -246,6 +254,33 @@ Structure matches the registry server entry, plus:
 
 - `config` holds user-provided values (defaults are not auto-applied)
 - dmcp injects each `config` key/value into the server's environment at spawn
+
+### 6.3.1 Credentials
+
+```json
+"credentials": [
+  { "provider": "github", "scopes": ["repo"], "inject": { "GITHUB_PERSONAL_ACCESS_TOKEN": "access_token" } }
+],
+"login": { "tool": "login" }
+```
+
+- At spawn (one-shot `call`, `run`, and the session broker), dmcp resolves the
+  account granted to this server for each declared provider. It checks the
+  account has the declared scopes, refreshes the token if it expires within
+  60 s, and sets each `inject` key to the named field: `access_token`,
+  `refresh_token`, `client_id` or `account`.
+- A key already present in `config` is never overwritten.
+- If an account can't be delivered, the server is not spawned: `dmcp call` and
+  `dmcp run` exit 3 with a `credential_required: {...}` line on stderr. `reason`
+  is one of `no_account`, `not_granted`, `insufficient_scope`, `expired` or
+  `store_unavailable`.
+- Listing tools spawns without the account, so a server can describe itself
+  before anyone signs in.
+- A malformed `credentials` or `login` value reads as absent; the manifest
+  still loads.
+- Providers (endpoints, public client id, scope catalogue) come from the
+  registry's top-level `providers` map. Their endpoints must be `https`,
+  except on loopback hosts.
 
 ### 6.4 Setup Script
 

@@ -44,6 +44,46 @@ modes: that tree is visible to every user on the machine by design. Modes are
 applied where dmcp creates a file or directory; a directory that already exists
 is left exactly as it is, including one you widened on purpose.
 
+### Signed-in accounts
+
+A server that works in your account on a service (GitHub first) can declare
+that in its manifest (`credentials`) instead of asking you to paste a token.
+You sign in once per account and give it to the servers that should use it:
+
+```bash
+dmcp login github --for io.github.missionsquad.mcp-github   # device flow: open a URL, type a code
+dmcp accounts                                               # what is signed in, and who uses it
+dmcp grant <server> github [--account <name>] [--revoke]    # give or take away access
+dmcp logout github [--account <name>]                       # delete the token and every grant to it
+```
+
+- **The token lives in the OS keyring**: Secret Service (KWallet or GNOME
+  Keyring), macOS Keychain, or Windows Credential Manager. If no keyring
+  answers (headless, container), dmcp falls back to an owner-only
+  `~/.local/share/mcp/credentials.json` and warns you. Set
+  `DMCP_CREDENTIAL_STORE=file` or `=keyring` to force one or the other.
+- **Nothing secret is in `~/.config/mcp/accounts.json`.** It lists the
+  accounts, their scopes and which servers may use each, so `dmcp accounts`
+  never unlocks the keyring.
+- **A server gets an account only when you grant it.** Installing a server that
+  declares `github` gives it nothing. The grant comes from `dmcp login --for`
+  or `dmcp grant`, and neither is reachable through `dmcp serve`.
+- **At spawn**, dmcp injects the account into the environment variables the
+  manifest maps, refreshing the token first if it has expired. A value you set
+  with `dmcp config set` always wins, so a personal access token keeps
+  working.
+- **When the account is missing**, `dmcp call` and `dmcp run` exit with status
+  **3**. Stderr carries a sentence saying what to run, plus one
+  machine-readable line, `credential_required: {"server", "provider",
+  "scopes", "reason", ...}`, for callers such as JARVIS. `dmcp tools` still
+  lists a server's tools before you sign in.
+- **Client id.** Providers come from the registry. Until a provider has a
+  registered OAuth client id, set `DMCP_OAUTH_CLIENT_ID_<PROVIDER>` (for
+  example `DMCP_OAUTH_CLIENT_ID_GITHUB`) to your own app's client id, with
+  device flow enabled.
+
+Design: JarvisOSLinux/Project-JARVIS#229.
+
 ## Build & Run
 
 Requires [Rust](https://rustup.rs/).
@@ -70,7 +110,11 @@ cargo install --path .   # Install to ~/.cargo/bin
 | `dmcp update <id> \| --all [--check] [--json] [--ignore-platform]` | Refresh installed servers whose registry manifest hash has drifted (detects same-version fixes; `--check` reports without changing, including platform state; `--json` requires `--check`) |
 | `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
 | `dmcp tools <id> [--json]` | List tools on a server |
-| `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |
+| `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server (exit 3 when a declared account is missing) |
+| `dmcp login <provider> [--for <id>] [--scopes a,b] [--json]` | Sign in with a one-time code; `--for` also grants the account to that server; `--json` prints the code, then the result, one JSON object per line |
+| `dmcp logout <provider> [--account <name>] [--json]` | Delete an account's token and every grant to it |
+| `dmcp grant <id> <provider> [--account <name>] [--revoke] [--json]` | Give a server a signed-in account, or take it away |
+| `dmcp accounts [--json]` | List signed-in accounts and the servers that use each |
 | `dmcp serve` | Run dmcp as MCP server (for LLM integration) |
 | `dmcp setup <id>` | Run setup script for an installed server |
 | `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup] [--ignore-platform]` | Connect to remote server (a fetched manifest is platform-gated like an install, before the manifest is written or its setup script runs) |
@@ -91,6 +135,8 @@ src/
 ├── sources.rs   # Registry sources (sources.list)
 ├── config.rs    # Config get/set
 ├── manifest_io.rs # Atomic, owner-only writes for manifests holding credentials
+├── accounts.rs  # Signed-in accounts: keyring/file store, grants, injection at spawn
+├── login.rs     # Device-flow sign-in, refresh, logout/grant
 ├── install.rs   # Install, uninstall
 ├── run.rs       # Run servers (stdio spawn, SSE/WS URL)
 ├── setup.rs     # Setup script execution
@@ -317,6 +363,8 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 
 ## Changelog — corrected claims
+
+*2026-09-29:* signed-in accounts (Project-JARVIS#229): `login`/`logout`/`grant`/`accounts` added. The "Where per-server credentials live" section still describes values set by hand; a value that comes from a signed-in account is kept in the OS keyring and never written to the manifest.
 
 *2026-07-25:* semantic search carries the platform state too — `sync-index` copies each entry's `platforms` into the vector index and `browse --vector`/`--vectors` mark `unsupported_on_host` in the table and in `--json`, the surface an agent reaches through dispatch. Re-run `dmcp sync-index` to fill an older index. A Windows host with no `setupScriptWindows` now refuses by name instead of handing `setup.sh` to PowerShell.
 

@@ -49,6 +49,8 @@ src/
 ├── doc_comments.rs   Extract @mcp.tool docstrings from Python servers (description fallback for the search index)
 ├── config.rs         Per-server config get/set
 ├── manifest_io.rs    Atomic, owner-only writes for the manifests that hold server credentials
+├── accounts.rs       Signed-in accounts: keyring/file secret store, accounts.json index + grants, `credential_env` at spawn
+├── login.rs          Device-flow sign-in (RFC 8628), refresh, provider lookup, logout/grant/revoke
 ├── run.rs            Spawn stdio servers, print SSE/WS URLs
 ├── setup.rs          Execute setup scripts
 ├── call.rs           Call tools on MCP servers
@@ -162,7 +164,41 @@ dmcp session list|close|gc         # Inspect / close live sessions; sweep idle o
 dmcp serve                         # Run dmcp as MCP server
 dmcp sync-index                    # Cache registry embeddings locally
 dmcp browse --vector '[...]'       # Semantic search against the local index
+dmcp login <provider> --for <id>   # Sign in (device flow) and grant the account to a server
+dmcp accounts | grant | logout     # Inspect / give / remove signed-in accounts
 ```
+
+### Signed-in accounts (Project-JARVIS#229)
+
+mcp-registry declares **what** a server needs: a manifest's `credentials`
+(provider, scopes, `inject` map), plus the registry's top-level `providers`
+(endpoints, public client id, scope catalogue). dmcp owns **how** it is
+obtained, stored and delivered.
+
+- **Store.** The token goes in the OS keyring (`keyring-core` plus one store
+  crate per OS; the zbus store runs on async-io, not tokio). The fallback is
+  an owner-only `credentials.json`. The non-secret index and grants go in
+  `accounts.json` beside `sources.list`.
+- **Grants are the security property.** Installing is agent-reachable, so a
+  server that *declares* `github` gets nothing without a grant. Grants are
+  written only by `login --for` (a completed device flow proves a human was
+  present) and by `grant`. Neither is exposed through `dmcp serve`, and grants
+  are never stored in `config`, which the model can write through
+  `configure_server`.
+- **Spawn.** `call::build_stdio_command` (now `async`) resolves credentials in
+  `spawn_blocking`, because the keyring is blocking D-Bus and a refresh is
+  blocking reqwest. It is used by one-shot `call` and the broker (both
+  `Credentials::Required`) and by `tools` (`Credentials::BestEffort`); `run`
+  calls `credential_env` directly. A missing account becomes
+  `CallError`/`RunError::CredentialRequired`, whose `Display` ends with the
+  `credential_required: {json}` machine line. The CLI exits 3.
+- **Endpoints.** Provider endpoints must be `https`. The only exception is a
+  loopback host, checked with `url::Url::parse`, not string matching.
+- **Tests.** `tests/accounts_login.rs` drives the real binary against
+  `tests/fixtures/fake_oauth_server.py`, a loopback device-flow, refresh and
+  identity server that logs every request, with `fake_env_server.py` reporting
+  what was injected. Tests force `DMCP_CREDENTIAL_STORE=file`, so none touches
+  the real keyring.
 
 ### Session broker (stateful servers)
 
@@ -310,6 +346,15 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-09-29:* signed-in accounts (Project-JARVIS#229, dmcp half).
+- **New modules.** `accounts.rs` and `login.rs`, plus `Manifest.credentials` and `Manifest.login`. Both are read leniently, so a malformed value reads as absent and never makes a manifest unloadable.
+- **Spawn changes.** `build_stdio_command` is now `async` and takes `Credentials::{Required, BestEffort}`. `CallError` and `RunError` gain `CredentialRequired`, and `dmcp call`/`run` exit 3 on it.
+- **Verification.**
+  - Unit tests with an in-memory store and stub refreshers cover: grants, hand-set config winning, partial injection, scope checks, refresh (including a provider that doesn't rotate its refresh token), refresh failure, a machine line with no secret in it, redacted `Debug`, and 0600 modes.
+  - 11 integration tests run against the fake provider.
+  - Mutation checks: removing the grant check, the config-wins filter, the refresh trigger, or any one of the three https checks each turns a test red.
+  - One live round-trip against KWallet's Secret Service on the reference machine: `login` stored the token in the keyring with no file fallback, and `logout` removed it.
 
 *2026-08-01:* two elevation fixes (#52 polkit action, #51 timeout scope). **#52:** the polkit action never matched. `elevation::re_exec_with_pkexec` invoked `pkexec env HOME=… dmcp …`, so pkexec mapped the action by `/usr/bin/env`, not the `/usr/bin/dmcp` the policy annotates — `org.jarvisos.dmcp.run-system-server` (its `allow_gui` and `auth_admin_keep`) never fired and elevation fell back to the generic exec action, losing the graphical prompt a TTY-less `dmcp serve`/dispatch caller needs and the one-password window. The re-exec now runs `pkexec <dmcp> <args>` directly (`current_exe()` → `/proc/self/exe` → the annotated path for a packaged install); pointing the annotation at `/usr/bin/env` instead was rejected as it would grant the keep-window to every `pkexec env …` on the box. HOME — which the env wrapper carried so the elevated dmcp read the user's `sources.list`, not `/root`'s — is restored **inside** dmcp: `restore_invoking_user_home`, the first statement of `main` (before dotenvy, `Paths::resolve`, any thread; `set_var` is process-global), maps `PKEXEC_UID` back to a home via getpwuid (`nix`), guarded on euid 0 + a present `PKEXEC_UID` so a deliberately-root serve is untouched, and leaving HOME as-is (never `/root`) on any unresolvable uid. The pure `restored_home(euid, pkexec_uid, lookup)` carries the guard/fallbacks and is unit-tested without a real user database. **#51:** `DMCP_ELEVATION_TIMEOUT_SECS` bounded the whole call, not the auth. `call_tool_elevated` wrapped the child's stdout-read-to-EOF in the timeout, and stdout only EOFs when the child exits — so any system-scope job over 180s (`pacman -Syu`) died with a false "authentication prompt was never completed" ~179s after auth actually succeeded, while the double-forked + setsid jarvis-shell holder survived the process-group kill and kept running as root. Now the re-exec'd, now-root child emits an internal sentinel (`ELEVATION_SENTINEL`, `\x01`-bracketed) to stderr once past pkexec — carried on the argv (`--dmcp-internal-elevation-authenticated`, stripped in `main` before clap) since pkexec sanitizes the environment, gated on `DELEGATED_ENV` so a human `dmcp call`/`install` never emits it. `relay_stderr_watching_sentinel` notifies on the marker and strips it from both the teed stream and the retained detail; `wait_for_auth_or_deadline` races the sentinel, completion, and the deadline, so the deadline bounds only the pre-auth window and an authorized long run finishes unbounded. A genuine timeout now says authentication did not complete and warns that a detached holder may have outlived the kill, rather than implying the operation stopped. Exit-code mapping (0/2/else) and the retained-stderr failure detail are unchanged. Verified without pkexec: `restored_home` guard/fallbacks, `scan_sentinel` boundary cases, the sentinel-stripping relay (auth fires, marker absent from sink and retained), `wait_for_auth_or_deadline` under a paused clock (sentinel-before-deadline completes past the old 180s; no-sentinel times out; a fast call is taken directly), the honest timeout message, and an end-to-end `tests/elevation_sentinel.rs` that the flag emits the sentinel and never reaches clap.
 

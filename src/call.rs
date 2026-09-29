@@ -33,6 +33,7 @@ pub enum CallError {
     RemoteNotSupported(String),
     ConnectionFailed(String),
     ToolCallFailed(String),
+    CredentialRequired(Box<crate::accounts::CredentialRequired>),
 }
 
 impl std::fmt::Display for CallError {
@@ -80,6 +81,10 @@ impl std::fmt::Display for CallError {
             }
             CallError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
             CallError::ToolCallFailed(e) => write!(f, "Tool call failed: {}", e),
+            // The machine line rides along on its own line wherever this error
+            // is printed — CLI stderr, a broker reply, a `dmcp serve` tool
+            // error — so a caller can match it without parsing the prose.
+            CallError::CredentialRequired(c) => write!(f, "{}\n{}", c, c.machine_line()),
         }
     }
 }
@@ -645,22 +650,58 @@ pub fn resolve_stdio_install_dir(paths: &Paths, manifest: &Manifest, id: &str) -
 /// directory, and config-derived env. Factored out of the one-shot call path so
 /// the session broker spawns servers with byte-identical semantics; the one-shot
 /// and session paths must not drift in how a server is launched.
-pub fn build_stdio_command(
+pub async fn build_stdio_command(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
     command: &str,
     args: Option<&[String]>,
+    credentials: Credentials,
 ) -> Result<Command, CallError> {
     let install_dir =
         resolve_stdio_install_dir(paths, manifest, id).ok_or(CallError::NoStdioTransport)?;
-    let env = config_to_env(&manifest.config);
+    let mut env = config_to_env(&manifest.config);
+    match (
+        credentials_for_spawn(paths, id, manifest).await,
+        credentials,
+    ) {
+        (Ok(injected), _) => env.extend(injected),
+        (Err(CallError::CredentialRequired(_)), Credentials::BestEffort) => {}
+        (Err(e), _) => return Err(e),
+    }
     let mut cmd = Command::new(command);
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
         .unwrap_or_default();
     cmd.args(&args).current_dir(&install_dir).envs(env);
     Ok(cmd)
+}
+
+/// Whether a server may start without the account its manifest declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credentials {
+    /// A tool call: refuse with `CredentialRequired` before spawning.
+    Required,
+    /// Listing tools: start without them, so a server can describe itself
+    /// before anyone has signed in.
+    BestEffort,
+}
+
+/// Declared credentials as environment, resolved off the async runtime: the
+/// keyring is a blocking D-Bus call and a refresh is a blocking HTTP request.
+async fn credentials_for_spawn(
+    paths: &Paths,
+    id: &str,
+    manifest: &Manifest,
+) -> Result<std::collections::HashMap<String, OsString>, CallError> {
+    if manifest.credentials.is_empty() {
+        return Ok(Default::default());
+    }
+    let (paths, id, manifest) = (paths.clone(), id.to_string(), manifest.clone());
+    tokio::task::spawn_blocking(move || crate::accounts::credential_env(&paths, &id, &manifest))
+        .await
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?
+        .map_err(CallError::CredentialRequired)
 }
 
 /// Call a tool on an installed MCP server.
@@ -721,7 +762,8 @@ async fn call_tool_stdio(
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let cmd = build_stdio_command(paths, manifest, id, command, args)?;
+    let cmd =
+        build_stdio_command(paths, manifest, id, command, args, Credentials::Required).await?;
 
     // Piped instead of rmcp's inherited default: the relay keeps the same live
     // view a caller had under inheritance, and the retained copy lets a failed
@@ -840,7 +882,8 @@ async fn list_tools_stdio(
     command: &str,
     args: Option<&[String]>,
 ) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    let cmd = build_stdio_command(paths, manifest, id, command, args)?;
+    let cmd =
+        build_stdio_command(paths, manifest, id, command, args, Credentials::BestEffort).await?;
 
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
