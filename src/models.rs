@@ -183,12 +183,24 @@ pub enum Transport {
         #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
         platforms: PlatformDecl,
     },
+    /// A hosted server over HTTP. dmcp speaks Streamable HTTP to it, which is
+    /// what `http` names; `sse` is the older spelling and means the same here.
+    #[serde(alias = "http", alias = "streamable-http", alias = "streamable_http")]
     Sse {
         url: String,
         #[serde(default)]
         description: Option<String>,
         #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
         platforms: PlatformDecl,
+        /// How the server authenticates its caller. Read leniently, like
+        /// `platforms`: an unreadable value reads as none, so the call reaches
+        /// the server and fails there rather than the manifest failing to load.
+        #[serde(
+            default,
+            deserialize_with = "lenient_auth",
+            skip_serializing_if = "Option::is_none"
+        )]
+        auth: Option<RemoteAuth>,
     },
     #[serde(rename = "websocket")]
     WebSocket {
@@ -201,7 +213,37 @@ pub enum Transport {
     },
 }
 
+/// A hosted server's sign-in. `oauth` is the MCP authorization spec: the
+/// server names its authorization server, dmcp registers itself there and the
+/// user approves in a browser (Project-JARVIS#229).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteAuth {
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+fn lenient_auth<'de, D>(deserializer: D) -> Result<Option<RemoteAuth>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 impl Transport {
+    /// The URL of a hosted server that signs its caller in with OAuth.
+    pub fn oauth_url(&self) -> Option<&str> {
+        match self {
+            Transport::Sse {
+                url,
+                auth: Some(RemoteAuth::OAuth),
+                ..
+            } => Some(url),
+            _ => None,
+        }
+    }
+
     /// Platforms this transport is declared for. The declaration is returned as
     /// read — including "present but unreadable", which covers no host — so the
     /// typed and raw-JSON views of the same manifest select the same transport.
@@ -228,6 +270,35 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    fn remote(json: serde_json::Value) -> Transport {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn http_is_the_streamable_http_transport_and_may_sign_in() {
+        for kind in ["http", "streamable-http", "streamable_http", "sse"] {
+            let t =
+                remote(serde_json::json!({"type": kind, "url": "https://x/mcp", "auth": "oauth"}));
+            assert_eq!(t.oauth_url(), Some("https://x/mcp"), "{kind}");
+        }
+        let plain = remote(serde_json::json!({"type": "http", "url": "https://x/mcp"}));
+        assert_eq!(plain.oauth_url(), None);
+    }
+
+    /// An unreadable `auth` reads as none, so the manifest still loads.
+    #[test]
+    fn a_malformed_auth_leaves_the_transport_loadable() {
+        for auth in [
+            serde_json::json!("basic"),
+            serde_json::json!(7),
+            serde_json::json!({"x": 1}),
+        ] {
+            let t =
+                remote(serde_json::json!({"type": "http", "url": "https://x/mcp", "auth": auth}));
+            assert_eq!(t.oauth_url(), None);
+        }
+    }
+
     use super::*;
 
     fn manifest_with(platforms: &str) -> Manifest {

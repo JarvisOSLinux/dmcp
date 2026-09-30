@@ -128,6 +128,16 @@ pub fn select_json(transports: &[serde_json::Value]) -> Result<&serde_json::Valu
     select_json_for_host(transports, host_platform())
 }
 
+/// Transport type names that mean a hosted server: nothing to clone, only an
+/// endpoint to record. Every spelling `Transport::Sse` deserializes from, plus
+/// WebSocket.
+pub fn is_remote_type(transport_type: &str) -> bool {
+    matches!(
+        transport_type,
+        "sse" | "http" | "streamable-http" | "streamable_http" | "websocket"
+    )
+}
+
 /// Extract the transport type this host would use (e.g. "stdio", "sse",
 /// "websocket") from manifest JSON.
 ///
@@ -167,6 +177,23 @@ pub fn transport_from_manifest_path(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every name the typed model accepts for a hosted server must also be one
+    /// install treats as remote, or `dmcp install` refuses a server `call`
+    /// could reach.
+    #[test]
+    fn every_remote_spelling_the_model_reads_is_installable() {
+        for kind in ["sse", "http", "streamable-http", "streamable_http"] {
+            let t: Transport =
+                serde_json::from_value(serde_json::json!({"type": kind, "url": "https://x/mcp"}))
+                    .unwrap();
+            assert!(matches!(t, Transport::Sse { .. }), "{kind}");
+            assert!(is_remote_type(kind), "{kind}");
+        }
+        assert!(is_remote_type("websocket"));
+        assert!(!is_remote_type("stdio"));
+    }
+
     use super::*;
 
     fn stdio(command: &str, platforms: Option<&[&str]>) -> Transport {

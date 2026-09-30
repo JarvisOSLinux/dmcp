@@ -73,6 +73,8 @@ registry JSON cache.
 | OS keyring, service `dmcp`, user `<provider>/<account>` | The token: `{access_token, refresh_token?, expires_at?}` |
 | `$XDG_DATA_HOME/mcp/credentials.json` (beside `installed/`) | File fallback for the token when no keyring is available. Mode `0600`. |
 
+A hosted server's own sign-in is stored as provider = the server id, account = `default`, with `hosted: true` and its `resource` in the index. A client secret, if its registration issued one, is kept with the token, never in the index.
+
 **Env overrides:** all paths are overridable via `MCP_USER_SOURCES_PATH`,
 `MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`, `MCP_SYSTEM_INSTALL_DIR`,
 and `MCP_VECTOR_INDEX_DIR` (loaded from `.env` via dotenvy).
@@ -191,15 +193,24 @@ Structure matches the registry server entry, plus:
 - `args`: Arguments, relative to project root (install dir)
 - Process is spawned with `cwd` = install dir
 
-**sse (remote):**
+**http (remote, Streamable HTTP):**
 
 ```json
 {
-  "type": "sse",
-  "url": "https://api.example.com/mcp/sse",
-  "description": "Cloud endpoint"
+  "type": "http",
+  "url": "https://mcp.example.com/mcp",
+  "auth": "oauth",
+  "description": "Hosted endpoint"
 }
 ```
+
+- `type`: `http` (also accepted as `streamable-http` and `streamable_http`).
+  `sse` is the older spelling and means the same to dmcp, which speaks
+  Streamable HTTP to both.
+- `auth`: `"oauth"` when the server signs its caller in under the MCP
+  authorization spec (RFC 9728 discovery, RFC 7591 registration, PKCE,
+  RFC 8707 `resource`). `dmcp login --for <id>` signs in, and every call then
+  carries the token as a bearer. An unreadable value reads as absent.
 
 **websocket (remote):**
 

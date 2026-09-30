@@ -194,6 +194,23 @@ obtained, stored and delivered.
   `credential_required: {json}` machine line. The CLI exits 3.
 - **Endpoints.** Provider endpoints must be `https`. The only exception is a
   loopback host, checked with `url::Url::parse`, not string matching.
+- **Hosted servers (MCP OAuth).** An `http`/`sse` transport with
+  `"auth": "oauth"` signs its caller in under the MCP authorization spec.
+  - **Login.** `login::login_hosted` uses rmcp's `AuthorizationManager` for
+    discovery, dynamic registration, the PKCE authorization URL and the code
+    exchange. A one-shot `127.0.0.1` listener takes the redirect and ignores
+    any request without this sign-in's `state`. Every discovered endpoint must
+    pass `check_endpoint`.
+  - **Tokens.** Stored as provider = server id, account = `default`,
+    `hosted: true`, with `resource`. rmcp's refresh is **not** used: it treats a
+    stored token's relative `expires_in` as remaining lifetime, and its refresh
+    path calls `blocking_read` inside async. dmcp refreshes itself instead,
+    sending `resource` and any registration `client_secret`.
+  - **Calls.** `call::hosted_bearer` attaches the token through
+    `StreamableHttpClientTransportConfig::auth_header`. It is built from config
+    inline because rmcp implements its transport for its own reqwest version.
+    A 401 becomes `CredentialRequired` with reason `rejected` if a token was
+    sent, `no_account` if not.
 - **Tests.** `tests/accounts_login.rs` drives the real binary against
   `tests/fixtures/fake_oauth_server.py`, a loopback device-flow, refresh and
   identity server that logs every request, with `fake_env_server.py` reporting
@@ -346,6 +363,13 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-09-30:* hosted-server sign-in (Project-JARVIS#229, hosted half).
+- **Changes.** rmcp gains the `auth` feature. `Transport::Sse` accepts `http`/`streamable-http`/`streamable_http` and a lenient `auth` field, plus `Transport::oauth_url`. `dmcp login`'s provider is optional: with `--for` it picks the hosted sign-in or the server's only declared provider. `--no-browser` is new, and `login --json` prints `{"type":"authorize",...}` for a hosted sign-in. `AccountRecord.hosted`/`resource`, `Secret.client_secret`, `Reason::Rejected`, and `Refresher::refresh` now takes the client secret.
+- **Verification.**
+  - `tests/hosted_login.rs`: 11 tests of the real binary against `fixtures/fake_hosted_server.py`, a loopback MCP server plus authorization server that enforces registration of the exact redirect, PKCE S256, `resource`, and the bearer. It is shaped like mcp.notion.com's metadata.
+  - Mutation checks: removing the callback `state` check, `resource` on refresh, the client secret on refresh (sent or kept), the https check, the `hosted` record filter, or the sent/rejected distinction each turns a test red.
+  - Not yet run against Notion itself; that needs a person to approve in a browser. Its metadata was checked by hand: registration endpoint, S256, `none` auth.
 
 *2026-09-29:* signed-in accounts (Project-JARVIS#229, dmcp half).
 - **New modules.** `accounts.rs` and `login.rs`, plus `Manifest.credentials` and `Manifest.login`. Both are read leniently, so a malformed value reads as absent and never makes a manifest unloadable.

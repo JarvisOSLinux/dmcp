@@ -69,7 +69,7 @@ pub fn install(
 
     if transport_type == "stdio" {
         install_stdio(&server, &install_dir)?;
-    } else if transport_type == "sse" || transport_type == "websocket" {
+    } else if crate::transport::is_remote_type(transport_type) {
         // Remote: just write manifest
     } else {
         return Err(InstallError::UnsupportedTransport);

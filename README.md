@@ -82,6 +82,21 @@ dmcp logout github [--account <name>]                       # delete the token a
   example `DMCP_OAUTH_CLIENT_ID_GITHUB`) to your own app's client id, with
   device flow enabled.
 
+**Hosted servers that sign you in themselves.** A hosted server such as
+Notion's (`https://mcp.notion.com/mcp`) runs its own sign-in under the MCP
+authorization spec. Its manifest says so with `"auth": "oauth"` on an `http`
+transport. `dmcp login --for <id>` then does the following:
+
+1. It finds the server's authorization server.
+2. It registers itself there, so no one has to register an app first.
+3. It opens your browser to approve, with PKCE. The browser comes back to a
+   one-time listener on `127.0.0.1`.
+
+The token is kept like any other account and sent as a bearer on every call.
+dmcp refreshes it for the same server (`resource`). If the server rejects it,
+you get the same exit 3 and `credential_required` line, with `"hosted": true`.
+Use `--no-browser` to print the link without opening it.
+
 Design: JarvisOSLinux/Project-JARVIS#229.
 
 ## Build & Run
@@ -111,7 +126,7 @@ cargo install --path .   # Install to ~/.cargo/bin
 | `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
 | `dmcp tools <id> [--json]` | List tools on a server |
 | `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server (exit 3 when a declared account is missing) |
-| `dmcp login <provider> [--for <id>] [--scopes a,b] [--json]` | Sign in with a one-time code; `--for` also grants the account to that server; `--json` prints the code, then the result, one JSON object per line |
+| `dmcp login [provider] [--for <id>] [--scopes a,b] [--json] [--no-browser]` | Sign in: a provider with a one-time code, or (no provider) the way `--for <id>` needs, a hosted server's own browser sign-in included; `--for` also grants the account; `--json` prints what to show the user, then the result, one JSON object per line |
 | `dmcp logout <provider> [--account <name>] [--json]` | Delete an account's token and every grant to it |
 | `dmcp grant <id> <provider> [--account <name>] [--revoke] [--json]` | Give a server a signed-in account, or take it away |
 | `dmcp accounts [--json]` | List signed-in accounts and the servers that use each |
