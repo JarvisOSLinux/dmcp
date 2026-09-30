@@ -216,8 +216,10 @@ enum Commands {
     /// Sign in to an account provider (e.g. github) with a one-time code, and
     /// optionally give the account to a server
     Login {
-        /// Provider id from the registry (e.g. "github")
-        provider: String,
+        /// Provider id from the registry (e.g. "github"). Omit it with --for to
+        /// sign in the way that server needs: a hosted server's own sign-in, or
+        /// the one account it declares.
+        provider: Option<String>,
 
         /// Give the signed-in account to this installed server
         #[arg(long = "for", value_name = "SERVER")]
@@ -228,9 +230,13 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         scopes: Vec<String>,
 
-        /// One JSON object per line: the code to show, then the result
+        /// One JSON object per line: what to show the user, then the result
         #[arg(long)]
         json: bool,
+
+        /// Print the sign-in link instead of also opening it in a browser
+        #[arg(long)]
+        no_browser: bool,
     },
 
     /// Sign out: delete an account's token from this machine and every grant to it
@@ -480,31 +486,61 @@ fn fail_json(json: bool, e: &dmcp::login::LoginError) -> ! {
 
 fn cmd_login(
     paths: &Paths,
-    provider: &str,
+    provider: Option<&str>,
     for_server: Option<&str>,
     scopes: &[String],
     json: bool,
+    open_browser: bool,
 ) {
+    use dmcp::login::LoginPrompt;
     use std::io::Write;
-    let mut on_code = |code: &dmcp::login::DeviceCode| {
+    let mut on_prompt = |prompt: &LoginPrompt| {
         if json {
-            let mut event = serde_json::to_value(code).expect("plain data serializes");
-            event["type"] = serde_json::json!("device_code");
-            println!("{}", event);
+            println!(
+                "{}",
+                serde_json::to_value(prompt).expect("plain data serializes")
+            );
         } else {
-            println!(
-                "To sign in to {}, open {} and enter the code: {}",
-                code.provider_name, code.verification_uri, code.user_code
-            );
-            println!(
-                "Waiting for you to approve (the code expires in {}s)...",
-                code.expires_in
-            );
+            match prompt {
+                LoginPrompt::DeviceCode(code) => {
+                    println!(
+                        "To sign in to {}, open {} and enter the code: {}",
+                        code.provider_name, code.verification_uri, code.user_code
+                    );
+                    println!(
+                        "Waiting for you to approve (the code expires in {}s)...",
+                        code.expires_in
+                    );
+                }
+                LoginPrompt::Authorize(auth) => {
+                    println!(
+                        "To sign in to {}, approve in your browser{}:\n  {}",
+                        auth.server,
+                        if open_browser {
+                            " (opening it now)"
+                        } else {
+                            ""
+                        },
+                        auth.url
+                    );
+                    println!(
+                        "Waiting for the browser to return (up to {}s)...",
+                        auth.expires_in
+                    );
+                }
+            }
         }
-        // A caller reading line by line must see the code before we block on it.
+        // A caller reading line by line must see this before we block on it.
         let _ = std::io::stdout().flush();
     };
-    match dmcp::login::login(paths, provider, scopes, for_server, &mut on_code) {
+    match dmcp::login::login_for(
+        paths,
+        provider,
+        scopes,
+        for_server,
+        open_browser,
+        &mut on_prompt,
+    ) {
         Ok(outcome) => {
             if json {
                 let mut event = serde_json::to_value(&outcome).expect("plain data serializes");
@@ -1285,7 +1321,15 @@ fn main() {
             for_server,
             scopes,
             json,
-        } => cmd_login(&paths, &provider, for_server.as_deref(), &scopes, json),
+            no_browser,
+        } => cmd_login(
+            &paths,
+            provider.as_deref(),
+            for_server.as_deref(),
+            &scopes,
+            json,
+            !no_browser,
+        ),
         Commands::Logout {
             provider,
             account,

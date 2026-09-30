@@ -71,6 +71,14 @@ pub struct AccountRecord {
     #[serde(default)]
     pub client_id: Option<String>,
     pub signed_in_at: u64,
+    /// A hosted server's own sign-in: `provider` is the server id, the token is
+    /// bound to that server, and no other server can be granted it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosted: bool,
+    /// The protected resource (RFC 8707) a hosted token is for, sent again on
+    /// refresh so the new token is bound to the same server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +176,11 @@ pub struct Secret {
     /// Unix seconds; absent for tokens that do not expire (GitHub OAuth apps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// Issued to this machine alone by dynamic client registration, when the
+    /// authorization server makes it a confidential client. Never a registry
+    /// value: those ship to everyone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
 }
 
 // Hand-written so no `{:?}` anywhere can print a token.
@@ -180,6 +193,10 @@ impl std::fmt::Debug for Secret {
                 &self.refresh_token.as_ref().map(|_| "[redacted]"),
             )
             .field("expires_at", &self.expires_at)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
 }
@@ -428,6 +445,9 @@ pub enum Reason {
     /// The store holding the account could not be read (keyring locked or
     /// absent in this session).
     StoreUnavailable,
+    /// The server refused the credentials it was given (revoked, or expired
+    /// on its side before ours).
+    Rejected,
 }
 
 /// A server declared an account it cannot be given yet. Carries everything a
@@ -444,6 +464,10 @@ pub struct CredentialRequired {
     pub login_tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The server's own sign-in (MCP OAuth), not a registry provider:
+    /// `provider` is then the server id.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hosted: bool,
 }
 
 /// Prefix of the one-line, machine-readable form on stderr. A caller that
@@ -472,6 +496,7 @@ impl CredentialRequired {
             Reason::StoreUnavailable => {
                 "unlock the keyring in this session, or sign in again".to_string()
             }
+            _ if self.hosted => format!("dmcp login --for {}", self.server),
             _ => format!("dmcp login {} --for {}", self.provider, self.server),
         }
     }
@@ -480,6 +505,9 @@ impl CredentialRequired {
 impl std::fmt::Display for CredentialRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let why = match self.reason {
+            Reason::NoAccount if self.hosted => "nobody has signed in to it yet".to_string(),
+            Reason::Expired if self.hosted => "its sign-in expired".to_string(),
+            Reason::Rejected if self.hosted => "it rejected its sign-in".to_string(),
             Reason::NoAccount => format!("no {} account is signed in", self.provider),
             Reason::NotGranted => format!(
                 "it has not been given a {} account{}",
@@ -501,6 +529,7 @@ impl std::fmt::Display for CredentialRequired {
                     self.provider
                 )
             }
+            Reason::Rejected => format!("{} rejected the account it was given", self.provider),
         };
         write!(
             f,
@@ -523,7 +552,12 @@ impl std::error::Error for CredentialRequired {}
 /// Exchanges a refresh token. Swappable so resolution is testable without a
 /// network.
 pub trait Refresher {
-    fn refresh(&self, record: &AccountRecord, refresh_token: &str) -> Result<Secret, String>;
+    fn refresh(
+        &self,
+        record: &AccountRecord,
+        refresh_token: &str,
+        client_secret: Option<&str>,
+    ) -> Result<Secret, String>;
 }
 
 /// The environment a server's declared credentials add at spawn.
@@ -581,6 +615,7 @@ pub fn resolve(
                 account: account.map(str::to_string),
                 login_tool: login_tool.clone(),
                 detail,
+                hosted: false,
             })
         };
 
@@ -616,44 +651,8 @@ pub fn resolve(
             ));
         }
 
-        let store = open(record.store)
-            .map_err(|e| required(Reason::StoreUnavailable, Some(account), Some(e.to_string())))?;
-        let mut secret = match store.get(&record.provider, &record.account) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return Err(required(
-                    Reason::NoAccount,
-                    Some(account),
-                    Some(format!("its token is no longer in the {}", record.store)),
-                ))
-            }
-            Err(e) => {
-                return Err(required(
-                    Reason::StoreUnavailable,
-                    Some(account),
-                    Some(e.to_string()),
-                ))
-            }
-        };
-
-        if secret.needs_refresh(now) {
-            let Some(refresh_token) = secret.refresh_token.clone() else {
-                return Err(required(Reason::Expired, Some(account), None));
-            };
-            let mut fresh = refresher
-                .refresh(record, &refresh_token)
-                .map_err(|e| required(Reason::Expired, Some(account), Some(e)))?;
-            // Providers that do not rotate refresh tokens omit it on refresh.
-            if fresh.refresh_token.is_none() {
-                fresh.refresh_token = Some(refresh_token);
-            }
-            store
-                .set(&record.provider, &record.account, &fresh)
-                .map_err(|e| {
-                    required(Reason::StoreUnavailable, Some(account), Some(e.to_string()))
-                })?;
-            secret = fresh;
-        }
+        let secret = current_secret(record, open, refresher, now)
+            .map_err(|(reason, detail)| required(reason, Some(account), detail))?;
 
         for (key, field) in wanted {
             let value = match field.as_str() {
@@ -669,6 +668,93 @@ pub fn resolve(
         }
     }
     Ok(env)
+}
+
+/// An account's token, refreshed first when it is about to expire and the
+/// refreshed one stored in its place. The error is the reason and any detail.
+fn current_secret(
+    record: &AccountRecord,
+    open: &StoreOpener<'_>,
+    refresher: &dyn Refresher,
+    now: u64,
+) -> Result<Secret, (Reason, Option<String>)> {
+    let store = open(record.store).map_err(|e| (Reason::StoreUnavailable, Some(e.to_string())))?;
+    let secret = match store.get(&record.provider, &record.account) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err((
+                Reason::NoAccount,
+                Some(format!("its token is no longer in the {}", record.store)),
+            ))
+        }
+        Err(e) => return Err((Reason::StoreUnavailable, Some(e.to_string()))),
+    };
+    if !secret.needs_refresh(now) {
+        return Ok(secret);
+    }
+    let Some(refresh_token) = secret.refresh_token.clone() else {
+        return Err((Reason::Expired, None));
+    };
+    let mut fresh = refresher
+        .refresh(record, &refresh_token, secret.client_secret.as_deref())
+        .map_err(|e| (Reason::Expired, Some(e)))?;
+    // Providers that do not rotate refresh tokens omit it on refresh; the
+    // client secret is ours, never part of a token response.
+    if fresh.refresh_token.is_none() {
+        fresh.refresh_token = Some(refresh_token);
+    }
+    fresh.client_secret = secret.client_secret;
+    store
+        .set(&record.provider, &record.account, &fresh)
+        .map_err(|e| (Reason::StoreUnavailable, Some(e.to_string())))?;
+    Ok(fresh)
+}
+
+/// The one account name a hosted sign-in is stored under: the token belongs to
+/// the server, so there is nothing to choose between.
+pub const HOSTED_ACCOUNT: &str = "default";
+
+/// The bearer token for a hosted server that signs its caller in (MCP OAuth).
+pub fn hosted_bearer(paths: &Paths, server: &str) -> Result<String, Box<CredentialRequired>> {
+    resolve_hosted(
+        paths,
+        server,
+        &|kind| open_store(kind, paths),
+        &crate::login::HttpRefresher,
+        now_unix(),
+    )
+}
+
+/// A hosted token needs no grant check beyond its record existing: only
+/// `dmcp login --for <server>` writes one, and the token is bound to that
+/// server (RFC 8707), so no other server could use it anyway.
+pub fn resolve_hosted(
+    paths: &Paths,
+    server: &str,
+    open: &StoreOpener<'_>,
+    refresher: &dyn Refresher,
+    now: u64,
+) -> Result<String, Box<CredentialRequired>> {
+    let required = |reason: Reason, detail: Option<String>| {
+        Box::new(CredentialRequired {
+            server: server.to_string(),
+            provider: server.to_string(),
+            scopes: Vec::new(),
+            reason,
+            account: None,
+            login_tool: None,
+            detail,
+            hosted: true,
+        })
+    };
+    let accounts = load_accounts(paths)
+        .map_err(|e| required(Reason::StoreUnavailable, Some(e.to_string())))?;
+    let Some(record) = accounts.find(server, HOSTED_ACCOUNT).filter(|r| r.hosted) else {
+        return Err(required(Reason::NoAccount, None));
+    };
+    current_secret(record, open, refresher, now)
+        .map(|s| s.access_token)
+        .map_err(|(reason, detail)| required(reason, detail))
 }
 
 /// Scopes the servers already granted `provider` accounts need, so a fresh
@@ -720,27 +806,33 @@ mod tests {
 
     struct NoRefresh;
     impl Refresher for NoRefresh {
-        fn refresh(&self, _: &AccountRecord, _: &str) -> Result<Secret, String> {
+        fn refresh(&self, _: &AccountRecord, _: &str, _: Option<&str>) -> Result<Secret, String> {
             panic!("refresh must not be attempted here")
         }
     }
 
     struct Rotating(RefCell<u32>);
     impl Refresher for Rotating {
-        fn refresh(&self, _: &AccountRecord, refresh_token: &str) -> Result<Secret, String> {
+        fn refresh(
+            &self,
+            _: &AccountRecord,
+            refresh_token: &str,
+            _: Option<&str>,
+        ) -> Result<Secret, String> {
             *self.0.borrow_mut() += 1;
             assert_eq!(refresh_token, "rt-1");
             Ok(Secret {
                 access_token: "at-2".into(),
                 refresh_token: None,
                 expires_at: Some(10_000),
+                client_secret: None,
             })
         }
     }
 
     struct Failing;
     impl Refresher for Failing {
-        fn refresh(&self, _: &AccountRecord, _: &str) -> Result<Secret, String> {
+        fn refresh(&self, _: &AccountRecord, _: &str, _: Option<&str>) -> Result<Secret, String> {
             Err("invalid_grant".into())
         }
     }
@@ -803,6 +895,8 @@ mod tests {
             token_endpoint: "https://example.invalid/token".into(),
             client_id: Some("cid".into()),
             signed_in_at: 1,
+            hosted: false,
+            resource: None,
         }
     }
 
@@ -820,6 +914,7 @@ mod tests {
             access_token: "at-1".into(),
             refresh_token: Some("rt-1".into()),
             expires_at,
+            client_secret: None,
         }
     }
 
@@ -989,11 +1084,61 @@ mod tests {
 
     #[test]
     fn secret_debug_never_prints_tokens() {
-        let shown = format!("{:?}", secret(Some(5)));
+        let mut s = secret(Some(5));
+        s.client_secret = Some("cs-1".into());
+        let shown = format!("{:?}", s);
         assert!(
-            !shown.contains("at-1") && !shown.contains("rt-1"),
+            !shown.contains("at-1") && !shown.contains("rt-1") && !shown.contains("cs-1"),
             "{shown}"
         );
+    }
+
+    fn hosted_record(hosted: bool) -> AccountRecord {
+        AccountRecord {
+            provider: "srv".into(),
+            account: HOSTED_ACCOUNT.into(),
+            hosted,
+            resource: Some("https://mcp.example.invalid/mcp".into()),
+            ..record(&[])
+        }
+    }
+
+    fn hosted_with(tree: &Tree, rec: AccountRecord) {
+        let mut accounts = AccountsFile::default();
+        accounts.upsert(rec);
+        save_accounts(&tree.paths, &accounts).unwrap();
+    }
+
+    fn run_hosted(tree: &Tree) -> Result<String, Box<CredentialRequired>> {
+        let map = map_with(None);
+        map.borrow_mut()
+            .insert(store_key("srv", HOSTED_ACCOUNT), secret(None));
+        resolve_hosted(
+            &tree.paths,
+            "srv",
+            &move |_| Ok(Box::new(Shared(map.clone())) as Box<dyn SecretStore>),
+            &NoRefresh,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn a_hosted_sign_in_yields_its_token() {
+        let tree = Tree::new("hosted");
+        hosted_with(&tree, hosted_record(true));
+        assert_eq!(run_hosted(&tree).unwrap(), "at-1");
+    }
+
+    /// A provider account that happens to be named like the server is not a
+    /// hosted sign-in: only a record `dmcp login --for` wrote as hosted counts.
+    #[test]
+    fn only_a_hosted_record_is_a_hosted_sign_in() {
+        let tree = Tree::new("nothosted");
+        hosted_with(&tree, hosted_record(false));
+        let err = run_hosted(&tree).unwrap_err();
+        assert_eq!(err.reason, Reason::NoAccount);
+        assert!(err.hosted);
+        assert_eq!(err.fix(), "dmcp login --for srv");
     }
 
     #[test]

@@ -16,7 +16,7 @@ url = "2"
 sha2 = "0.10"
 shellexpand = "3"
 tokio = { version = "1", features = ["full"] }
-rmcp = { version = "0.16", features = ["server", "client", "transport-io", "transport-child-process", "macros", "schemars", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "0.16", features = ["server", "client", "transport-io", "transport-child-process", "macros", "schemars", "transport-streamable-http-client-reqwest", "auth"] }
 schemars = "1"
 # Signed-in accounts live in the OS keyring (#229); one store crate per OS.
 keyring-core = "1"

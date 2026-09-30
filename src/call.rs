@@ -746,11 +746,66 @@ pub async fn call_tool(
             )
             .await
         }
-        Transport::Sse { url, .. } => call_tool_remote(url, "sse", tool_name, arguments).await,
+        Transport::Sse { url, .. } => {
+            let bearer = hosted_bearer(paths, id, primary, Credentials::Required).await?;
+            let sent = bearer.is_some();
+            call_tool_remote(url, bearer, tool_name, arguments)
+                .await
+                .map_err(|e| rejected_sign_in(e, id, primary, sent))
+        }
         Transport::WebSocket { ws_url, .. } => {
-            call_tool_remote(ws_url, "websocket", tool_name, arguments).await
+            call_tool_remote(ws_url, None, tool_name, arguments).await
         }
     }
+}
+
+/// The bearer token for a hosted server that signs its caller in, if it does.
+async fn hosted_bearer(
+    paths: &Paths,
+    id: &str,
+    transport: &Transport,
+    credentials: Credentials,
+) -> Result<Option<String>, CallError> {
+    if transport.oauth_url().is_none() {
+        return Ok(None);
+    }
+    let (paths, id) = (paths.clone(), id.to_string());
+    let resolved = tokio::task::spawn_blocking(move || crate::accounts::hosted_bearer(&paths, &id))
+        .await
+        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    match (resolved, credentials) {
+        (Ok(token), _) => Ok(Some(token)),
+        (Err(_), Credentials::BestEffort) => Ok(None),
+        (Err(e), Credentials::Required) => Err(CallError::CredentialRequired(e)),
+    }
+}
+
+/// A hosted server that answers 401 needs a sign-in: again, when it refused a
+/// token dmcp sent (revoked or expired on its side), or for the first time,
+/// when dmcp had none to send. Either way say that, not "connection failed".
+fn rejected_sign_in(error: CallError, id: &str, transport: &Transport, sent: bool) -> CallError {
+    let text = match &error {
+        CallError::ConnectionFailed(t) | CallError::ToolCallFailed(t) => t.to_ascii_lowercase(),
+        _ => return error,
+    };
+    if transport.oauth_url().is_none() || !(text.contains("auth required") || text.contains("401"))
+    {
+        return error;
+    }
+    CallError::CredentialRequired(Box::new(crate::accounts::CredentialRequired {
+        server: id.to_string(),
+        provider: id.to_string(),
+        scopes: Vec::new(),
+        reason: if sent {
+            crate::accounts::Reason::Rejected
+        } else {
+            crate::accounts::Reason::NoAccount
+        },
+        account: None,
+        login_tool: None,
+        detail: None,
+        hosted: true,
+    }))
 }
 
 async fn call_tool_stdio(
@@ -820,16 +875,27 @@ async fn drive_stdio_call(
     result
 }
 
+/// Streamable HTTP settings for `url`, carrying `bearer` when there is one.
+fn remote_config(
+    url: &str,
+    bearer: Option<String>,
+) -> rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig {
+    let config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url);
+    match bearer {
+        Some(token) => config.auth_header(token),
+        None => config,
+    }
+}
+
 async fn call_tool_remote(
     url: &str,
-    _transport_type: &str,
+    bearer: Option<String>,
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    use rmcp::transport::StreamableHttpClientTransport;
-    use std::sync::Arc;
-
-    let transport = StreamableHttpClientTransport::from_uri(Arc::from(url));
+    let transport =
+        rmcp::transport::StreamableHttpClientTransport::from_config(remote_config(url, bearer));
 
     let client = crate::elicit::ServerClient::unattended(url)
         .serve(transport)
@@ -870,8 +936,14 @@ pub async fn list_tools(paths: &Paths, id: &str) -> Result<Vec<rmcp::model::Tool
         Transport::Stdio { command, args, .. } => {
             list_tools_stdio(paths, &manifest, id, command, args.as_deref()).await
         }
-        Transport::Sse { url, .. } => list_tools_remote(url).await,
-        Transport::WebSocket { ws_url, .. } => list_tools_remote(ws_url).await,
+        Transport::Sse { url, .. } => {
+            let bearer = hosted_bearer(paths, id, primary, Credentials::BestEffort).await?;
+            let sent = bearer.is_some();
+            list_tools_remote(url, bearer)
+                .await
+                .map_err(|e| rejected_sign_in(e, id, primary, sent))
+        }
+        Transport::WebSocket { ws_url, .. } => list_tools_remote(ws_url, None).await,
     }
 }
 
@@ -903,11 +975,12 @@ async fn list_tools_stdio(
     Ok(tools.tools)
 }
 
-async fn list_tools_remote(url: &str) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    use rmcp::transport::StreamableHttpClientTransport;
-    use std::sync::Arc;
-
-    let transport = StreamableHttpClientTransport::from_uri(Arc::from(url));
+async fn list_tools_remote(
+    url: &str,
+    bearer: Option<String>,
+) -> Result<Vec<rmcp::model::Tool>, CallError> {
+    let transport =
+        rmcp::transport::StreamableHttpClientTransport::from_config(remote_config(url, bearer));
 
     let client = crate::elicit::ServerClient::unattended(url)
         .serve(transport)
@@ -998,6 +1071,7 @@ mod tests {
             url: "http://example".into(),
             description: None,
             platforms: PlatformDecl::Absent,
+            auth: None,
         }];
         assert!(!needs_system_elevation(
             Scope::System,
@@ -1018,6 +1092,7 @@ mod tests {
                 platforms: PlatformDecl::Declared(vec![
                     crate::platform::foreign_platform().to_string()
                 ]),
+                auth: None,
             },
             Transport::Stdio {
                 command: "srv".into(),
@@ -1136,6 +1211,7 @@ mod tests {
             url: "http://example".into(),
             description: None,
             platforms: PlatformDecl::Absent,
+            auth: None,
         }];
         assert_eq!(
             plan_elevation(Scope::System, selected(&sse), false, false),

@@ -63,6 +63,26 @@ pub struct DeviceCode {
     pub expires_in: u64,
 }
 
+/// What the user must open to finish a hosted server's sign-in.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizeUrl {
+    pub server: String,
+    pub url: String,
+    /// Seconds dmcp waits for the browser to come back.
+    pub expires_in: u64,
+}
+
+/// What a sign-in needs from the user. Serialized with a `type` tag, which is
+/// the shape `dmcp login --json` prints.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoginPrompt {
+    /// Type a code on the provider's page (device flow).
+    DeviceCode(DeviceCode),
+    /// Approve in a browser, which returns to dmcp (a hosted server's OAuth).
+    Authorize(AuthorizeUrl),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginOutcome {
     pub provider: String,
@@ -93,6 +113,8 @@ pub enum LoginError {
     NoAccount(String),
     AmbiguousAccount(String, Vec<String>),
     Accounts(AccountsError),
+    NothingToSignIn(String),
+    NameTheProvider(String, Vec<String>),
 }
 
 impl std::fmt::Display for LoginError {
@@ -139,6 +161,15 @@ impl std::fmt::Display for LoginError {
                 all.join(", ")
             ),
             LoginError::Accounts(e) => write!(f, "{e}"),
+            LoginError::NothingToSignIn(s) => write!(
+                f,
+                "server '{s}' declares no account and no sign-in of its own"
+            ),
+            LoginError::NameTheProvider(s, all) => write!(
+                f,
+                "server '{s}' uses several accounts ({}); name the provider: dmcp login <provider> --for {s}",
+                all.join(", ")
+            ),
         }
     }
 }
@@ -288,6 +319,7 @@ impl TokenResponse {
                 access_token,
                 refresh_token: self.refresh_token.filter(|t| !t.is_empty()),
                 expires_at: self.expires_in.map(|s| now + s),
+                client_secret: None,
             },
             self.scope,
         ))
@@ -330,7 +362,7 @@ pub fn login(
     provider_id: &str,
     extra_scopes: &[String],
     for_server: Option<&str>,
-    on_code: &mut dyn FnMut(&DeviceCode),
+    on_prompt: &mut dyn FnMut(&LoginPrompt),
 ) -> Result<LoginOutcome, LoginError> {
     let mut wanted: BTreeSet<String> = extra_scopes.iter().cloned().collect();
     if let Some(server) = for_server {
@@ -356,14 +388,14 @@ pub fn login(
     .map_err(|e| LoginError::Protocol(format!("device authorization: {e}")))?;
     check_endpoint(&auth.verification_uri)?;
 
-    on_code(&DeviceCode {
+    on_prompt(&LoginPrompt::DeviceCode(DeviceCode {
         provider: provider.id.clone(),
         provider_name: provider.name.clone(),
         verification_uri: auth.verification_uri.clone(),
         verification_uri_complete: auth.verification_uri_complete.clone(),
         user_code: auth.user_code.clone(),
         expires_in: auth.expires_in,
-    });
+    }));
 
     let (secret, granted) = poll_for_token(&client, &provider, &client_id, &auth)?;
     let account = identify(&client, &provider, &secret.access_token)?;
@@ -372,31 +404,22 @@ pub fn login(
         _ => wanted.into_iter().collect(),
     };
 
-    let (store_kind, store, warning) = accounts::store_for_new_login(paths)?;
-    store.set(&provider.id, &account, &secret)?;
-
-    let mut index = load_accounts(paths)?;
-    // A re-sign-in that lands in a different store must not leave the old copy.
-    if let Some(previous) = index.find(&provider.id, &account) {
-        if previous.store != store_kind {
-            if let Ok(old) = open_store(previous.store, paths) {
-                let _ = old.delete(&provider.id, &account);
-            }
-        }
-    }
-    index.upsert(AccountRecord {
-        provider: provider.id.clone(),
-        account: account.clone(),
-        scopes: scopes.clone(),
-        store: store_kind,
-        token_endpoint: provider.oauth.token_endpoint.clone(),
-        client_id: Some(client_id),
-        signed_in_at: now_unix(),
-    });
-    if let Some(server) = for_server {
-        index.grant(server, &provider.id, &account);
-    }
-    save_accounts(paths, &index)?;
+    let (store_kind, warning) = save_account(
+        paths,
+        AccountRecord {
+            provider: provider.id.clone(),
+            account: account.clone(),
+            scopes: scopes.clone(),
+            store: StoreKind::File,
+            token_endpoint: provider.oauth.token_endpoint.clone(),
+            client_id: Some(client_id),
+            signed_in_at: now_unix(),
+            hosted: false,
+            resource: None,
+        },
+        &secret,
+        for_server,
+    )?;
 
     Ok(LoginOutcome {
         provider: provider.id,
@@ -406,6 +429,36 @@ pub fn login(
         granted_to: for_server.map(str::to_string),
         warning,
     })
+}
+
+/// Store a fresh sign-in: the secret in the store a new login goes to, the
+/// record and any grant in the index. `record.store` is overwritten with the
+/// store actually used. Returns that store and any warning about it.
+fn save_account(
+    paths: &Paths,
+    mut record: AccountRecord,
+    secret: &Secret,
+    grant_to: Option<&str>,
+) -> Result<(StoreKind, Option<String>), LoginError> {
+    let (store_kind, store, warning) = accounts::store_for_new_login(paths)?;
+    store.set(&record.provider, &record.account, secret)?;
+
+    let mut index = load_accounts(paths)?;
+    // A re-sign-in that lands in a different store must not leave the old copy.
+    if let Some(previous) = index.find(&record.provider, &record.account) {
+        if previous.store != store_kind {
+            if let Ok(old) = open_store(previous.store, paths) {
+                let _ = old.delete(&record.provider, &record.account);
+            }
+        }
+    }
+    record.store = store_kind;
+    if let Some(server) = grant_to {
+        index.grant(server, &record.provider, &record.account);
+    }
+    index.upsert(record);
+    save_accounts(paths, &index)?;
+    Ok((store_kind, warning))
 }
 
 fn poll_for_token(
@@ -481,11 +534,311 @@ fn identify(
     }
 }
 
+/// Sign in for `server`, choosing how from its manifest: a named provider is
+/// the device flow; with none named, a hosted server's own OAuth, or the one
+/// provider the server declares.
+pub fn login_for(
+    paths: &Paths,
+    provider: Option<&str>,
+    extra_scopes: &[String],
+    for_server: Option<&str>,
+    open_browser: bool,
+    on_prompt: &mut dyn FnMut(&LoginPrompt),
+) -> Result<LoginOutcome, LoginError> {
+    let hosted = match for_server {
+        Some(server) if provider.is_none() || provider == Some(server) => {
+            let (manifest, _) = get_server(paths, server)
+                .ok_or_else(|| LoginError::ServerNotInstalled(server.into()))?;
+            let url = crate::transport::select(manifest.transports.as_deref())
+                .ok()
+                .and_then(|t| t.oauth_url())
+                .map(str::to_string);
+            match (url, provider) {
+                (Some(url), _) => Some((server, url)),
+                (None, Some(p)) => return login(paths, p, extra_scopes, for_server, on_prompt),
+                (None, None) => {
+                    return match manifest.credentials.as_slice() {
+                        [] => Err(LoginError::NothingToSignIn(server.into())),
+                        [only] => login(paths, &only.provider, extra_scopes, for_server, on_prompt),
+                        all => Err(LoginError::NameTheProvider(
+                            server.into(),
+                            all.iter().map(|d| d.provider.clone()).collect(),
+                        )),
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
+    match (hosted, provider) {
+        (Some((server, url)), _) => login_hosted(paths, server, &url, open_browser, on_prompt),
+        (None, Some(p)) => login(paths, p, extra_scopes, for_server, on_prompt),
+        (None, None) => Err(LoginError::NothingToSignIn(
+            "(none given: use --for <server> or name a provider)".into(),
+        )),
+    }
+}
+
+/// How long a hosted sign-in waits for the browser to come back.
+fn hosted_timeout() -> u64 {
+    std::env::var("DMCP_LOGIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(300)
+}
+
+fn auth_error(e: rmcp::transport::auth::AuthError) -> LoginError {
+    LoginError::Protocol(e.to_string())
+}
+
+/// Sign in to a hosted server by the MCP authorization spec.
+///
+/// The server names its authorization server (RFC 9728); dmcp registers itself
+/// there (RFC 7591), which is why no one has to register an app first, and
+/// sends the user to approve with PKCE. The browser comes back to a one-shot
+/// listener on 127.0.0.1. rmcp does discovery, registration, the PKCE URL and
+/// the code exchange; the token is then kept like any other account, and
+/// refreshed by dmcp rather than rmcp, whose refresh cannot tell a stored
+/// token's age.
+pub fn login_hosted(
+    paths: &Paths,
+    server: &str,
+    resource: &str,
+    open_browser: bool,
+    on_prompt: &mut dyn FnMut(&LoginPrompt),
+) -> Result<LoginOutcome, LoginError> {
+    check_endpoint(resource)?;
+    let timeout = hosted_timeout();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| LoginError::Http(e.to_string()))?;
+    let signed_in = runtime.block_on(async {
+        use rmcp::transport::auth::AuthorizationManager;
+
+        let mut manager = AuthorizationManager::new(resource)
+            .await
+            .map_err(auth_error)?;
+        let metadata = manager.discover_metadata().await.map_err(auth_error)?;
+        check_endpoint(&metadata.authorization_endpoint)?;
+        check_endpoint(&metadata.token_endpoint)?;
+        if let Some(registration) = &metadata.registration_endpoint {
+            check_endpoint(registration)?;
+        }
+        let token_endpoint = metadata.token_endpoint.clone();
+        manager.set_metadata(metadata);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|e| LoginError::Http(e.to_string()))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| LoginError::Http(e.to_string()))?
+            .port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+
+        let client = manager
+            .register_client("JARVIS (dmcp)", &redirect_uri)
+            .await
+            .map_err(auth_error)?;
+        let scopes = manager.select_scopes(None, &[]);
+        manager
+            .configure_client(client.clone())
+            .map_err(auth_error)?;
+        let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+        let url = manager
+            .get_authorization_url(&scope_refs)
+            .await
+            .map_err(auth_error)?;
+        check_endpoint(&url)?;
+        let state = url::Url::parse(&url)
+            .ok()
+            .and_then(|u| {
+                u.query_pairs()
+                    .find(|(k, _)| k == "state")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .ok_or_else(|| LoginError::Protocol("authorization URL carries no state".into()))?;
+
+        on_prompt(&LoginPrompt::Authorize(AuthorizeUrl {
+            server: server.to_string(),
+            url: url.clone(),
+            expires_in: timeout,
+        }));
+        if open_browser {
+            open_in_browser(&url);
+        }
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(timeout),
+            wait_for_callback(&listener, &state),
+        )
+        .await
+        .map_err(|_| LoginError::Expired)??;
+
+        let token = manager
+            .exchange_code_for_token(&code, &state)
+            .await
+            .map_err(auth_error)?;
+        // Through serde rather than the oauth2 traits: the standard token
+        // response serializes to exactly the RFC 6749 fields we read.
+        let answer: TokenResponse = serde_json::to_value(&token)
+            .and_then(serde_json::from_value)
+            .map_err(|e| LoginError::Protocol(format!("token: {e}")))?;
+        let (mut secret, granted) = answer
+            .into_secret(now_unix())
+            .ok_or_else(|| LoginError::Protocol("token response carried no access_token".into()))?;
+        secret.client_secret = client.client_secret.clone();
+        let scopes = match granted.as_deref().map(split_scopes) {
+            Some(s) if !s.is_empty() => s,
+            _ => scopes,
+        };
+        Ok::<_, LoginError>((secret, scopes, client.client_id, token_endpoint))
+    })?;
+    let (secret, scopes, client_id, token_endpoint) = signed_in;
+
+    let (store_kind, warning) = save_account(
+        paths,
+        AccountRecord {
+            provider: server.to_string(),
+            account: accounts::HOSTED_ACCOUNT.to_string(),
+            scopes: scopes.clone(),
+            store: StoreKind::File,
+            token_endpoint,
+            client_id: Some(client_id),
+            signed_in_at: now_unix(),
+            hosted: true,
+            resource: Some(resource.to_string()),
+        },
+        &secret,
+        Some(server),
+    )?;
+    Ok(LoginOutcome {
+        provider: server.to_string(),
+        account: accounts::HOSTED_ACCOUNT.to_string(),
+        scopes,
+        store: store_kind,
+        granted_to: Some(server.to_string()),
+        warning,
+    })
+}
+
+const CALLBACK_DONE: &str = "<!doctype html><title>Signed in</title><p>Signed in. You can close this tab and return to JARVIS.</p>";
+const CALLBACK_FAILED: &str = "<!doctype html><title>Sign-in not completed</title><p>The sign-in was not completed. You can close this tab.</p>";
+
+/// Serve the loopback redirect until the browser comes back with this
+/// sign-in's `state`. Anything else — a favicon request, a stray or forged
+/// callback — is answered and ignored, so it can neither finish nor abort
+/// the sign-in.
+async fn wait_for_callback(
+    listener: &tokio::net::TcpListener,
+    state: &str,
+) -> Result<String, LoginError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| LoginError::Http(e.to_string()))?;
+        let mut buf = vec![0u8; 8192];
+        let mut len = 0;
+        while len < buf.len() {
+            match stream.read(&mut buf[len..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => len += n,
+            }
+            if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&buf[..len]);
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("GET "))
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or("");
+        let outcome = callback_outcome(target, state);
+        let (status, body) = match &outcome {
+            Some(Ok(_)) => ("200 OK", CALLBACK_DONE),
+            Some(Err(_)) => ("200 OK", CALLBACK_FAILED),
+            None => ("404 Not Found", ""),
+        };
+        let reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(reply.as_bytes()).await;
+        let _ = stream.shutdown().await;
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
+    }
+}
+
+/// What one request to the loopback listener means: `None` to keep waiting,
+/// or the code / the reason the sign-in ended.
+fn callback_outcome(target: &str, state: &str) -> Option<Result<String, LoginError>> {
+    let url = url::Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
+    if url.path() != "/callback" {
+        return None;
+    }
+    let param = |name: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    };
+    if param("state").as_deref() != Some(state) {
+        return None;
+    }
+    if let Some(error) = param("error") {
+        return Some(Err(if error == "access_denied" {
+            LoginError::Denied
+        } else {
+            LoginError::Protocol(match param("error_description") {
+                Some(d) => format!("{error}: {d}"),
+                None => error,
+            })
+        }));
+    }
+    param("code").map(Ok)
+}
+
+/// Best effort: the URL is printed either way, so a missing opener only
+/// costs a click.
+fn open_in_browser(url: &str) {
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(windows)]
+    let mut command = {
+        // Not `cmd /c start`: cmd would read the URL's `&` as a command separator.
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    let _ = command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 /// Refreshes over HTTP against the endpoint recorded at sign-in.
 pub struct HttpRefresher;
 
 impl Refresher for HttpRefresher {
-    fn refresh(&self, record: &AccountRecord, refresh_token: &str) -> Result<Secret, String> {
+    fn refresh(
+        &self,
+        record: &AccountRecord,
+        refresh_token: &str,
+        client_secret: Option<&str>,
+    ) -> Result<Secret, String> {
         check_endpoint(&record.token_endpoint).map_err(|e| e.to_string())?;
         let client = http_client().map_err(|e| e.to_string())?;
         let mut form = vec![
@@ -494,6 +847,12 @@ impl Refresher for HttpRefresher {
         ];
         if let Some(id) = record.client_id.as_deref() {
             form.push(("client_id", id));
+        }
+        if let Some(secret) = client_secret {
+            form.push(("client_secret", secret));
+        }
+        if let Some(resource) = record.resource.as_deref() {
+            form.push(("resource", resource));
         }
         let answer: TokenResponse = serde_json::from_value(
             post_form(&client, &record.token_endpoint, &form).map_err(|e| e.to_string())?,
@@ -611,6 +970,26 @@ mod tests {
             client_id_env("google-work"),
             "DMCP_OAUTH_CLIENT_ID_GOOGLE_WORK"
         );
+    }
+
+    #[test]
+    fn only_this_sign_ins_callback_counts() {
+        let ok = callback_outcome("/callback?code=c1&state=s1", "s1");
+        assert!(matches!(ok, Some(Ok(ref c)) if c == "c1"));
+        assert!(callback_outcome("/callback?code=c1&state=other", "s1").is_none());
+        assert!(callback_outcome("/callback?code=c1", "s1").is_none());
+        assert!(callback_outcome("/favicon.ico", "s1").is_none());
+        assert!(callback_outcome("/elsewhere?code=c1&state=s1", "s1").is_none());
+        assert!(matches!(
+            callback_outcome("/callback?error=access_denied&state=s1", "s1"),
+            Some(Err(LoginError::Denied))
+        ));
+        assert!(matches!(
+            callback_outcome("/callback?error=server_error&state=s1", "s1"),
+            Some(Err(LoginError::Protocol(_)))
+        ));
+        // A denial for some other sign-in is not this one's answer.
+        assert!(callback_outcome("/callback?error=access_denied&state=other", "s1").is_none());
     }
 
     #[test]
