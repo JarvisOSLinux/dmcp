@@ -935,7 +935,9 @@ mod server {
                 id,
                 &command,
                 args.as_deref(),
+                crate::call::Credentials::Required,
             )
+            .await
             .map_err(|e| e.to_string())?;
             // `TokioChildProcess::new` spawns the child immediately; `serve`
             // then blocks on the MCP `initialize` handshake. Bound that await:

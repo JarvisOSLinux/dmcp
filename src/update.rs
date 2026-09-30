@@ -266,7 +266,7 @@ fn build_http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
         .build()
 }
 
-fn fetch_registry_value(
+pub(crate) fn fetch_registry_value(
     client: &reqwest::blocking::Client,
     url: &str,
 ) -> Result<serde_json::Value, UpdateError> {
