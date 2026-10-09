@@ -669,12 +669,31 @@ pub async fn build_stdio_command(
         (Err(CallError::CredentialRequired(_)), Credentials::BestEffort) => {}
         (Err(e), _) => return Err(e),
     }
-    let mut cmd = Command::new(command);
+    let mut cmd = Command::new(resolve_launch_command(command)?);
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
         .unwrap_or_default();
     cmd.args(&args).current_dir(&install_dir).envs(env);
     Ok(cmd)
+}
+
+/// On Windows, `npx`/`uvx` and friends are `.cmd` shims that `CreateProcess`
+/// will not find by bare name, so resolve against `PATH` and `PATHEXT` first
+/// (#66). Elsewhere the command is spawned as written.
+#[cfg(windows)]
+fn resolve_launch_command(command: &str) -> Result<std::path::PathBuf, CallError> {
+    crate::pathext::resolve_command(
+        command,
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("PATHEXT").as_deref(),
+        |p| p.is_file(),
+    )
+    .map_err(|e| CallError::ConnectionFailed(e.to_string()))
+}
+
+#[cfg(not(windows))]
+fn resolve_launch_command(command: &str) -> Result<std::path::PathBuf, CallError> {
+    Ok(std::path::PathBuf::from(command))
 }
 
 /// Whether a server may start without the account its manifest declares.

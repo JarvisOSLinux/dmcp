@@ -17,6 +17,7 @@ pub mod login;
 pub mod manifest_io;
 pub mod models;
 pub mod orchestrator;
+pub mod pathext;
 pub mod paths;
 pub mod platform;
 pub mod run;
