@@ -424,3 +424,46 @@ fn signing_in_for_a_server_that_does_not_declare_the_provider_is_refused() {
         "no one is sent to sign in for nothing"
     );
 }
+
+#[test]
+fn a_value_piped_on_stdin_is_stored_and_never_echoed() {
+    use std::io::Write;
+    let env = TestEnv::new("ok");
+    assert!(env.login_json().0.status.success());
+    let mut child = env
+        .cmd()
+        .args(["config", SERVER, "set", "DEMO_TOKEN"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run dmcp");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"pat-from-stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("pat-from-stdin"),
+        "value echoed: {}",
+        stdout(&out)
+    );
+    let seen: serde_json::Value = serde_json::from_str(stdout(&env.whoami()).trim()).unwrap();
+    assert_eq!(seen["DEMO_TOKEN"], "pat-from-stdin");
+}
+
+#[test]
+fn an_empty_piped_value_is_refused() {
+    let env = TestEnv::new("ok");
+    let out = env
+        .cmd()
+        .args(["config", SERVER, "set", "DEMO_TOKEN"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dmcp");
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("empty value"), "{}", stderr(&out));
+}

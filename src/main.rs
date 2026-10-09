@@ -391,8 +391,10 @@ enum ConfigAction {
         /// Config key
         key: String,
 
-        /// Config value
-        value: String,
+        /// Config value. Omit it for a secret: a terminal gets a hidden prompt,
+        /// a pipe is read for one line, so the value never reaches shell
+        /// history or the process list.
+        value: Option<String>,
     },
 }
 
@@ -676,21 +678,45 @@ fn main() {
             }
         },
         Commands::Config { id, action } => match action {
-            ConfigAction::Set { key, value } => match set_config_value(&paths, &id, &key, &value) {
-                Ok(()) => println!("Set {} = {}", key, value),
-                Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
-                    if is_system_scope(&manifest_path, paths.system_install_dir()) {
-                        re_exec_with_pkexec();
-                    } else {
-                        eprintln!("Error: Failed to write manifest (permission denied)");
+            ConfigAction::Set { key, value } => {
+                // A value read from the prompt or stdin cannot be replayed to a
+                // pkexec child, so a system-scope server re-execs before reading
+                // and the child (which inherits stdin) reads it instead.
+                if value.is_none() && !is_elevated() {
+                    if let Some(manifest_path) = dmcp::discovery::get_manifest_path(&paths, &id) {
+                        if is_system_scope(&manifest_path, paths.system_install_dir()) {
+                            re_exec_with_pkexec();
+                        }
+                    }
+                }
+                let value = match value {
+                    Some(v) => v,
+                    None => match config::read_secret_value(&key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Error: could not read value for {}: {}", key, e);
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                match set_config_value(&paths, &id, &key, &value) {
+                    Ok(()) => println!("Set {}", key),
+                    Err(config::SetConfigError::WriteFailed(_, manifest_path))
+                        if !is_elevated() =>
+                    {
+                        if is_system_scope(&manifest_path, paths.system_install_dir()) {
+                            re_exec_with_pkexec();
+                        } else {
+                            eprintln!("Error: Failed to write manifest (permission denied)");
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            },
+            }
             ConfigAction::Get { key, json } => match get_server(&paths, &id) {
                 Some((manifest, _)) => {
                     if let Some(k) = key {

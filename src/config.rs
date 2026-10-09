@@ -4,6 +4,27 @@ use crate::discovery::get_manifest_path;
 use crate::manifest_io::{write_manifest_atomic, Readers};
 use crate::paths::Paths;
 
+/// Read a config value without it touching argv: a hidden prompt on a terminal,
+/// otherwise one line from stdin. An empty value is an error, not a silent clear.
+pub fn read_secret_value(key: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, IsTerminal};
+
+    let value = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(format!("Value for {key} (input hidden): "))?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        line.trim_end_matches(['\r', '\n']).to_string()
+    };
+    if value.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty value",
+        ));
+    }
+    Ok(value)
+}
+
 /// Set a config value for a server. Persists to manifest.json.
 /// Uses raw JSON to preserve all manifest fields.
 pub fn set_config_value(
