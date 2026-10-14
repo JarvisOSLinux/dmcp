@@ -165,6 +165,9 @@ impl ServerClient {
     }
 
     /// Take one unit of budget, or report that it is spent.
+    // Rust 1.99 renamed fetch_update to try_update; older stable toolchains
+    // still in use have only the old name.
+    #[allow(deprecated)]
     fn claim_budget(&self) -> bool {
         // fetch_update rather than load-then-store: two prompts racing in from
         // one server must not both pass on the last unit.
