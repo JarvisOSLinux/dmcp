@@ -36,7 +36,6 @@ pub enum RunError {
     CommandNotFound(String),
     SpawnFailed(io::Error),
     ProcessExited(i32),
-    CredentialRequired(Box<crate::accounts::CredentialRequired>),
 }
 
 impl std::fmt::Display for RunError {
@@ -52,7 +51,6 @@ impl std::fmt::Display for RunError {
             RunError::CommandNotFound(cmd) => write!(f, "Command not found: {}", cmd),
             RunError::SpawnFailed(e) => write!(f, "Failed to spawn process: {}", e),
             RunError::ProcessExited(code) => write!(f, "Process exited with code {}", code),
-            RunError::CredentialRequired(c) => write!(f, "{}\n{}", c, c.machine_line()),
         }
     }
 }
@@ -116,11 +114,7 @@ fn run_stdio(
     let install_dir = crate::call::resolve_stdio_install_dir(paths, manifest, id)
         .ok_or(RunError::NoStdioTransport)?;
 
-    let mut env = config_to_env(&manifest.config);
-    env.extend(
-        crate::accounts::credential_env(paths, id, manifest)
-            .map_err(RunError::CredentialRequired)?,
-    );
+    let env = config_to_env(&manifest.config);
 
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
