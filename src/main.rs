@@ -332,8 +332,15 @@ enum ConfigAction {
         /// Config key
         key: String,
 
-        /// Config value
-        value: String,
+        /// Config value (omit with --stdin)
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        value: Option<String>,
+
+        /// Read the value from standard input (a trailing newline is dropped)
+        /// and do not echo it. For secrets: any local user can read a running
+        /// process's command line.
+        #[arg(long)]
+        stdin: bool,
     },
 }
 
@@ -400,6 +407,42 @@ enum SourcesAction {
         #[arg(long)]
         system: bool,
     },
+}
+
+/// The value for `config set --stdin`: all of stdin, less one trailing newline.
+fn read_value_from_stdin() -> String {
+    use std::io::Read;
+    let mut value = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut value) {
+        eprintln!("Error: could not read the value from stdin: {e}");
+        std::process::exit(1);
+    }
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn set_config_or_exit(paths: &Paths, id: &str, key: &str, value: &str, quiet_value: bool) {
+    match set_config_value(paths, id, key, value) {
+        Ok(()) if quiet_value => println!("Set {key}"),
+        Ok(()) => println!("Set {key} = {value}"),
+        Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
+            if is_system_scope(&manifest_path, paths.system_install_dir()) {
+                re_exec_with_pkexec();
+            } else {
+                eprintln!("Error: Failed to write manifest (permission denied)");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -478,21 +521,25 @@ fn main() {
             }
         },
         Commands::Config { id, action } => match action {
-            ConfigAction::Set { key, value } => match set_config_value(&paths, &id, &key, &value) {
-                Ok(()) => println!("Set {} = {}", key, value),
-                Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
-                    if is_system_scope(&manifest_path, paths.system_install_dir()) {
-                        re_exec_with_pkexec();
-                    } else {
-                        eprintln!("Error: Failed to write manifest (permission denied)");
-                        std::process::exit(1);
+            ConfigAction::Set { key, value, stdin } => {
+                let value = match value {
+                    Some(value) => value,
+                    None => {
+                        // A system-scope manifest is written as root. Elevate
+                        // before reading: the re-exec'd copy reads stdin, which
+                        // this process would otherwise already have consumed.
+                        if !is_elevated() {
+                            if let Some(path) = dmcp::get_manifest_path(&paths, &id) {
+                                if is_system_scope(&path, paths.system_install_dir()) {
+                                    re_exec_with_pkexec();
+                                }
+                            }
+                        }
+                        read_value_from_stdin()
                     }
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            },
+                };
+                set_config_or_exit(&paths, &id, &key, &value, stdin)
+            }
             ConfigAction::Get { key, json } => match get_server(&paths, &id) {
                 Some((manifest, _)) => {
                     if let Some(k) = key {
