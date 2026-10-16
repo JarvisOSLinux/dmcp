@@ -253,9 +253,43 @@ pub fn refresh_install(
     ignore_platform: bool,
 ) -> Result<(), UpdateError> {
     let server = fetch_server_from_registry(paths, id).map_err(UpdateError::Install)?;
+    refresh_install_from(paths, id, scope, server, ignore_platform)
+}
+
+/// The install half of [`refresh_install`], given the registry's server entry.
+///
+/// The installed manifest is where a server's settings live (`dmcp config
+/// set`, the JARVIS form), API keys included. The registry's copy has none,
+/// so the reinstall would rebuild the manifest without them: every update
+/// silently wiped a server's configuration. They are carried over, and the
+/// setup script runs with them, as it did at first install.
+fn refresh_install_from(
+    paths: &Paths,
+    id: &str,
+    scope: Scope,
+    mut server: serde_json::Value,
+    ignore_platform: bool,
+) -> Result<(), UpdateError> {
+    if let Some(config) = installed_config(paths, id, scope) {
+        server["config"] = config;
+    }
     install::install(paths, id, scope, Some(server), true, ignore_platform)
         .map_err(UpdateError::Install)?;
     Ok(())
+}
+
+/// The non-empty `config` object of an installed server's manifest, if any.
+fn installed_config(paths: &Paths, id: &str, scope: Scope) -> Option<serde_json::Value> {
+    let dir = match scope {
+        Scope::User => paths.user_install_dir(),
+        Scope::System => paths.system_install_dir(),
+    };
+    let text = std::fs::read_to_string(dir.join(id).join("manifest.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    manifest
+        .get("config")
+        .filter(|c| c.as_object().is_some_and(|o| !o.is_empty()))
+        .cloned()
 }
 
 fn build_http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
@@ -705,6 +739,69 @@ pub(crate) mod tests {
         let sources = paths.user_sources_path();
         std::fs::create_dir_all(sources.parent().unwrap()).unwrap();
         std::fs::write(sources, format!("file://{}\n", reg_path.display())).unwrap();
+    }
+
+    /// A registry entry for a remote server: installing it clones and runs
+    /// nothing, so the refresh path can be exercised without the network.
+    fn remote_entry(id: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": id,
+            "version": version,
+            "trustStatus": "community",
+            "transports": [{"type": "sse", "url": "https://mcp.example.invalid/sse"}],
+            "integrity": {"manifestSha256": format!("HASH-{version}")},
+        })
+    }
+
+    fn installed_manifest(paths: &Paths, id: &str) -> serde_json::Value {
+        let text = std::fs::read_to_string(paths.user_install_dir().join(id).join("manifest.json"))
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn refresh_keeps_the_servers_configuration() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let mut first = remote_entry("s", "1.0.0");
+        first["config"] = serde_json::json!({"API_KEY": "k-123", "MODE": "read-only"});
+        install::install(&paths, "s", Scope::User, Some(first), false, true).unwrap();
+
+        refresh_install_from(&paths, "s", Scope::User, remote_entry("s", "2.0.0"), true).unwrap();
+
+        let manifest = installed_manifest(&paths, "s");
+        assert_eq!(
+            manifest["version"], "2.0.0",
+            "the refresh took the new manifest"
+        );
+        assert_eq!(
+            manifest["config"],
+            serde_json::json!({"API_KEY": "k-123", "MODE": "read-only"}),
+            "the user's settings survived the refresh"
+        );
+    }
+
+    #[test]
+    fn refresh_of_an_unconfigured_server_still_gets_an_empty_config() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install::install(
+            &paths,
+            "s",
+            Scope::User,
+            Some(remote_entry("s", "1.0.0")),
+            false,
+            true,
+        )
+        .unwrap();
+
+        refresh_install_from(&paths, "s", Scope::User, remote_entry("s", "2.0.0"), true).unwrap();
+
+        assert_eq!(
+            installed_manifest(&paths, "s")["config"],
+            serde_json::json!({})
+        );
     }
 
     #[test]
