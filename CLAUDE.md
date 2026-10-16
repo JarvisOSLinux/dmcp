@@ -157,6 +157,7 @@ dmcp install <id> --ignore-platform # Install despite an unvouched host (see Pla
 dmcp run <id>                      # Run a server
 dmcp tools <id>                    # List tools on a server
 dmcp call <id> <tool> --args '{}'  # Call a tool (one-shot: spawn, call once, kill)
+dmcp config <id> set <KEY> --stdin # Set a value read from stdin, not echoed (secrets: argv is world-readable)
 dmcp call <id> <tool> --session <sid> # Keep a stateful user-scope server alive across calls (broker)
 dmcp session list|close|gc         # Inspect / close live sessions; sweep idle ones
 dmcp serve                         # Run dmcp as MCP server
@@ -310,6 +311,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-10-15:* `dmcp config <id> set <KEY> --stdin` reads the value from standard input and prints only the key. JARVIS wrote server secrets as `config set KEY VALUE`, so an API key sat in the process's command line, readable by any local user while dmcp ran, and was echoed back as `Set KEY = value`. For a system-scope server the elevation check runs before stdin is read, because the pkexec re-exec reads stdin itself. The positional value still works; giving both, or neither, is an error. `tests/config_set_stdin.rs` covers it.
 
 *2026-10-15:* `dmcp update` (and the agent's `update_server`) no longer wipes a server's configuration. `refresh_install` reinstalls from the registry's manifest, which carries no `config`, and the installed manifest is where `dmcp config set` values and API keys live, so every update silently dropped them. Found when updating the Microsoft 365 wrapper reset its read-only setting. `refresh_install_from` now copies the installed `config` into the new manifest before installing, so the setup script also runs with it, as at first install. Tested with a remote fixture server that is refreshed with and without settings.
 
