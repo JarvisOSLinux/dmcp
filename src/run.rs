@@ -5,7 +5,8 @@
 //!
 //! Config keys are passed directly as environment variables using the key name stored
 //! in the manifest (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY). This matches
-//! what upstream servers expect based on their configurableProperties definitions.
+//! what upstream servers expect based on their configurableProperties definitions,
+//! and only those: a key the manifest does not declare is not passed.
 //!
 //! ## System-scoped servers
 //!
@@ -17,7 +18,7 @@
 //!
 //! See `policy/org.jarvisos.dmcp.policy` for the polkit action definition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::{Command, Stdio};
 
@@ -114,7 +115,7 @@ fn run_stdio(
     let install_dir = crate::call::resolve_stdio_install_dir(paths, manifest, id)
         .ok_or(RunError::NoStdioTransport)?;
 
-    let env = config_to_env(&manifest.config);
+    let env = config_to_env(manifest);
 
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
@@ -146,19 +147,43 @@ fn run_stdio(
     Ok(())
 }
 
-/// Convert manifest config to env vars using the key name as-is.
-/// Config keys in configurableProperties ARE the expected env var names
-/// (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY).
-pub fn config_to_env(
-    config: &std::collections::HashMap<String, serde_json::Value>,
-) -> HashMap<String, std::ffi::OsString> {
+/// The environment a server starts with: its config, keyed by name, limited to
+/// the settings its manifest declares.
+///
+/// A key becomes an environment variable as-is, so an undeclared one such as
+/// NODE_OPTIONS or LD_PRELOAD would run arbitrary code in the server. A stored
+/// key the manifest does not declare is left out, and named on stderr.
+pub fn config_to_env(manifest: &Manifest) -> HashMap<String, std::ffi::OsString> {
+    let declared: HashSet<&str> = manifest
+        .configurable_properties
+        .iter()
+        .map(|p| p.key.as_str())
+        .collect();
     let mut env = HashMap::new();
-    for (key, value) in config {
+    let mut skipped: Vec<&str> = Vec::new();
+    for (key, value) in &manifest.config {
+        if !declared.contains(key.as_str()) {
+            skipped.push(key);
+            continue;
+        }
         let env_val = match value {
             serde_json::Value::String(s) => s.clone(),
             _ => value.to_string(),
         };
         env.insert(key.clone(), std::ffi::OsString::from(env_val));
+    }
+    if !skipped.is_empty() {
+        skipped.sort_unstable();
+        let name = manifest.id.as_deref().unwrap_or("the server");
+        eprintln!(
+            "dmcp: not passing {} to {name}: its manifest does not declare {}",
+            skipped.join(", "),
+            if skipped.len() == 1 {
+                "that setting"
+            } else {
+                "those settings"
+            }
+        );
     }
     env
 }

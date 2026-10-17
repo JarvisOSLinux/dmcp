@@ -70,8 +70,9 @@ pub struct Manifest {
     #[serde(default)]
     pub source: Option<serde_json::Value>,
     /// Schema for user-facing configuration fields. Parsed by installers/wrappers
-    /// (e.g. JARVIS) to collect values before setup. dmcp itself stores the values
-    /// in `config` and injects them as env vars — it does not validate against this schema.
+    /// (e.g. JARVIS) to collect values before setup. dmcp stores the values in
+    /// `config` and injects them as env vars; `config set` refuses, and a spawn
+    /// leaves out, any key not declared here.
     #[serde(default)]
     pub configurable_properties: Vec<ConfigurableProperty>,
     /// When true, the server holds state in-process across tool calls (a browser,

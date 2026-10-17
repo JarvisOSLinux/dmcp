@@ -31,6 +31,7 @@ impl TestEnv {
             serde_json::json!({
                 "version": "1.0.0",
                 "transports": [{"type": "stdio", "command": "true", "args": []}],
+                "configurableProperties": [{"key": "API_KEY"}, {"key": "K"}, {"key": "MODE"}],
                 "config": {},
             })
             .to_string(),
@@ -134,5 +135,20 @@ fn a_value_is_required_one_way_or_the_other() {
         .run(&["config", ID, "set", "K", "v", "--stdin"], Some("w"))
         .status
         .success());
+    assert_eq!(env.config(), serde_json::json!({}));
+}
+
+#[test]
+fn a_setting_the_server_does_not_declare_is_refused() {
+    let env = TestEnv::new();
+    let out = env.run(
+        &["config", ID, "set", "NODE_OPTIONS", "--stdin"],
+        Some("--import=data:text/javascript,0\n"),
+    );
+    assert!(!out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "Error: NODE_OPTIONS is not a setting of this server; its settings are: API_KEY, K, MODE"
+    );
     assert_eq!(env.config(), serde_json::json!({}));
 }

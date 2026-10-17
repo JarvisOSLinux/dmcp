@@ -6,6 +6,11 @@ use crate::paths::Paths;
 
 /// Set a config value for a server. Persists to manifest.json.
 /// Uses raw JSON to preserve all manifest fields.
+///
+/// Only a setting the manifest declares in `configurableProperties` is
+/// accepted. A key reaches the server as an environment variable of that name,
+/// and the caller may be an agent; NODE_OPTIONS or LD_PRELOAD set here would be
+/// code execution in the server.
 pub fn set_config_value(
     paths: &Paths,
     id: &str,
@@ -17,6 +22,23 @@ pub fn set_config_value(
     let content = std::fs::read_to_string(&manifest_path).map_err(SetConfigError::ReadFailed)?;
     let mut manifest: serde_json::Value =
         serde_json::from_str(&content).map_err(SetConfigError::ParseFailed)?;
+
+    let declared: Vec<String> = manifest
+        .get("configurableProperties")
+        .and_then(|p| p.as_array())
+        .map(|props| {
+            props
+                .iter()
+                .filter_map(|p| p.get("key")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !declared.iter().any(|k| k == key) {
+        return Err(SetConfigError::Undeclared {
+            key: key.to_string(),
+            declared,
+        });
+    }
 
     // Ensure config object exists
     if manifest.get("config").is_none() {
@@ -47,6 +69,7 @@ pub fn set_config_value(
 #[derive(Debug)]
 pub enum SetConfigError {
     ServerNotFound,
+    Undeclared { key: String, declared: Vec<String> },
     InvalidManifest,
     ReadFailed(std::io::Error),
     ParseFailed(serde_json::Error),
@@ -58,6 +81,14 @@ impl std::fmt::Display for SetConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SetConfigError::ServerNotFound => write!(f, "Server not found"),
+            SetConfigError::Undeclared { key, declared } if declared.is_empty() => {
+                write!(f, "{key} is not a setting of this server; it declares none")
+            }
+            SetConfigError::Undeclared { key, declared } => write!(
+                f,
+                "{key} is not a setting of this server; its settings are: {}",
+                declared.join(", ")
+            ),
             SetConfigError::InvalidManifest => write!(f, "Manifest has no config object"),
             SetConfigError::ReadFailed(e) => write!(f, "Failed to read manifest: {}", e),
             SetConfigError::ParseFailed(e) => write!(f, "Failed to parse manifest: {}", e),
@@ -109,8 +140,12 @@ mod tests {
             let manifest_path = dir.join("manifest.json");
             std::fs::write(
                 &manifest_path,
-                serde_json::json!({ "id": id, "config": { "ENDPOINT": "https://example.invalid" } })
-                    .to_string(),
+                serde_json::json!({
+                    "id": id,
+                    "configurableProperties": [{"key": "ENDPOINT"}, {"key": "GITHUB_TOKEN"}],
+                    "config": { "ENDPOINT": "https://example.invalid" },
+                })
+                .to_string(),
             )
             .unwrap();
             #[cfg(unix)]
@@ -184,5 +219,23 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "the stored token must not be world-readable");
+    }
+
+    #[test]
+    fn a_setting_the_manifest_does_not_declare_is_refused() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let manifest_path = tree.installed_server("test.server");
+        let before = std::fs::read(&manifest_path).unwrap();
+
+        let err =
+            set_config_value(&paths, "test.server", "NODE_OPTIONS", "--import=x").unwrap_err();
+
+        assert!(matches!(err, SetConfigError::Undeclared { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "NODE_OPTIONS is not a setting of this server; its settings are: ENDPOINT, GITHUB_TOKEN"
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
     }
 }
