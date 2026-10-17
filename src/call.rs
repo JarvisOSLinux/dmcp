@@ -654,7 +654,7 @@ pub fn build_stdio_command(
 ) -> Result<Command, CallError> {
     let install_dir =
         resolve_stdio_install_dir(paths, manifest, id).ok_or(CallError::NoStdioTransport)?;
-    let env = config_to_env(&manifest.config);
+    let env = config_to_env(manifest);
     let mut cmd = Command::new(command);
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
@@ -919,6 +919,44 @@ mod tests {
 
     fn selected(transports: &[Transport]) -> Option<&Transport> {
         crate::transport::select(Some(transports)).ok()
+    }
+
+    #[test]
+    fn a_server_starts_with_only_the_settings_its_manifest_declares() {
+        let manifest = Manifest {
+            install_dir: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            configurable_properties: vec![crate::models::ConfigurableProperty {
+                key: "API_KEY".into(),
+                ..Default::default()
+            }],
+            config: [("API_KEY", "k-1"), ("NODE_OPTIONS", "--import=data:,x")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect(),
+            ..Default::default()
+        };
+        let root = std::env::temp_dir().join("dmcp-unused");
+        let paths = Paths {
+            user_sources: root.join("u.list"),
+            user_install_dir: root.join("u"),
+            system_sources: root.join("s.list"),
+            system_install_dir: root.join("s"),
+            vector_index_dir: root.join("v"),
+        };
+
+        let cmd = build_stdio_command(&paths, &manifest, "srv", "srv", None).unwrap();
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(envs, vec![("API_KEY".to_string(), Some("k-1".to_string()))]);
     }
 
     #[test]

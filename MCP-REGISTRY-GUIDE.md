@@ -409,7 +409,7 @@ dmcp stores `configurableProperties` as metadata for wrapper UIs (e.g. the JARVI
 | `sensitive`   | boolean | If `true`, field is shown as a password input.             |
 | `required`    | boolean | If `true`, must be filled before installation.             |
 
-User-provided values are stored in the per-server manifest at `<installDir>/manifest.json` in the `config` object and injected into the server process as **environment variables**, using each key verbatim as the variable name — name keys after the env var the server expects (e.g. `BRAVE_API_KEY`). dmcp does not auto-apply `default` values.
+User-provided values are stored in the per-server manifest at `<installDir>/manifest.json` in the `config` object and injected into the server process as **environment variables**, using each key verbatim as the variable name — name keys after the env var the server expects (e.g. `BRAVE_API_KEY`). Only declared keys are passed: `dmcp config set` refuses a key that `configurableProperties` does not list, so every variable a server needs must be declared there. dmcp does not auto-apply `default` values.
 
 Use `keywords` for searchability in `dmcp browse -k` and the semantic index.
 

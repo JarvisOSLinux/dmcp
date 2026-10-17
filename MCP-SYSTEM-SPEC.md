@@ -159,7 +159,7 @@ a transport's list governs which command starts the server.
 
 ## 6. Manifest Format
 
-Each installed server has `manifest.json` in its install directory. The manifest is the full server metadata plus runtime config. At spawn time, dmcp injects the manifest's `config` map into the server process as environment variables (key names used verbatim).
+Each installed server has `manifest.json` in its install directory. The manifest is the full server metadata plus runtime config. At spawn time, dmcp injects the manifest's `config` map into the server process as environment variables (key names used verbatim), limited to the keys the manifest declares in `configurableProperties`. `dmcp config set` refuses any other key, and a stored undeclared key is left out at spawn and named on stderr: a key reaches the server as an environment variable, so `NODE_OPTIONS` or `LD_PRELOAD` would be code execution in it.
 
 Structure matches the registry server entry, plus:
 
@@ -306,7 +306,7 @@ A reference implementation should provide at least:
 
 - `spawn_server(id)` — Start the stdio process for a server
   - Working directory: install dir
-  - Environment: inherit from parent, plus each key/value in the manifest `config` object injected as an environment variable (key name used verbatim, e.g. `BRAVE_API_KEY`)
+  - Environment: inherit from parent, plus each key/value in the manifest `config` object whose key `configurableProperties` declares, injected as an environment variable (key name used verbatim, e.g. `BRAVE_API_KEY`)
   - Command + args from primary transport
 
 ### 8.3 Config
@@ -332,7 +332,7 @@ When spawning a stdio server:
 3. Get the primary transport: the first entry in `transports` whose `platforms` include the host (an entry without `platforms` matches every host) with `type == "stdio"`. If no entry covers the host, the invocation fails naming the platforms the manifest declares
 4. `cwd` = `installDir` from manifest (or dir containing manifest.json)
 5. Execute `command` with `args`
-6. Config is delivered via environment variables (the manifest `config` map, keys verbatim)
+6. Config is delivered via environment variables (the manifest `config` map, keys verbatim, declared keys only)
 
 Environment: inherit from parent, plus the injected config variables.
 
