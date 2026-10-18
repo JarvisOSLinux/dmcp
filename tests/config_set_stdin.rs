@@ -31,7 +31,10 @@ impl TestEnv {
             serde_json::json!({
                 "version": "1.0.0",
                 "transports": [{"type": "stdio", "command": "true", "args": []}],
-                "configurableProperties": [{"key": "API_KEY"}, {"key": "K"}, {"key": "MODE"}],
+                "configurableProperties": [
+                    {"key": "API_KEY"}, {"key": "K"}, {"key": "MODE"},
+                    {"key": "PORT", "type": "integer", "min": 1, "max": 65535},
+                ],
                 "config": {},
             })
             .to_string(),
@@ -148,7 +151,23 @@ fn a_setting_the_server_does_not_declare_is_refused() {
     assert!(!out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "Error: NODE_OPTIONS is not a setting of this server; its settings are: API_KEY, K, MODE"
+        "Error: NODE_OPTIONS is not a setting of this server; its settings are: API_KEY, K, MODE, PORT"
     );
     assert_eq!(env.config(), serde_json::json!({}));
+}
+
+#[test]
+fn a_value_the_setting_type_rejects_is_refused() {
+    let env = TestEnv::new();
+    let out = env.run(&["config", ID, "set", "PORT", "--stdin"], Some("99999\n"));
+    assert!(!out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "Error: PORT must be at most 65535"
+    );
+    assert_eq!(env.config(), serde_json::json!({}));
+    assert!(env
+        .run(&["config", ID, "set", "PORT", "--stdin"], Some("993\n"))
+        .status
+        .success());
 }

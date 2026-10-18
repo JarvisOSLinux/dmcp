@@ -23,20 +23,27 @@ pub fn set_config_value(
     let mut manifest: serde_json::Value =
         serde_json::from_str(&content).map_err(SetConfigError::ParseFailed)?;
 
-    let declared: Vec<String> = manifest
+    let props: Vec<serde_json::Value> = manifest
         .get("configurableProperties")
         .and_then(|p| p.as_array())
-        .map(|props| {
-            props
-                .iter()
-                .filter_map(|p| p.get("key")?.as_str().map(str::to_string))
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default();
-    if !declared.iter().any(|k| k == key) {
+    let Some(prop) = props
+        .iter()
+        .find(|p| p.get("key").and_then(|k| k.as_str()) == Some(key))
+    else {
         return Err(SetConfigError::Undeclared {
             key: key.to_string(),
-            declared,
+            declared: props
+                .iter()
+                .filter_map(|p| p.get("key")?.as_str().map(str::to_string))
+                .collect(),
+        });
+    };
+    if let Some(why) = value_error(prop, value) {
+        return Err(SetConfigError::Invalid {
+            key: key.to_string(),
+            why,
         });
     }
 
@@ -66,10 +73,90 @@ pub fn set_config_value(
     Ok(())
 }
 
+/// Why `value` is not valid for the setting `prop`, by its `type` (mcp-registry#115).
+///
+/// Mirrors `property_value_error` in the registry's validator. A setting with
+/// no `type`, or one this dmcp does not know, takes any string: the registry
+/// gate is where types are checked, and refusing a newer type here would
+/// strand a server whose manifest is newer than dmcp.
+pub fn value_error(prop: &serde_json::Value, value: &str) -> Option<String> {
+    let strings = |field: &str| -> Vec<String> {
+        prop.get(field)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match prop
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("string")
+    {
+        "boolean" => {
+            let spelled = |which: &str| {
+                prop.get("values")
+                    .and_then(|v| v.get(which))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(which)
+                    .to_string()
+            };
+            let (yes, no) = (spelled("true"), spelled("false"));
+            (value != yes && value != no).then(|| format!("must be '{yes}' or '{no}'"))
+        }
+        "integer" => {
+            let digits = value.strip_prefix('-').unwrap_or(value);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Some("must be a whole number".to_string());
+            }
+            let Ok(number) = value.parse::<i64>() else {
+                return Some("is out of range".to_string());
+            };
+            if let Some(min) = prop.get("min").and_then(|m| m.as_i64()) {
+                if number < min {
+                    return Some(format!("must be at least {min}"));
+                }
+            }
+            if let Some(max) = prop.get("max").and_then(|m| m.as_i64()) {
+                if number > max {
+                    return Some(format!("must be at most {max}"));
+                }
+            }
+            None
+        }
+        "choice" => {
+            let choices = strings("choices");
+            let multiple = prop.get("multiple").and_then(|m| m.as_bool()) == Some(true);
+            let separator = prop
+                .get("separator")
+                .and_then(|s| s.as_str())
+                .unwrap_or(",");
+            let items: Vec<&str> = if multiple {
+                value.split(separator).collect()
+            } else {
+                vec![value]
+            };
+            let bad = value.is_empty() || items.iter().any(|i| !choices.iter().any(|c| c == i));
+            bad.then(|| {
+                let how = if multiple {
+                    "each of its items must be"
+                } else {
+                    "must be"
+                };
+                format!("{how} one of {}", choices.join(", "))
+            })
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub enum SetConfigError {
     ServerNotFound,
     Undeclared { key: String, declared: Vec<String> },
+    Invalid { key: String, why: String },
     InvalidManifest,
     ReadFailed(std::io::Error),
     ParseFailed(serde_json::Error),
@@ -84,6 +171,7 @@ impl std::fmt::Display for SetConfigError {
             SetConfigError::Undeclared { key, declared } if declared.is_empty() => {
                 write!(f, "{key} is not a setting of this server; it declares none")
             }
+            SetConfigError::Invalid { key, why } => write!(f, "{key} {why}"),
             SetConfigError::Undeclared { key, declared } => write!(
                 f,
                 "{key} is not a setting of this server; its settings are: {}",
@@ -103,6 +191,7 @@ impl std::error::Error for SetConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -237,5 +326,96 @@ mod tests {
             "NODE_OPTIONS is not a setting of this server; its settings are: ENDPOINT, GITHUB_TOKEN"
         );
         assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_value_is_checked_against_the_setting_type() {
+        let cases = [
+            (json!({"type": "boolean"}), "true", None),
+            (
+                json!({"type": "boolean"}),
+                "yes",
+                Some("must be 'true' or 'false'"),
+            ),
+            (
+                json!({"type": "boolean", "values": {"true": "1", "false": "0"}}),
+                "0",
+                None,
+            ),
+            (
+                json!({"type": "boolean", "values": {"true": "1", "false": "0"}}),
+                "true",
+                Some("must be '1' or '0'"),
+            ),
+            (
+                json!({"type": "integer", "min": 1, "max": 65535}),
+                "993",
+                None,
+            ),
+            (
+                json!({"type": "integer", "min": 1, "max": 65535}),
+                "0",
+                Some("must be at least 1"),
+            ),
+            (
+                json!({"type": "integer"}),
+                "3.5",
+                Some("must be a whole number"),
+            ),
+            (
+                json!({"type": "integer"}),
+                "",
+                Some("must be a whole number"),
+            ),
+            (
+                json!({"type": "choice", "choices": ["ssl", "starttls"]}),
+                "ssl",
+                None,
+            ),
+            (
+                json!({"type": "choice", "choices": ["ssl", "starttls"]}),
+                "tls",
+                Some("must be one of ssl, starttls"),
+            ),
+            (
+                json!({"type": "choice", "multiple": true, "choices": ["mail", "calendar"]}),
+                "mail,calendar",
+                None,
+            ),
+            (
+                json!({"type": "choice", "multiple": true, "choices": ["mail", "calendar"]}),
+                "mail,,calendar",
+                Some("each of its items must be one of mail, calendar"),
+            ),
+            (json!({}), "anything at all", None),
+            (json!({"type": "from-the-future"}), "anything", None),
+        ];
+        for (prop, value, expected) in cases {
+            assert_eq!(
+                value_error(&prop, value).as_deref(),
+                expected,
+                "{prop} with {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_value_is_refused_and_nothing_is_written() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let manifest_path = tree.installed_server("test.server");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["configurableProperties"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"key": "READ_ONLY", "type": "boolean"}));
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let before = std::fs::read(&manifest_path).unwrap();
+
+        let err = set_config_value(&paths, "test.server", "READ_ONLY", "yes").unwrap_err();
+        assert_eq!(err.to_string(), "READ_ONLY must be 'true' or 'false'");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+        set_config_value(&paths, "test.server", "READ_ONLY", "true").unwrap();
     }
 }
