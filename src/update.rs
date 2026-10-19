@@ -6,6 +6,11 @@
 //! `version`, as with a transport bug fix — the recorded hash and the current
 //! registry hash diverge. That divergence, not a version bump, is the drift
 //! signal: version comparison misses same-version fixes and security fixes.
+//!
+//! The setup script this host runs is compared the same way
+//! (`integrity.setupScriptSha256`, or `setupScriptWindowsSha256` on Windows).
+//! A fix can live in the setup script alone — fetch-guard's `mcp<2` cap did —
+//! and an update that compared only the manifest called that server up to date.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +59,8 @@ impl DriftReport {
 #[derive(Debug, Clone)]
 pub struct RegistryEntryInfo {
     pub manifest_sha256: Option<String>,
+    /// The registry's hash of the setup script this host runs.
+    pub setup_sha256: Option<String>,
     pub trust_status: String,
     pub platforms: PlatformDecl,
 }
@@ -88,6 +95,33 @@ pub fn read_installed_hash(manifest_path: &Path) -> Option<String> {
     installed_manifest_hash(&value)
 }
 
+/// The `integrity` key holding the hash of the setup script this host runs.
+pub fn setup_integrity_key() -> &'static str {
+    if platform::host_platform() == "windows" {
+        "setupScriptWindowsSha256"
+    } else {
+        "setupScriptSha256"
+    }
+}
+
+/// The recorded hash of the setup script this host runs, from a manifest or
+/// a registry entry (both carry it under `integrity`).
+pub fn setup_hash(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("integrity")
+        .and_then(|i| i.get(setup_integrity_key()))
+        .and_then(|h| h.as_str())
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+}
+
+/// Read the installed setup script's recorded hash from a manifest on disk.
+pub fn read_installed_setup_hash(manifest_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(manifest_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    setup_hash(&value)
+}
+
 /// Extract `integrity.manifestSha256` from a parsed manifest value.
 pub fn installed_manifest_hash(manifest: &serde_json::Value) -> Option<String> {
     manifest
@@ -102,6 +136,7 @@ pub fn installed_manifest_hash(manifest: &serde_json::Value) -> Option<String> {
 pub fn assess(
     id: &str,
     installed_hash: Option<String>,
+    installed_setup_hash: Option<String>,
     entry: Option<&RegistryEntryInfo>,
     scope: Scope,
 ) -> AssessedServer {
@@ -126,8 +161,9 @@ pub fn assess(
             // A revoked server is never "update available": it is uninstalled,
             // not refreshed. Drift on a revoked entry is still reported via the
             // trust_status field so the daemon sees the revocation.
-            let update_available =
-                !revoked && is_drifted(installed_hash.as_deref(), e.manifest_sha256.as_deref());
+            let update_available = !revoked
+                && (is_drifted(installed_hash.as_deref(), e.manifest_sha256.as_deref())
+                    || is_drifted(installed_setup_hash.as_deref(), e.setup_sha256.as_deref()));
             let unsupported_on_host = !e.platforms.supports(platform::host_platform());
             AssessedServer {
                 report: DriftReport {
@@ -177,6 +213,7 @@ pub fn parse_registry_entries(registry: &serde_json::Value) -> HashMap<String, R
         let trust_status = install::trust_status(&entry).to_string();
         let info = RegistryEntryInfo {
             manifest_sha256,
+            setup_sha256: setup_hash(&entry),
             trust_status,
             platforms: platform::platform_decl(&entry),
         };
@@ -236,7 +273,14 @@ pub fn assess_servers(paths: &Paths, ids: &[String]) -> Result<Vec<AssessedServe
             Scope::System
         };
         let installed_hash = read_installed_hash(&manifest_path);
-        out.push(assess(id, installed_hash, registry.get(id), scope));
+        let installed_setup_hash = read_installed_setup_hash(&manifest_path);
+        out.push(assess(
+            id,
+            installed_hash,
+            installed_setup_hash,
+            registry.get(id),
+            scope,
+        ));
     }
     Ok(out)
 }
@@ -428,10 +472,11 @@ pub(crate) mod tests {
     fn assess_detects_drift_on_trusted_server() {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "community".into(),
             platforms: PlatformDecl::Absent,
         };
-        let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
+        let a = assess("s", Some("old".into()), None, Some(&entry), Scope::User);
         assert!(a.in_registry);
         assert!(!a.revoked);
         assert!(a.report.update_available);
@@ -443,10 +488,11 @@ pub(crate) mod tests {
     fn assess_no_drift_is_not_updatable() {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("same".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Absent,
         };
-        let a = assess("s", Some("same".into()), Some(&entry), Scope::User);
+        let a = assess("s", Some("same".into()), None, Some(&entry), Scope::User);
         assert!(!a.report.update_available);
         assert!(!a.revoked);
     }
@@ -455,10 +501,11 @@ pub(crate) mod tests {
     fn assess_removed_is_revoked_never_updatable() {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "removed".into(),
             platforms: PlatformDecl::Absent,
         };
-        let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
+        let a = assess("s", Some("old".into()), None, Some(&entry), Scope::User);
         assert!(a.revoked);
         assert!(!a.report.update_available);
         // trust_status still surfaces the revocation to a polling daemon.
@@ -469,10 +516,11 @@ pub(crate) mod tests {
     fn assess_deprecated_still_updates() {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "deprecated".into(),
             platforms: PlatformDecl::Absent,
         };
-        let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
+        let a = assess("s", Some("old".into()), None, Some(&entry), Scope::User);
         assert!(!a.revoked);
         assert!(a.report.update_available);
         // deprecated warns but proceeds.
@@ -484,7 +532,7 @@ pub(crate) mod tests {
 
     #[test]
     fn assess_absent_from_registry() {
-        let a = assess("s", Some("old".into()), None, Scope::User);
+        let a = assess("s", Some("old".into()), None, None, Scope::User);
         assert!(!a.in_registry);
         assert!(!a.report.update_available);
     }
@@ -493,10 +541,11 @@ pub(crate) mod tests {
     fn assess_marks_a_host_the_registry_does_not_vouch_for() {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Declared(vec![platform::foreign_platform().to_string()]),
         };
-        let a = assess("s", Some("old".into()), Some(&entry), Scope::User);
+        let a = assess("s", Some("old".into()), None, Some(&entry), Scope::User);
         assert!(a.report.unsupported_on_host);
         // Drift is a fact about the manifest, not about the host: the row still
         // reports the update, and the apply path is what refuses.
@@ -511,21 +560,29 @@ pub(crate) mod tests {
     fn assess_leaves_supported_and_undeclared_hosts_unmarked() {
         let vouched = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Declared(vec![platform::host_platform().to_string()]),
         };
         assert!(
-            !assess("s", Some("old".into()), Some(&vouched), Scope::User)
+            !assess("s", Some("old".into()), None, Some(&vouched), Scope::User)
                 .report
                 .unsupported_on_host
         );
 
         let undeclared = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Absent,
         };
-        let a = assess("s", Some("old".into()), Some(&undeclared), Scope::User);
+        let a = assess(
+            "s",
+            Some("old".into()),
+            None,
+            Some(&undeclared),
+            Scope::User,
+        );
         assert!(!a.report.unsupported_on_host);
         assert_eq!(a.report.platforms, None);
     }
@@ -534,12 +591,14 @@ pub(crate) mod tests {
     fn check_json_rows_carry_platform_state() {
         let entry = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Declared(vec![platform::foreign_platform().to_string()]),
         };
-        let row =
-            serde_json::to_value(assess("s", Some("old".into()), Some(&entry), Scope::User).report)
-                .unwrap();
+        let row = serde_json::to_value(
+            assess("s", Some("old".into()), None, Some(&entry), Scope::User).report,
+        )
+        .unwrap();
         assert_eq!(row["unsupported_on_host"], serde_json::json!(true));
         assert_eq!(
             row["platforms"],
@@ -550,12 +609,14 @@ pub(crate) mod tests {
         // daemon: the verdict is always there, the list only when declared.
         let plain = RegistryEntryInfo {
             manifest_sha256: Some("new".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Absent,
         };
-        let row =
-            serde_json::to_value(assess("s", Some("old".into()), Some(&plain), Scope::User).report)
-                .unwrap();
+        let row = serde_json::to_value(
+            assess("s", Some("old".into()), None, Some(&plain), Scope::User).report,
+        )
+        .unwrap();
         assert_eq!(row["unsupported_on_host"], serde_json::json!(false));
         assert!(row.get("platforms").is_none());
     }
@@ -616,6 +677,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_changed_setup_script_is_an_update_even_with_the_same_manifest() {
+        let entry = |setup: Option<&str>| RegistryEntryInfo {
+            manifest_sha256: Some("SAME".into()),
+            setup_sha256: setup.map(str::to_string),
+            trust_status: "community".into(),
+            platforms: PlatformDecl::Absent,
+        };
+        let drifted = |installed: Option<&str>, registry: Option<&str>| {
+            assess(
+                "s",
+                Some("SAME".into()),
+                installed.map(str::to_string),
+                Some(&entry(registry)),
+                Scope::User,
+            )
+            .report
+            .update_available
+        };
+        assert!(drifted(Some("OLD"), Some("NEW")), "a new setup script");
+        assert!(
+            drifted(None, Some("NEW")),
+            "a setup script added since install"
+        );
+        assert!(
+            !drifted(Some("SAME-SETUP"), Some("SAME-SETUP")),
+            "nothing changed"
+        );
+        assert!(
+            !drifted(Some("OLD"), None),
+            "the registry records no setup hash"
+        );
+    }
+
+    #[test]
+    fn parse_registry_entries_reads_the_host_setup_hash() {
+        let reg = serde_json::json!({"servers": {"a": {"id": "a", "integrity": {
+            "manifestSha256": "m",
+            "setupScriptSha256": "posix",
+            "setupScriptWindowsSha256": "windows",
+        }}}});
+        let expected = if platform::host_platform() == "windows" {
+            "windows"
+        } else {
+            "posix"
+        };
+        assert_eq!(
+            parse_registry_entries(&reg)["a"].setup_sha256.as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
     fn parse_registry_entries_reads_platforms() {
         let reg = serde_json::json!({
             "servers": {
@@ -642,7 +755,7 @@ pub(crate) mod tests {
         let m = parse_registry_entries(&reg);
         assert!(m["a"].platforms.is_malformed());
 
-        let a = assess("a", Some("old".into()), Some(&m["a"]), Scope::User);
+        let a = assess("a", Some("old".into()), None, Some(&m["a"]), Scope::User);
         assert!(a.report.unsupported_on_host);
         assert!(a.report.platforms_malformed);
         assert_eq!(a.report.platforms, None);
@@ -758,6 +871,31 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(paths.user_install_dir().join(id).join("manifest.json"))
             .unwrap();
         serde_json::from_str(&text).unwrap()
+    }
+
+    /// fetch-guard, 2026-10-19: the registry fixed its setup script only, and
+    /// `dmcp update` called the installed copy up to date.
+    #[test]
+    fn assess_servers_sees_a_setup_script_only_change() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install_fake_server(&paths, "s", "SAME");
+        let manifest_path = paths.user_install_dir().join("s").join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["integrity"][setup_integrity_key()] = serde_json::json!("OLD-SETUP");
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let mut entry = remote_entry("s", "1.0.0");
+        entry["integrity"] =
+            serde_json::json!({"manifestSha256": "SAME", setup_integrity_key(): "NEW-SETUP"});
+        write_registry(&paths, &serde_json::json!({"servers": {"s": entry}}));
+
+        let assessed = assess_servers(&paths, &["s".to_string()]).unwrap();
+        assert!(assessed[0].report.update_available);
+        assert_eq!(
+            assessed[0].report.installed_hash,
+            assessed[0].report.registry_hash
+        );
     }
 
     #[test]

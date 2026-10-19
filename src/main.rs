@@ -1247,12 +1247,19 @@ fn main() {
                 (user || !system, system || !user)
             };
             let installed = list_servers(&paths, include_user, include_system, false);
-            let installed_hashes: std::collections::HashMap<String, Option<String>> = installed
+            let installed_hashes: std::collections::HashMap<
+                String,
+                (Option<String>, Option<String>),
+            > = installed
                 .iter()
                 .map(|s| {
+                    let path = std::path::Path::new(&s.manifest_path);
                     (
                         s.id.clone(),
-                        dmcp::update::read_installed_hash(std::path::Path::new(&s.manifest_path)),
+                        (
+                            dmcp::update::read_installed_hash(path),
+                            dmcp::update::read_installed_setup_hash(path),
+                        ),
                     )
                 })
                 .collect();
@@ -1263,12 +1270,18 @@ fn main() {
                 s.installed = installed_ids.contains(&s.id);
                 // Flag drift only for installed servers whose registry entry
                 // records a manifest hash to compare against.
-                if s.installed {
-                    if let Some(reg) = s.registry_manifest_sha256.clone() {
-                        let inst = installed_hashes.get(&s.id).cloned().flatten();
-                        s.update_available =
-                            Some(dmcp::update::is_drifted(inst.as_deref(), Some(&reg)));
-                    }
+                if s.installed && s.registry_manifest_sha256.is_some() {
+                    let (manifest, setup) =
+                        installed_hashes.get(&s.id).cloned().unwrap_or_default();
+                    s.update_available = Some(
+                        dmcp::update::is_drifted(
+                            manifest.as_deref(),
+                            s.registry_manifest_sha256.as_deref(),
+                        ) || dmcp::update::is_drifted(
+                            setup.as_deref(),
+                            s.registry_setup_sha256.as_deref(),
+                        ),
+                    );
                 }
             }
             servers = filter_servers_by_keywords(servers, &keyword);
@@ -1696,14 +1709,18 @@ fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
             actionable = true;
         } else if a.report.update_available {
             println!("{}: update available", id);
-            println!(
-                "        installed: {}",
-                a.report.installed_hash.as_deref().unwrap_or("(none)")
-            );
-            println!(
-                "        registry:  {}",
-                a.report.registry_hash.as_deref().unwrap_or("(none)")
-            );
+            if a.report.installed_hash == a.report.registry_hash {
+                println!("        the manifest is unchanged; its setup script changed");
+            } else {
+                println!(
+                    "        installed: {}",
+                    a.report.installed_hash.as_deref().unwrap_or("(none)")
+                );
+                println!(
+                    "        registry:  {}",
+                    a.report.registry_hash.as_deref().unwrap_or("(none)")
+                );
+            }
             actionable = true;
         } else {
             println!("{}: up to date", id);
