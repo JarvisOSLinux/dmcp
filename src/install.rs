@@ -93,6 +93,13 @@ pub fn install(
     let mut setup_failure: Option<String> = None;
 
     if run_setup {
+        // Written before the script runs, as `connect` does: the registry's
+        // setup template for remote servers reads ./manifest.json, and finding
+        // none failed hello-sse on every install and update. It is written
+        // again below with the setup's outcome.
+        let output = serde_json::to_string_pretty(&manifest).map_err(InstallError::Serialize)?;
+        write_manifest_atomic(&manifest_path, output.as_bytes(), readers)
+            .map_err(InstallError::WriteManifest)?;
         // --- setupScript delivery from registry ---
         // The script lives in the registry repo (servers/<id>/setup.sh, or
         // setup.ps1 on Windows), not in the cloned server repo.
@@ -1114,6 +1121,26 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("failed:"));
+    }
+
+    #[test]
+    fn a_setup_script_can_read_its_own_manifest() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let script = tree.script(
+            "reads-manifest.sh",
+            "#!/bin/sh\ngrep -q '\"installDir\"' manifest.json || { echo 'no manifest' >&2; exit 7; }\n",
+        );
+
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server(&script)),
+            true,
+            false,
+        )
+        .expect("the setup script finds manifest.json in its working directory");
     }
 
     #[test]
