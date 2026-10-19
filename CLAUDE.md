@@ -152,7 +152,7 @@ cargo fmt --check
 dmcp list                          # List installed servers
 dmcp browse                        # Browse registries
 dmcp install <id>                  # Install from registry
-dmcp update <id> | --all [--check] # Refresh servers whose registry manifest hash drifted
+dmcp update <id> | --all [--check] # Refresh servers whose registry manifest or setup-script hash drifted
 dmcp install <id> --ignore-platform # Install despite an unvouched host (see Platform support)
 dmcp run <id>                      # Run a server
 dmcp tools <id>                    # List tools on a server
@@ -311,6 +311,10 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-10-19:* a setup script can read its own `manifest.json`. `install` (and `update`, which reuses it) wrote the manifest only after the setup script ran, into a directory it had just recreated, so the registry's remote-server setup template, which reads `./manifest.json` for config and transport URLs, failed on every install and update (hello-sse). The manifest is now written before the script runs, as `connect` already did, and again afterwards with the setup's outcome. Test: a setup script that requires `installDir` in `./manifest.json` installs cleanly.
+
+*2026-10-19:* `dmcp update` sees a change to a server's setup script, not only to its manifest. The registry fixed fetch-guard by capping `mcp<2` in its `setup.sh` (mcp-registry#121), and `update --check` called the broken install up to date: drift compared only `integrity.manifestSha256`. The installed manifest already records the registry's `integrity` from install time, so `update::setup_hash` reads the hash of the setup script this host runs (`setupScriptSha256`, or `setupScriptWindowsSha256` on Windows) from both sides, `RegistryEntryInfo.setup_sha256` carries the registry's, and `assess` (hence `update`, `update --check`, the agent's `update_server` and `get_server_info`) and `browse`'s `update_available` flag either difference. A registry entry with no setup hash asserts nothing, as with the manifest hash. `update --check` says "the manifest is unchanged; its setup script changed" instead of printing two equal hashes. Tests: the comparison's four cases, the host's key read from a registry entry, and `assess_servers` against an on-disk registry where only the setup hash moved.
 
 *2026-10-18:* `config set` checks a value against its setting's type (mcp-registry#115). A `configurableProperties` entry may declare `type` (`boolean` with optional `values` spellings, `integer` with `min`/`max`, `choice` with `choices` and optional `multiple`/`separator`); `config::value_error` mirrors the registry validator's `property_value_error`, and `set_config_value` refuses an invalid value before writing (`READ_ONLY must be 'true' or 'false'`), on the CLI and through `dmcp serve`'s `set_config` alike, so a value set by hand, by JARVIS or by an agent gets the same check. A setting with no type, or one this dmcp does not know, takes any string: the registry gate checks types, and refusing a newer one would strand a server whose manifest is newer than dmcp. Tests: every type's accept/refuse cases, the manifest left untouched on a refusal, and the CLI refusing a port above 65535.
 
