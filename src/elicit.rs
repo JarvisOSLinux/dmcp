@@ -169,13 +169,25 @@ impl ServerClient {
     // still in use have only the old name.
     #[allow(deprecated)]
     fn claim_budget(&self) -> bool {
-        // fetch_update rather than load-then-store: two prompts racing in from
-        // one server must not both pass on the last unit.
-        self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < self.budget).then_some(n + 1)
-            })
-            .is_ok()
+        // A compare-exchange loop rather than load-then-store: two prompts
+        // racing in from one server must not both pass on the last unit.
+        // (Not `fetch_update`, which newer toolchains deprecate, and not
+        // `try_update`, which older ones lack.)
+        let mut used = self.used.load(Ordering::SeqCst);
+        loop {
+            if used >= self.budget {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
     }
 }
 
