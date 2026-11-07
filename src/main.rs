@@ -198,6 +198,13 @@ enum Commands {
         #[arg(long)]
         args: Option<String>,
 
+        /// A phone passkey's signed approval for exactly this command. polkit
+        /// reads it from the pkexec command line before dmcp runs as root
+        /// (JarvisOSLinux/jarvisos `jarvis-approval-check`); dmcp itself ignores
+        /// it. Must come after --args. Project-JARVIS#310.
+        #[arg(long, hide = true)]
+        approval: Option<String>,
+
         /// Keep the server alive across calls under this session id (stateful,
         /// user-scope servers only). Routes the call through the broker so
         /// in-process state (a browser, a REPL) survives between calls.
@@ -1007,6 +1014,7 @@ fn main() {
             id,
             tool,
             args,
+            approval: _,
             session,
             interactive,
         } => {
@@ -1822,6 +1830,31 @@ fn resolve_doc_comment_descriptions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// polkit reads `--approval` off the pkexec command line (#310); dmcp must
+    /// still parse the call once it is root, with and without `--args`.
+    #[test]
+    fn call_accepts_an_approval_after_its_args() {
+        for argv in [
+            vec![
+                "dmcp",
+                "call",
+                "s",
+                "t",
+                "--args",
+                "{\"a\":1}",
+                "--approval",
+                "QUJD",
+            ],
+            vec!["dmcp", "call", "s", "t", "--approval", "QUJD"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parses");
+            match cli.command {
+                Commands::Call { approval, .. } => assert_eq!(approval.as_deref(), Some("QUJD")),
+                _ => panic!("not a call"),
+            }
+        }
+    }
 
     /// A platform that is never the host, so the refusal paths are exercised
     /// the same way whichever OS the suite runs on.
