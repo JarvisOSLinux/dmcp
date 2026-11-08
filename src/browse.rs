@@ -38,6 +38,9 @@ pub struct RegistryServer {
     /// Internal to the browse command; never serialized.
     #[serde(skip)]
     pub registry_manifest_sha256: Option<String>,
+    /// Registry-recorded hash of the setup script this host runs; same use.
+    #[serde(skip)]
+    pub registry_setup_sha256: Option<String>,
     /// Platforms the registry vouches for. Absent means unrestricted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<String>>,
@@ -226,6 +229,7 @@ fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> R
         keywords,
         update_available: None,
         registry_manifest_sha256,
+        registry_setup_sha256: crate::update::setup_hash(server),
         platforms,
         unsupported_on_host,
         platforms_malformed,

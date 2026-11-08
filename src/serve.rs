@@ -584,6 +584,7 @@ mod tests {
     fn entry(trust: &str, hash: &str) -> RegistryEntryInfo {
         RegistryEntryInfo {
             manifest_sha256: Some(hash.to_string()),
+            setup_sha256: None,
             trust_status: trust.to_string(),
             platforms: PlatformDecl::Absent,
         }
@@ -592,7 +593,7 @@ mod tests {
     #[test]
     fn revoked_server_is_never_refreshed() {
         let e = entry("removed", "NEW");
-        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        let a = assess("s", Some("OLD".into()), None, Some(&e), Scope::User);
         match update_decision(&a) {
             UpdateDecision::Disowned(msg) => {
                 assert!(msg.contains("REVOKED"), "{msg}");
@@ -607,7 +608,7 @@ mod tests {
 
     #[test]
     fn server_gone_from_the_registry_is_not_refreshed() {
-        let a = assess("s", Some("OLD".into()), None, Scope::User);
+        let a = assess("s", Some("OLD".into()), None, None, Scope::User);
         match update_decision(&a) {
             UpdateDecision::Disowned(msg) => assert!(msg.contains("uninstall_server"), "{msg}"),
             other => panic!("nothing upstream to refresh from: {other:?}"),
@@ -617,7 +618,7 @@ mod tests {
     #[test]
     fn deprecated_server_updates_with_a_warning() {
         let e = entry("deprecated", "NEW");
-        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        let a = assess("s", Some("OLD".into()), None, Some(&e), Scope::User);
         match update_decision(&a) {
             UpdateDecision::Refresh { warning } => assert!(
                 warning.is_some_and(|w| w.contains("deprecated")),
@@ -630,7 +631,7 @@ mod tests {
     #[test]
     fn official_server_updates_without_a_warning() {
         let e = entry("official", "NEW");
-        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        let a = assess("s", Some("OLD".into()), None, Some(&e), Scope::User);
         assert!(matches!(
             update_decision(&a),
             UpdateDecision::Refresh { warning: None }
@@ -640,7 +641,7 @@ mod tests {
     #[test]
     fn matching_hashes_are_a_no_op() {
         let e = entry("official", "SAME");
-        let a = assess("s", Some("SAME".into()), Some(&e), Scope::User);
+        let a = assess("s", Some("SAME".into()), None, Some(&e), Scope::User);
         assert!(matches!(update_decision(&a), UpdateDecision::UpToDate));
     }
 
@@ -650,12 +651,13 @@ mod tests {
     fn a_host_the_registry_does_not_vouch_for_is_refused() {
         let e = RegistryEntryInfo {
             manifest_sha256: Some("NEW".into()),
+            setup_sha256: None,
             trust_status: "official".into(),
             platforms: PlatformDecl::Declared(
                 vec![crate::platform::foreign_platform().to_string()],
             ),
         };
-        let a = assess("s", Some("OLD".into()), Some(&e), Scope::User);
+        let a = assess("s", Some("OLD".into()), None, Some(&e), Scope::User);
         match update_decision(&a) {
             UpdateDecision::Refuse(msg) => assert!(msg.contains("--ignore-platform"), "{msg}"),
             other => panic!("an unvouched host must refuse on the agent path: {other:?}"),

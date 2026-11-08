@@ -33,7 +33,6 @@ pub enum CallError {
     RemoteNotSupported(String),
     ConnectionFailed(String),
     ToolCallFailed(String),
-    CredentialRequired(Box<crate::accounts::CredentialRequired>),
 }
 
 impl std::fmt::Display for CallError {
@@ -81,10 +80,6 @@ impl std::fmt::Display for CallError {
             }
             CallError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
             CallError::ToolCallFailed(e) => write!(f, "Tool call failed: {}", e),
-            // The machine line rides along on its own line wherever this error
-            // is printed — CLI stderr, a broker reply, a `dmcp serve` tool
-            // error — so a caller can match it without parsing the prose.
-            CallError::CredentialRequired(c) => write!(f, "{}\n{}", c, c.machine_line()),
         }
     }
 }
@@ -650,25 +645,16 @@ pub fn resolve_stdio_install_dir(paths: &Paths, manifest: &Manifest, id: &str) -
 /// directory, and config-derived env. Factored out of the one-shot call path so
 /// the session broker spawns servers with byte-identical semantics; the one-shot
 /// and session paths must not drift in how a server is launched.
-pub async fn build_stdio_command(
+pub fn build_stdio_command(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
     command: &str,
     args: Option<&[String]>,
-    credentials: Credentials,
 ) -> Result<Command, CallError> {
     let install_dir =
         resolve_stdio_install_dir(paths, manifest, id).ok_or(CallError::NoStdioTransport)?;
-    let mut env = config_to_env(&manifest.config);
-    match (
-        credentials_for_spawn(paths, id, manifest).await,
-        credentials,
-    ) {
-        (Ok(injected), _) => env.extend(injected),
-        (Err(CallError::CredentialRequired(_)), Credentials::BestEffort) => {}
-        (Err(e), _) => return Err(e),
-    }
+    let env = config_to_env(manifest);
     let mut cmd = Command::new(resolve_launch_command(command)?);
     let args: Vec<&str> = args
         .map(|a| a.iter().map(String::as_str).collect())
@@ -694,33 +680,6 @@ fn resolve_launch_command(command: &str) -> Result<std::path::PathBuf, CallError
 #[cfg(not(windows))]
 fn resolve_launch_command(command: &str) -> Result<std::path::PathBuf, CallError> {
     Ok(std::path::PathBuf::from(command))
-}
-
-/// Whether a server may start without the account its manifest declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Credentials {
-    /// A tool call: refuse with `CredentialRequired` before spawning.
-    Required,
-    /// Listing tools: start without them, so a server can describe itself
-    /// before anyone has signed in.
-    BestEffort,
-}
-
-/// Declared credentials as environment, resolved off the async runtime: the
-/// keyring is a blocking D-Bus call and a refresh is a blocking HTTP request.
-async fn credentials_for_spawn(
-    paths: &Paths,
-    id: &str,
-    manifest: &Manifest,
-) -> Result<std::collections::HashMap<String, OsString>, CallError> {
-    if manifest.credentials.is_empty() {
-        return Ok(Default::default());
-    }
-    let (paths, id, manifest) = (paths.clone(), id.to_string(), manifest.clone());
-    tokio::task::spawn_blocking(move || crate::accounts::credential_env(&paths, &id, &manifest))
-        .await
-        .map_err(|e| CallError::ConnectionFailed(e.to_string()))?
-        .map_err(CallError::CredentialRequired)
 }
 
 /// Call a tool on an installed MCP server.
@@ -781,8 +740,7 @@ async fn call_tool_stdio(
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let cmd =
-        build_stdio_command(paths, manifest, id, command, args, Credentials::Required).await?;
+    let cmd = build_stdio_command(paths, manifest, id, command, args)?;
 
     // Piped instead of rmcp's inherited default: the relay keeps the same live
     // view a caller had under inheritance, and the retained copy lets a failed
@@ -901,8 +859,7 @@ async fn list_tools_stdio(
     command: &str,
     args: Option<&[String]>,
 ) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    let cmd =
-        build_stdio_command(paths, manifest, id, command, args, Credentials::BestEffort).await?;
+    let cmd = build_stdio_command(paths, manifest, id, command, args)?;
 
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
@@ -981,6 +938,44 @@ mod tests {
 
     fn selected(transports: &[Transport]) -> Option<&Transport> {
         crate::transport::select(Some(transports)).ok()
+    }
+
+    #[test]
+    fn a_server_starts_with_only_the_settings_its_manifest_declares() {
+        let manifest = Manifest {
+            install_dir: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            configurable_properties: vec![crate::models::ConfigurableProperty {
+                key: "API_KEY".into(),
+                ..Default::default()
+            }],
+            config: [("API_KEY", "k-1"), ("NODE_OPTIONS", "--import=data:,x")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect(),
+            ..Default::default()
+        };
+        let root = std::env::temp_dir().join("dmcp-unused");
+        let paths = Paths {
+            user_sources: root.join("u.list"),
+            user_install_dir: root.join("u"),
+            system_sources: root.join("s.list"),
+            system_install_dir: root.join("s"),
+            vector_index_dir: root.join("v"),
+        };
+
+        let cmd = build_stdio_command(&paths, &manifest, "srv", "srv", None).unwrap();
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(envs, vec![("API_KEY".to_string(), Some("k-1".to_string()))]);
     }
 
     #[test]

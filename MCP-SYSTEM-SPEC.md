@@ -65,14 +65,6 @@ Default for `$XDG_DATA_HOME`: `~/.local/share`.
 Registries themselves are fetched live on each browse/install — there is no
 registry JSON cache.
 
-### 2.4 Signed-in Accounts
-
-| Path | Purpose |
-|------|---------|
-| `$XDG_CONFIG_HOME/mcp/accounts.json` (beside `sources.list`) | Signed-in accounts (provider, account, scopes, which store holds the token) and grants (server → provider → account). Nothing secret. Mode `0600`. |
-| OS keyring, service `dmcp`, user `<provider>/<account>` | The token: `{access_token, refresh_token?, expires_at?}` |
-| `$XDG_DATA_HOME/mcp/credentials.json` (beside `installed/`) | File fallback for the token when no keyring is available. Mode `0600`. |
-
 **Env overrides:** all paths are overridable via `MCP_USER_SOURCES_PATH`,
 `MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`, `MCP_SYSTEM_INSTALL_DIR`,
 and `MCP_VECTOR_INDEX_DIR` (loaded from `.env` via dotenvy).
@@ -167,7 +159,7 @@ a transport's list governs which command starts the server.
 
 ## 6. Manifest Format
 
-Each installed server has `manifest.json` in its install directory. The manifest is the full server metadata plus runtime config. At spawn time, dmcp injects the manifest's `config` map into the server process as environment variables (key names used verbatim).
+Each installed server has `manifest.json` in its install directory. The manifest is the full server metadata plus runtime config. At spawn time, dmcp injects the manifest's `config` map into the server process as environment variables (key names used verbatim), limited to the keys the manifest declares in `configurableProperties`. `dmcp config set` refuses any other key, and a stored undeclared key is left out at spawn and named on stderr: a key reaches the server as an environment variable, so `NODE_OPTIONS` or `LD_PRELOAD` would be code execution in it.
 
 Structure matches the registry server entry, plus:
 
@@ -255,33 +247,6 @@ Structure matches the registry server entry, plus:
 - `config` holds user-provided values (defaults are not auto-applied)
 - dmcp injects each `config` key/value into the server's environment at spawn
 
-### 6.3.1 Credentials
-
-```json
-"credentials": [
-  { "provider": "github", "scopes": ["repo"], "inject": { "GITHUB_PERSONAL_ACCESS_TOKEN": "access_token" } }
-],
-"login": { "tool": "login" }
-```
-
-- At spawn (one-shot `call`, `run`, and the session broker), dmcp resolves the
-  account granted to this server for each declared provider. It checks the
-  account has the declared scopes, refreshes the token if it expires within
-  60 s, and sets each `inject` key to the named field: `access_token`,
-  `refresh_token`, `client_id` or `account`.
-- A key already present in `config` is never overwritten.
-- If an account can't be delivered, the server is not spawned: `dmcp call` and
-  `dmcp run` exit 3 with a `credential_required: {...}` line on stderr. `reason`
-  is one of `no_account`, `not_granted`, `insufficient_scope`, `expired` or
-  `store_unavailable`.
-- Listing tools spawns without the account, so a server can describe itself
-  before anyone signs in.
-- A malformed `credentials` or `login` value reads as absent; the manifest
-  still loads.
-- Providers (endpoints, public client id, scope catalogue) come from the
-  registry's top-level `providers` map. Their endpoints must be `https`,
-  except on loopback hosts.
-
 ### 6.4 Setup Script
 
 Manifests may carry `setupScript` (a filename inside the server folder for
@@ -341,7 +306,7 @@ A reference implementation should provide at least:
 
 - `spawn_server(id)` — Start the stdio process for a server
   - Working directory: install dir
-  - Environment: inherit from parent, plus each key/value in the manifest `config` object injected as an environment variable (key name used verbatim, e.g. `BRAVE_API_KEY`)
+  - Environment: inherit from parent, plus each key/value in the manifest `config` object whose key `configurableProperties` declares, injected as an environment variable (key name used verbatim, e.g. `BRAVE_API_KEY`)
   - Command + args from primary transport
 
 ### 8.3 Config
@@ -367,7 +332,7 @@ When spawning a stdio server:
 3. Get the primary transport: the first entry in `transports` whose `platforms` include the host (an entry without `platforms` matches every host) with `type == "stdio"`. If no entry covers the host, the invocation fails naming the platforms the manifest declares
 4. `cwd` = `installDir` from manifest (or dir containing manifest.json)
 5. Execute `command` with `args`
-6. Config is delivered via environment variables (the manifest `config` map, keys verbatim)
+6. Config is delivered via environment variables (the manifest `config` map, keys verbatim, declared keys only)
 
 Environment: inherit from parent, plus the injected config variables.
 

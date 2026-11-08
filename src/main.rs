@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag};
 use dmcp::config;
 use dmcp::elevation::{
-    is_elevated, is_system_scope, re_exec_with_pkexec, restore_invoking_user_home,
+    announce_auth_granted, is_elevated, is_system_scope, re_exec_with_pkexec,
+    restore_invoking_user_home,
 };
 use dmcp::manifest_io::{write_manifest_atomic, Readers};
 use dmcp::{
@@ -213,65 +214,6 @@ enum Commands {
         interactive: bool,
     },
 
-    /// Sign in to an account provider (e.g. github) with a one-time code, and
-    /// optionally give the account to a server
-    Login {
-        /// Provider id from the registry (e.g. "github")
-        provider: String,
-
-        /// Give the signed-in account to this installed server
-        #[arg(long = "for", value_name = "SERVER")]
-        for_server: Option<String>,
-
-        /// Extra scopes to request, comma-separated (the server's own are
-        /// always included)
-        #[arg(long, value_delimiter = ',')]
-        scopes: Vec<String>,
-
-        /// One JSON object per line: the code to show, then the result
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Sign out: delete an account's token from this machine and every grant to it
-    Logout {
-        /// Provider id (e.g. "github")
-        provider: String,
-
-        /// Which account, when more than one is signed in
-        #[arg(long)]
-        account: Option<String>,
-
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Give an installed server a signed-in account, or take it away
-    Grant {
-        /// Server ID
-        server: String,
-
-        /// Provider id (e.g. "github")
-        provider: String,
-
-        /// Which account, when more than one is signed in
-        #[arg(long)]
-        account: Option<String>,
-
-        /// Remove the server's access instead
-        #[arg(long)]
-        revoke: bool,
-
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// List signed-in accounts and the servers that may use each
-    Accounts {
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Manage live server sessions (broker-backed stateful servers)
     Session {
         #[command(subcommand)]
@@ -391,8 +333,15 @@ enum ConfigAction {
         /// Config key
         key: String,
 
-        /// Config value
-        value: String,
+        /// Config value (omit with --stdin)
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        value: Option<String>,
+
+        /// Read the value from standard input (a trailing newline is dropped)
+        /// and do not echo it. For secrets: any local user can read a running
+        /// process's command line.
+        #[arg(long)]
+        stdin: bool,
     },
 }
 
@@ -461,141 +410,38 @@ enum SourcesAction {
     },
 }
 
-/// `dmcp call` / `dmcp run` exit status when a server's declared account is
-/// missing: distinct from a tool error (2) and a failure (1), so a caller can
-/// offer a sign-in without reading stderr at all.
-const EXIT_CREDENTIAL_REQUIRED: i32 = 3;
-
-fn fail_json(json: bool, e: &dmcp::login::LoginError) -> ! {
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"type": "result", "status": e.status(), "message": e.to_string()})
-        );
-    } else {
-        eprintln!("Error: {}", e);
+/// The value for `config set --stdin`: all of stdin, less one trailing newline.
+fn read_value_from_stdin() -> String {
+    use std::io::Read;
+    let mut value = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut value) {
+        eprintln!("Error: could not read the value from stdin: {e}");
+        std::process::exit(1);
     }
-    std::process::exit(1);
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
 }
 
-fn cmd_login(
-    paths: &Paths,
-    provider: &str,
-    for_server: Option<&str>,
-    scopes: &[String],
-    json: bool,
-) {
-    use std::io::Write;
-    let mut on_code = |code: &dmcp::login::DeviceCode| {
-        if json {
-            let mut event = serde_json::to_value(code).expect("plain data serializes");
-            event["type"] = serde_json::json!("device_code");
-            println!("{}", event);
-        } else {
-            println!(
-                "To sign in to {}, open {} and enter the code: {}",
-                code.provider_name, code.verification_uri, code.user_code
-            );
-            println!(
-                "Waiting for you to approve (the code expires in {}s)...",
-                code.expires_in
-            );
-        }
-        // A caller reading line by line must see the code before we block on it.
-        let _ = std::io::stdout().flush();
-    };
-    match dmcp::login::login(paths, provider, scopes, for_server, &mut on_code) {
-        Ok(outcome) => {
-            if json {
-                let mut event = serde_json::to_value(&outcome).expect("plain data serializes");
-                event["type"] = serde_json::json!("result");
-                event["status"] = serde_json::json!("signed_in");
-                println!("{}", event);
+fn set_config_or_exit(paths: &Paths, id: &str, key: &str, value: &str, quiet_value: bool) {
+    match set_config_value(paths, id, key, value) {
+        Ok(()) if quiet_value => println!("Set {key}"),
+        Ok(()) => println!("Set {key} = {value}"),
+        Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
+            if is_system_scope(&manifest_path, paths.system_install_dir()) {
+                re_exec_with_pkexec();
             } else {
-                println!(
-                    "Signed in to {} as {} (scopes: {}).",
-                    outcome.provider,
-                    outcome.account,
-                    if outcome.scopes.is_empty() {
-                        "none".to_string()
-                    } else {
-                        outcome.scopes.join(", ")
-                    }
-                );
-                if let Some(server) = &outcome.granted_to {
-                    println!("{} can now use this account.", server);
-                }
-            }
-            if let Some(warning) = &outcome.warning {
-                eprintln!("Warning: {}", warning);
+                eprintln!("Error: Failed to write manifest (permission denied)");
+                std::process::exit(1);
             }
         }
-        Err(e) => fail_json(json, &e),
-    }
-}
-
-/// After an install, name the sign-in a server needs, so its first call does
-/// not have to be the thing that says so.
-fn print_sign_in_hint(paths: &Paths, id: &str) {
-    if let Some((manifest, _)) = dmcp::get_server(paths, id) {
-        for decl in &manifest.credentials {
-            println!(
-                "{} works in your {} account. Sign in with: dmcp login {} --for {}",
-                id, decl.provider, decl.provider, id
-            );
-        }
-    }
-}
-
-fn cmd_accounts(paths: &Paths, json: bool) {
-    let index = match dmcp::accounts::load_accounts(paths) {
-        Ok(i) => i,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
-        }
-    };
-    let rows: Vec<serde_json::Value> = index
-        .accounts
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "provider": a.provider,
-                "account": a.account,
-                "scopes": a.scopes,
-                "store": a.store,
-                "signed_in_at": a.signed_in_at,
-                "granted_to": index.granted_servers(&a.provider, &a.account),
-            })
-        })
-        .collect();
-    if json {
-        println!("{}", serde_json::json!({ "accounts": rows }));
-        return;
-    }
-    if index.accounts.is_empty() {
-        println!("No accounts signed in. Sign in with: dmcp login <provider> [--for <server>]");
-        return;
-    }
-    for a in &index.accounts {
-        println!(
-            "{}  {}  scopes: {}  store: {}",
-            a.provider,
-            a.account,
-            if a.scopes.is_empty() {
-                "none".to_string()
-            } else {
-                a.scopes.join(",")
-            },
-            a.store
-        );
-        let servers = index.granted_servers(&a.provider, &a.account);
-        if servers.is_empty() {
-            println!("  not given to any server");
-        } else {
-            for s in servers {
-                println!("  used by {}", s);
-            }
         }
     }
 }
@@ -606,6 +452,7 @@ fn main() {
     // HOME from PKEXEC_UID so config resolution reads their sources.list, not
     // /root's (issue #52). set_var is process-global — sound only single-threaded.
     restore_invoking_user_home();
+    announce_auth_granted();
 
     // A delegated elevation re-exec carries an internal flag (pkexec/sudo strip
     // the environment, so it cannot ride an env var): if present, this is the
@@ -676,21 +523,25 @@ fn main() {
             }
         },
         Commands::Config { id, action } => match action {
-            ConfigAction::Set { key, value } => match set_config_value(&paths, &id, &key, &value) {
-                Ok(()) => println!("Set {} = {}", key, value),
-                Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
-                    if is_system_scope(&manifest_path, paths.system_install_dir()) {
-                        re_exec_with_pkexec();
-                    } else {
-                        eprintln!("Error: Failed to write manifest (permission denied)");
-                        std::process::exit(1);
+            ConfigAction::Set { key, value, stdin } => {
+                let value = match value {
+                    Some(value) => value,
+                    None => {
+                        // A system-scope manifest is written as root. Elevate
+                        // before reading: the re-exec'd copy reads stdin, which
+                        // this process would otherwise already have consumed.
+                        if !is_elevated() {
+                            if let Some(path) = dmcp::get_manifest_path(&paths, &id) {
+                                if is_system_scope(&path, paths.system_install_dir()) {
+                                    re_exec_with_pkexec();
+                                }
+                            }
+                        }
+                        read_value_from_stdin()
                     }
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            },
+                };
+                set_config_or_exit(&paths, &id, &key, &value, stdin)
+            }
             ConfigAction::Get { key, json } => match get_server(&paths, &id) {
                 Some((manifest, _)) => {
                     if let Some(k) = key {
@@ -819,10 +670,7 @@ fn main() {
                     run_setup,
                     ignore_platform,
                 ) {
-                    Ok(id) => {
-                        println!("Installed {}", id);
-                        print_sign_in_hint(&paths, &id);
-                    }
+                    Ok(id) => println!("Installed {}", id),
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
@@ -862,10 +710,7 @@ fn main() {
                     re_exec_with_pkexec();
                 }
                 match install(&paths, &id, scope, Some(server), run_setup, ignore_platform) {
-                    Ok(()) => {
-                        println!("Installed {}", id);
-                        print_sign_in_hint(&paths, &id);
-                    }
+                    Ok(()) => println!("Installed {}", id),
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
@@ -876,10 +721,6 @@ fn main() {
         Commands::Run { id, verbose } => match run(&paths, &id, verbose) {
             Ok(()) => {}
             Err(dmcp::run::RunError::ProcessExited(code)) => std::process::exit(code),
-            Err(e @ dmcp::run::RunError::CredentialRequired(_)) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(EXIT_CREDENTIAL_REQUIRED);
-            }
             Err(e) => {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -1230,10 +1071,6 @@ fn main() {
                             std::process::exit(2);
                         }
                     }
-                    Err(e @ call::CallError::CredentialRequired(_)) => {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(EXIT_CREDENTIAL_REQUIRED);
-                    }
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
@@ -1280,73 +1117,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Login {
-            provider,
-            for_server,
-            scopes,
-            json,
-        } => cmd_login(&paths, &provider, for_server.as_deref(), &scopes, json),
-        Commands::Logout {
-            provider,
-            account,
-            json,
-        } => match dmcp::login::logout(&paths, &provider, account.as_deref()) {
-            Ok(record) => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"status": "signed_out", "provider": record.provider, "account": record.account})
-                    );
-                } else {
-                    println!(
-                        "Signed out of {} ({}). The token is deleted from this machine; it stays \
-                         valid at the provider until you revoke the app there.",
-                        record.provider, record.account
-                    );
-                }
-            }
-            Err(e) => fail_json(json, &e),
-        },
-        Commands::Grant {
-            server,
-            provider,
-            account,
-            revoke,
-            json,
-        } => {
-            if revoke {
-                match dmcp::login::revoke(&paths, &server, &provider) {
-                    Ok(removed) => {
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::json!({"status": if removed {"revoked"} else {"none"}, "server": server, "provider": provider})
-                            );
-                        } else if removed {
-                            println!("{} no longer has {} access.", server, provider);
-                        } else {
-                            println!("{} had no {} access to revoke.", server, provider);
-                        }
-                    }
-                    Err(e) => fail_json(json, &e),
-                }
-            } else {
-                match dmcp::login::grant(&paths, &server, &provider, account.as_deref()) {
-                    Ok(account) => {
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::json!({"status": "granted", "server": server, "provider": provider, "account": account})
-                            );
-                        } else {
-                            println!("Gave {} the {} account {}.", server, provider, account);
-                        }
-                    }
-                    Err(e) => fail_json(json, &e),
-                }
-            }
-        }
-        Commands::Accounts { json } => cmd_accounts(&paths, json),
         Commands::Serve => {
             if let Err(e) = dmcp::serve::run(&paths) {
                 eprintln!("Error: {}", e);
@@ -1479,12 +1249,19 @@ fn main() {
                 (user || !system, system || !user)
             };
             let installed = list_servers(&paths, include_user, include_system, false);
-            let installed_hashes: std::collections::HashMap<String, Option<String>> = installed
+            let installed_hashes: std::collections::HashMap<
+                String,
+                (Option<String>, Option<String>),
+            > = installed
                 .iter()
                 .map(|s| {
+                    let path = std::path::Path::new(&s.manifest_path);
                     (
                         s.id.clone(),
-                        dmcp::update::read_installed_hash(std::path::Path::new(&s.manifest_path)),
+                        (
+                            dmcp::update::read_installed_hash(path),
+                            dmcp::update::read_installed_setup_hash(path),
+                        ),
                     )
                 })
                 .collect();
@@ -1495,12 +1272,18 @@ fn main() {
                 s.installed = installed_ids.contains(&s.id);
                 // Flag drift only for installed servers whose registry entry
                 // records a manifest hash to compare against.
-                if s.installed {
-                    if let Some(reg) = s.registry_manifest_sha256.clone() {
-                        let inst = installed_hashes.get(&s.id).cloned().flatten();
-                        s.update_available =
-                            Some(dmcp::update::is_drifted(inst.as_deref(), Some(&reg)));
-                    }
+                if s.installed && s.registry_manifest_sha256.is_some() {
+                    let (manifest, setup) =
+                        installed_hashes.get(&s.id).cloned().unwrap_or_default();
+                    s.update_available = Some(
+                        dmcp::update::is_drifted(
+                            manifest.as_deref(),
+                            s.registry_manifest_sha256.as_deref(),
+                        ) || dmcp::update::is_drifted(
+                            setup.as_deref(),
+                            s.registry_setup_sha256.as_deref(),
+                        ),
+                    );
                 }
             }
             servers = filter_servers_by_keywords(servers, &keyword);
@@ -1928,14 +1711,18 @@ fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
             actionable = true;
         } else if a.report.update_available {
             println!("{}: update available", id);
-            println!(
-                "        installed: {}",
-                a.report.installed_hash.as_deref().unwrap_or("(none)")
-            );
-            println!(
-                "        registry:  {}",
-                a.report.registry_hash.as_deref().unwrap_or("(none)")
-            );
+            if a.report.installed_hash == a.report.registry_hash {
+                println!("        the manifest is unchanged; its setup script changed");
+            } else {
+                println!(
+                    "        installed: {}",
+                    a.report.installed_hash.as_deref().unwrap_or("(none)")
+                );
+                println!(
+                    "        registry:  {}",
+                    a.report.registry_hash.as_deref().unwrap_or("(none)")
+                );
+            }
             actionable = true;
         } else {
             println!("{}: up to date", id);

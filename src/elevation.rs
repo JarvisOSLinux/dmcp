@@ -20,6 +20,39 @@ pub fn is_elevated() -> bool {
     false
 }
 
+/// Written to stderr just before the polkit prompt is raised. dispatch streams a
+/// task's stderr into its live tail, so this line is how JARVIS (and the phone,
+/// app and TUI) can tell "waiting for a password nobody has typed" from "running"
+/// (Project-JARVIS#310). Keep the wording in step with the matcher in
+/// Project-JARVIS `jarvis/runtime/root_actions.py`.
+pub const AUTH_WAITING_NOTICE: &str =
+    "dmcp: waiting for the administrator password on the computer running JARVIS (polkit prompt)";
+
+/// Written to stderr by the re-exec'd root process once polkit has accepted the
+/// password. It ends the wait that [`AUTH_WAITING_NOTICE`] began.
+pub const AUTH_GRANTED_NOTICE: &str = "dmcp: administrator password accepted, running as root";
+
+/// True for the root half of a pkexec re-exec: euid 0 with the caller's uid in
+/// `PKEXEC_UID`. A dmcp deliberately started as root has no `PKEXEC_UID` and
+/// stays quiet.
+#[cfg(target_os = "linux")]
+pub fn is_pkexec_reexec(euid: u32, pkexec_uid: Option<&str>) -> bool {
+    euid == 0 && pkexec_uid.is_some_and(|u| u.parse::<u32>().is_ok())
+}
+
+/// Announce on stderr that polkit accepted the password. No-op unless this
+/// process is the root half of a pkexec re-exec.
+#[cfg(target_os = "linux")]
+pub fn announce_auth_granted() {
+    let euid = nix::unistd::geteuid().as_raw();
+    if is_pkexec_reexec(euid, std::env::var("PKEXEC_UID").ok().as_deref()) {
+        eprintln!("{}", AUTH_GRANTED_NOTICE);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn announce_auth_granted() {}
+
 /// Returns true if the path is under the system install directory.
 pub fn is_system_scope(path: &Path, system_install_dir: &Path) -> bool {
     path.starts_with(system_install_dir)
@@ -114,6 +147,8 @@ pub fn restore_invoking_user_home() {}
 #[cfg(target_os = "linux")]
 pub fn re_exec_with_pkexec() -> ! {
     let (exe, args) = current_exe_and_args();
+
+    eprintln!("{}", AUTH_WAITING_NOTICE);
 
     let mut cmd = process::Command::new("pkexec");
     cmd.arg(&exe).args(&args);
@@ -307,5 +342,22 @@ mod tests {
             restored_home(0, Some("not-a-uid"), |_| Some("/home/x".into())),
             None
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_the_root_half_of_a_pkexec_reexec_announces() {
+        assert!(is_pkexec_reexec(0, Some("1000")));
+        assert!(!is_pkexec_reexec(0, None));
+        assert!(!is_pkexec_reexec(1000, Some("1000")));
+        assert!(!is_pkexec_reexec(0, Some("not-a-uid")));
+    }
+
+    #[test]
+    fn the_notices_are_distinct_single_lines() {
+        for n in [AUTH_WAITING_NOTICE, AUTH_GRANTED_NOTICE] {
+            assert!(!n.contains('\n'));
+        }
+        assert_ne!(AUTH_WAITING_NOTICE, AUTH_GRANTED_NOTICE);
     }
 }
