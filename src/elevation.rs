@@ -24,7 +24,7 @@ pub fn is_elevated() -> bool {
 /// task's stderr into its live tail, so this line is how JARVIS (and the phone,
 /// app and TUI) can tell "waiting for a password nobody has typed" from "running"
 /// (Project-JARVIS#310). Keep the wording in step with the matcher in
-/// Project-JARVIS `jarvis/runtime/root_actions.py`.
+/// Project-JARVIS `jarvis/runtime/password_wait.py`.
 pub const AUTH_WAITING_NOTICE: &str =
     "dmcp: waiting for the administrator password on the computer running JARVIS (polkit prompt)";
 
