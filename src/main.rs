@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag};
 use dmcp::config;
 use dmcp::elevation::{
-    is_elevated, is_system_scope, re_exec_with_pkexec, restore_invoking_user_home,
+    announce_auth_granted, is_elevated, is_system_scope, re_exec_with_pkexec,
+    restore_invoking_user_home,
 };
 use dmcp::manifest_io::{write_manifest_atomic, Readers};
 use dmcp::{
@@ -458,6 +459,7 @@ fn main() {
     // HOME from PKEXEC_UID so config resolution reads their sources.list, not
     // /root's (issue #52). set_var is process-global — sound only single-threaded.
     restore_invoking_user_home();
+    announce_auth_granted();
 
     // A delegated elevation re-exec carries an internal flag (pkexec/sudo strip
     // the environment, so it cannot ride an env var): if present, this is the
