@@ -906,6 +906,16 @@ fn main() {
             }
         }
         Commands::Setup { id } => {
+            // A system-scope server's files are root's: its setup script (a
+            // chmod, a pip install into its dir) and the timestamp written
+            // back into its manifest both need root, as uninstall does.
+            if !is_elevated() {
+                if let Some(path) = discovery::get_manifest_path(&paths, &id) {
+                    if is_system_scope(&path, paths.system_install_dir()) {
+                        re_exec_elevated();
+                    }
+                }
+            }
             match get_server(&paths, &id) {
                 Some((manifest, _)) => {
                     let setup_script = manifest.setup_script_for_host(dmcp::host_platform());
