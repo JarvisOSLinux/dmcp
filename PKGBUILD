@@ -7,6 +7,7 @@ url='https://github.com/JarvisOSLinux/dmcp'
 license=('GPL-3.0-only')
 arch=('x86_64' 'armv6h' 'armv7h' 'aarch64')
 makedepends=('cargo')
+options=('!lto')
 depends=('gcc-libs')
 optdepends=('polkit: for system-scope operations (pkexec)')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgver.tar.gz")
