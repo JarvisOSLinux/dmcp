@@ -1,11 +1,11 @@
 //! dmcp - MCP Manager CLI
 
 use clap::{Parser, Subcommand};
-use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag};
+use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag, strip_internal_flag};
 use dmcp::config;
 use dmcp::elevation::{
-    announce_auth_granted, is_elevated, is_system_scope, re_exec_with_pkexec,
-    restore_invoking_user_home,
+    announce_auth_granted, is_elevated, is_system_scope, re_exec_elevated,
+    restore_invoking_user_home, SUDO_REEXEC_FLAG,
 };
 use dmcp::manifest_io::{write_manifest_atomic, Readers};
 use dmcp::{
@@ -433,7 +433,7 @@ fn set_config_or_exit(paths: &Paths, id: &str, key: &str, value: &str, quiet_val
         Ok(()) => println!("Set {key} = {value}"),
         Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
             if is_system_scope(&manifest_path, paths.system_install_dir()) {
-                re_exec_with_pkexec();
+                re_exec_elevated();
             } else {
                 eprintln!("Error: Failed to write manifest (permission denied)");
                 std::process::exit(1);
@@ -451,8 +451,12 @@ fn main() {
     // re-exec lands here with HOME reset to root's; restore the invoking user's
     // HOME from PKEXEC_UID so config resolution reads their sources.list, not
     // /root's (issue #52). set_var is process-global — sound only single-threaded.
-    restore_invoking_user_home();
-    announce_auth_granted();
+    // Read before anything else too, without touching the environment: whether
+    // this is the root half of our own sudo re-exec, the only case SUDO_UID
+    // names the user who asked.
+    let (raw_args, by_sudo) = strip_internal_flag(std::env::args_os().collect(), SUDO_REEXEC_FLAG);
+    restore_invoking_user_home(by_sudo);
+    announce_auth_granted(by_sudo);
 
     // A delegated elevation re-exec carries an internal flag (pkexec/sudo strip
     // the environment, so it cannot ride an env var): if present, this is the
@@ -460,8 +464,7 @@ fn main() {
     // the parent watches for, then strip the flag so clap never sees it (#51).
     // args_os() rather than args() so a non-UTF-8 argv element passes through
     // instead of panicking the process before clap can handle it.
-    let (raw_args, delegated_authenticated) =
-        strip_elevation_sentinel_flag(std::env::args_os().collect());
+    let (raw_args, delegated_authenticated) = strip_elevation_sentinel_flag(raw_args);
     if delegated_authenticated {
         emit_elevation_sentinel();
     }
@@ -533,7 +536,7 @@ fn main() {
                         if !is_elevated() {
                             if let Some(path) = dmcp::get_manifest_path(&paths, &id) {
                                 if is_system_scope(&path, paths.system_install_dir()) {
-                                    re_exec_with_pkexec();
+                                    re_exec_elevated();
                                 }
                             }
                         }
@@ -611,7 +614,7 @@ fn main() {
                 };
                 // System scope needs root for create_dir + write; re-exec upfront
                 if scope == dmcp::SourceScope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match add_source(&paths, &url, scope) {
                     Ok(()) => println!("Added {}", url),
@@ -629,7 +632,7 @@ fn main() {
                 };
                 // System scope needs root; re-exec upfront
                 if scope == dmcp::SourceScope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match remove_source(&paths, &url, scope) {
                     Ok(()) => println!("Removed {}", url),
@@ -656,7 +659,7 @@ fn main() {
                     dmcp::discovery::Scope::User
                 };
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match connect(
                     &paths,
@@ -707,7 +710,7 @@ fn main() {
                     scope_from_registry_server(&server)
                 };
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match install(&paths, &id, scope, Some(server), run_setup, ignore_platform) {
                     Ok(()) => println!("Installed {}", id),
@@ -729,7 +732,7 @@ fn main() {
         Commands::Uninstall { id } => {
             if let Some((_, _, scope)) = discovery::get_uninstall_info(&paths, &id) {
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
             }
             match uninstall(&paths, &id) {
@@ -847,7 +850,7 @@ fn main() {
                         );
                         continue;
                     }
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
 
                 match dmcp::update::refresh_install(&paths, id, a.scope, ignore_platform) {
@@ -879,7 +882,7 @@ fn main() {
                 dmcp::discovery::Scope::User
             };
             if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                re_exec_with_pkexec();
+                re_exec_elevated();
             }
             let config_ref: Vec<(String, String)> = config.to_vec();
             let run_setup = !no_setup;

@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::discovery::{get_manifest_path, get_server, Scope};
-use crate::elevation::{is_elevated, re_exec_with_pkexec};
+use crate::elevation::{is_elevated, re_exec_elevated};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 use crate::run::config_to_env;
@@ -113,11 +113,11 @@ fn needs_system_elevation(scope: Scope, selected: Option<&Transport>, elevated: 
 /// Set on a child spawned purely to elevate, so it can never spawn another.
 /// If pkexec failed in the child, the answer is the refusal, not a second
 /// attempt — without this a denial would recurse until the box gave out.
-/// `pub(crate)` so `elevation::re_exec_with_pkexec` can gate the delegation
+/// `pub(crate)` so `elevation::re_exec_elevated` can gate the delegation
 /// sentinel flag on it (see below).
 pub(crate) const DELEGATED_ENV: &str = "DMCP_ELEVATION_DELEGATED";
 
-/// Argv flag `re_exec_with_pkexec` appends when re-execing a *delegated*
+/// Argv flag `re_exec_elevated` appends when re-execing a *delegated*
 /// elevation, so the now-root process announces (via `emit_elevation_sentinel`)
 /// that it is past authentication. pkexec/sudo strip the environment, so this
 /// hand-off cannot ride an env var — it rides the argv, and `main` strips it
@@ -140,11 +140,16 @@ pub const ELEVATION_SENTINEL: &str = "\u{1}dmcp:elevation-authenticated\u{1}\n";
 /// so a non-UTF-8 argv element passes through untouched instead of panicking,
 /// as clap's own `args_os()` parsing would tolerate it.
 pub fn strip_elevation_sentinel_flag(args: Vec<OsString>) -> (Vec<OsString>, bool) {
+    strip_internal_flag(args, ELEVATION_SENTINEL_FLAG)
+}
+
+/// Remove an internal argv flag, reporting whether it was present.
+pub fn strip_internal_flag(args: Vec<OsString>, flag: &str) -> (Vec<OsString>, bool) {
     let mut found = false;
     let kept: Vec<OsString> = args
         .into_iter()
         .filter(|a| {
-            if a.as_os_str() == OsStr::new(ELEVATION_SENTINEL_FLAG) {
+            if a.as_os_str() == OsStr::new(flag) {
                 found = true;
                 false
             } else {
@@ -622,7 +627,7 @@ pub fn elevate_call_for_system_scope(paths: &Paths, id: &str) {
     if let Some((manifest, scope)) = get_server(paths, id) {
         let selected = crate::transport::select(manifest.transports.as_deref()).ok();
         if needs_system_elevation(scope, selected, is_elevated()) {
-            re_exec_with_pkexec();
+            re_exec_elevated();
         }
     }
 }

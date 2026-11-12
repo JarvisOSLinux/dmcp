@@ -23,7 +23,7 @@ use std::io;
 use std::process::{Command, Stdio};
 
 use crate::discovery::{get_server, Scope};
-use crate::elevation::{is_elevated, re_exec_with_pkexec};
+use crate::elevation::{is_elevated, re_exec_elevated};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 
@@ -90,7 +90,7 @@ pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
         if let Ok(Transport::Stdio { .. }) =
             crate::transport::select(manifest.transports.as_deref())
         {
-            re_exec_with_pkexec();
+            re_exec_elevated();
         }
     }
 

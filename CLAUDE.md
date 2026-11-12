@@ -127,6 +127,18 @@ statement of `main` (before dotenvy, `Paths::resolve`, and any thread), maps
 `PKEXEC_UID`, so a deliberately-root `dmcp serve` is untouched, and any
 unresolvable uid leaves HOME as-is rather than forcing `/root`.
 
+**sudo instead of pkexec (Project-JARVIS#310).** When `DMCP_SUDO_ASKPASS` names a
+program and that program answers `--check` with success, the re-exec (and the
+`cp`/`rm -rf` of `write_file_elevated`/`remove_dir_elevated`) runs
+`sudo -A -- <program> …` with `SUDO_ASKPASS` set to it, and the waiting notice
+ends "(sudo askpass)" instead of "(polkit prompt)". Anything else (unset, empty,
+missing, failing, not answering) keeps pkexec. It is asked at every elevation,
+so whoever runs the program (JARVIS's password popup) can turn it on and off
+without restarting dmcp. The root half restores HOME from `SUDO_UID` only when
+argv carries `--dmcp-internal-sudo-reexec` (stripped before clap, like the
+sentinel flag): sudo resets the environment, and a `SUDO_UID` alone may come from
+a human's `sudo bash` further up the tree.
+
 `auth_admin_keep` in the policy means one password covers a short window; TLA
 still confirms each privileged command upstream, so informed consent is
 per-command and proof-of-presence is per-window.
@@ -311,6 +323,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-11-11:* elevation may use `sudo -A` with an askpass program instead of pkexec (Project-JARVIS#310): JARVIS asks for the sudo password in jarvis-app and on phones when its `SUDO_PASSWORD_POPUP` is on, since polkit's dialog shows only on the host's desktop. `elevation::elevating` picks sudo when `DMCP_SUDO_ASKPASS` answers `--check`, pkexec otherwise, for the re-exec and the elevated `cp`/`rm`; `re_exec_with_pkexec` is now `re_exec_elevated`. `invoking_uid` reads `PKEXEC_UID`, or `SUDO_UID` behind the new internal flag. Tests: the HOME policy for both, a foreign `SUDO_UID` ignored, and pkexec kept for an unset, empty, missing or refusing askpass program.
 
 *2026-10-19:* a setup script can read its own `manifest.json`. `install` (and `update`, which reuses it) wrote the manifest only after the setup script ran, into a directory it had just recreated, so the registry's remote-server setup template, which reads `./manifest.json` for config and transport URLs, failed on every install and update (hello-sse). The manifest is now written before the script runs, as `connect` already did, and again afterwards with the setup's outcome. Test: a setup script that requires `installDir` in `./manifest.json` installs cleanly.
 
