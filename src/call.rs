@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::discovery::{get_manifest_path, get_server, Scope};
-use crate::elevation::{is_elevated, re_exec_elevated};
+use crate::elevation::{is_elevated, re_exec_elevated, AUTH_WAITING_NOTICE_SUDO};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 use crate::run::config_to_env;
@@ -29,6 +29,8 @@ pub enum CallError {
     NoStdioTransport,
     SystemScopeRequiresElevation(String),
     ElevationFailed(String, String),
+    /// [`CallError::ElevationFailed`] when the child elevated with `sudo -A`.
+    SudoElevationFailed(String, String),
     ElevationTimedOut(String, u64),
     RemoteNotSupported(String),
     ConnectionFailed(String),
@@ -61,6 +63,16 @@ impl std::fmt::Display for CallError {
                  of the README). That rule lives in root-owned \
                  /etc/polkit-1/rules.d/, so an agent cannot install it for \
                  itself — which is the point.",
+                id,
+                detail.trim()
+            ),
+            CallError::SudoElevationFailed(id, detail) => write!(
+                f,
+                "Elevation for system-scope server '{}' through sudo was not \
+                 granted: {}. sudo asked for the password through the askpass \
+                 program in DMCP_SUDO_ASKPASS (JARVIS's password popup); the \
+                 request was cancelled or refused there, or sudo did not accept \
+                 the password.",
                 id,
                 detail.trim()
             ),
@@ -471,6 +483,9 @@ fn result_from_cli_exit(
         Some(0) => Ok(CallToolResult::success(vec![Content::text(stdout)])),
         Some(2) => Ok(CallToolResult::error(vec![Content::text(stdout)])),
         _ => {
+            // The child names the program it elevates with before it asks
+            // (`elevation::re_exec_elevated`).
+            let by_sudo = stderr.contains(AUTH_WAITING_NOTICE_SUDO);
             let detail = if stderr.trim().is_empty() {
                 match code {
                     Some(c) => format!("elevation helper exited with status {}", c),
@@ -479,7 +494,11 @@ fn result_from_cli_exit(
             } else {
                 stderr
             };
-            Err(CallError::ElevationFailed(id.to_string(), detail))
+            Err(if by_sudo {
+                CallError::SudoElevationFailed(id.to_string(), detail)
+            } else {
+                CallError::ElevationFailed(id.to_string(), detail)
+            })
         }
     }
 }
@@ -1217,6 +1236,23 @@ mod tests {
         // A signal kill still names the server rather than passing for success.
         let killed = result_from_cli_exit(None, String::new(), String::new(), "sys").unwrap_err();
         assert!(killed.to_string().contains("signal"));
+    }
+
+    /// A cancelled or refused `sudo -A` is not polkit's doing: the message
+    /// names the program that asked (Project-JARVIS#310).
+    #[test]
+    fn a_refused_sudo_elevation_names_sudo_not_polkit() {
+        let by_sudo = format!("{}\n", AUTH_WAITING_NOTICE_SUDO);
+        let err = result_from_cli_exit(Some(1), String::new(), by_sudo, "sys").unwrap_err();
+        assert!(matches!(err, CallError::SudoElevationFailed(ref id, _) if id == "sys"));
+        let msg = err.to_string();
+        assert!(msg.contains("through sudo"));
+        assert!(msg.contains("DMCP_SUDO_ASKPASS"));
+        assert!(!msg.contains("polkit"));
+
+        let by_pkexec = format!("{}\n", crate::elevation::AUTH_WAITING_NOTICE);
+        let err = result_from_cli_exit(Some(1), String::new(), by_pkexec, "sys").unwrap_err();
+        assert!(err.to_string().contains("non-active session"));
     }
 
     /// The unanswered-prompt timeout is always positive, so a bad env value
