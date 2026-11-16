@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::discovery::{get_manifest_path, get_server, Scope};
-use crate::elevation::{is_elevated, re_exec_elevated};
+use crate::elevation::{is_elevated, re_exec_elevated, AUTH_WAITING_NOTICE_SUDO};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 use crate::run::config_to_env;
@@ -29,6 +29,8 @@ pub enum CallError {
     NoStdioTransport,
     SystemScopeRequiresElevation(String),
     ElevationFailed(String, String),
+    /// [`CallError::ElevationFailed`] when the child elevated with `sudo -A`.
+    SudoElevationFailed(String, String),
     ElevationTimedOut(String, u64),
     RemoteNotSupported(String),
     ConnectionFailed(String),
@@ -61,6 +63,16 @@ impl std::fmt::Display for CallError {
                  of the README). That rule lives in root-owned \
                  /etc/polkit-1/rules.d/, so an agent cannot install it for \
                  itself — which is the point.",
+                id,
+                detail.trim()
+            ),
+            CallError::SudoElevationFailed(id, detail) => write!(
+                f,
+                "Elevation for system-scope server '{}' through sudo was not \
+                 granted: {}. sudo asked for the password through the askpass \
+                 program in DMCP_SUDO_ASKPASS (JARVIS's password popup); the \
+                 request was cancelled or refused there, or sudo did not accept \
+                 the password.",
                 id,
                 detail.trim()
             ),
@@ -195,6 +207,8 @@ const STDERR_TRUNCATION_MARKER: &str = "[stderr truncated to last 64 KiB]";
 struct RetainedStderr {
     bytes: Vec<u8>,
     truncated: bool,
+    /// The elevation sentinel went by: the child got past authentication.
+    authenticated: bool,
 }
 
 impl RetainedStderr {
@@ -329,6 +343,7 @@ where
                     pending = keep;
                     if found && !fired {
                         fired = true;
+                        retained.authenticated = true;
                         on_authenticated.notify_one();
                     }
                     if !emit.is_empty() {
@@ -460,17 +475,33 @@ fn elevation_timeout_secs() -> u64 {
 
 /// Map the delegated CLI's exit into a tool result, mirroring how `dmcp call`
 /// reports: 0 is success, 2 is a tool-reported error (its status rides the exit
-/// code, never a sentinel in the output), anything else failed to elevate.
+/// code, never a sentinel in the output), anything else failed to elevate —
+/// unless the child got past authentication (`authenticated`, the sentinel
+/// went by), when the server failed as root and the password was not refused.
 fn result_from_cli_exit(
     code: Option<i32>,
     stdout: String,
     stderr: String,
     id: &str,
+    authenticated: bool,
 ) -> Result<CallToolResult, CallError> {
     match code {
         Some(0) => Ok(CallToolResult::success(vec![Content::text(stdout)])),
         Some(2) => Ok(CallToolResult::error(vec![Content::text(stdout)])),
+        _ if authenticated => Err(CallError::ToolCallFailed(format!(
+            "system-scope server '{}' was elevated (the password was accepted), \
+             then failed: {}",
+            id,
+            match code {
+                Some(c) if stderr.trim().is_empty() => format!("exit status {}", c),
+                None if stderr.trim().is_empty() => "killed by a signal".to_string(),
+                _ => stderr.trim().to_string(),
+            }
+        ))),
         _ => {
+            // The child names the program it elevates with before it asks
+            // (`elevation::re_exec_elevated`).
+            let by_sudo = stderr.contains(AUTH_WAITING_NOTICE_SUDO);
             let detail = if stderr.trim().is_empty() {
                 match code {
                     Some(c) => format!("elevation helper exited with status {}", c),
@@ -479,7 +510,11 @@ fn result_from_cli_exit(
             } else {
                 stderr
             };
-            Err(CallError::ElevationFailed(id.to_string(), detail))
+            Err(if by_sudo {
+                CallError::SudoElevationFailed(id.to_string(), detail)
+            } else {
+                CallError::ElevationFailed(id.to_string(), detail)
+            })
         }
     }
 }
@@ -581,6 +616,7 @@ async fn call_tool_elevated(
     };
     tokio::pin!(complete);
 
+    let mut past_auth = false;
     let raw = match wait_for_auth_or_deadline(
         complete.as_mut(),
         &authenticated,
@@ -591,7 +627,10 @@ async fn call_tool_elevated(
         PreAuth::Completed(res) => res,
         // Past authentication: re-authenticating later is acceptable (like
         // sudo), so the command's own runtime is no longer bounded.
-        PreAuth::Authenticated => complete.await,
+        PreAuth::Authenticated => {
+            past_auth = true;
+            complete.await
+        }
         // Genuine auth failure. Returning drops `complete` (releasing its
         // borrow of `child`) and then `child` — kill_on_drop tears down the
         // pkexec/server subtree, save for a detached holder the message warns
@@ -609,6 +648,7 @@ async fn call_tool_elevated(
         String::from_utf8_lossy(&stdout).trim_end().to_string(),
         stderr.detail().unwrap_or_default(),
         id,
+        past_auth || stderr.authenticated,
     )
 }
 
@@ -1194,11 +1234,12 @@ mod tests {
     /// reports it: 0 success, 2 a tool-reported error whose output is preserved.
     #[test]
     fn delegated_exit_code_maps_to_the_tool_result() {
-        let ok = result_from_cli_exit(Some(0), "output".into(), String::new(), "s").unwrap();
+        let ok = result_from_cli_exit(Some(0), "output".into(), String::new(), "s", false).unwrap();
         assert!(!call_is_error(&ok));
         assert_eq!(format_call_result(&ok), "output");
 
-        let tool_err = result_from_cli_exit(Some(2), "boom".into(), String::new(), "s").unwrap();
+        let tool_err =
+            result_from_cli_exit(Some(2), "boom".into(), String::new(), "s", false).unwrap();
         assert!(call_is_error(&tool_err));
         assert_eq!(format_call_result(&tool_err), "boom");
     }
@@ -1207,15 +1248,63 @@ mod tests {
     /// stderr explaining it reaches the caller.
     #[test]
     fn a_denied_elevation_is_reported_not_silently_run() {
-        let err = result_from_cli_exit(Some(127), String::new(), "Not authorized".into(), "sys")
-            .unwrap_err();
+        let err = result_from_cli_exit(
+            Some(127),
+            String::new(),
+            "Not authorized".into(),
+            "sys",
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(err, CallError::ElevationFailed(ref id, _) if id == "sys"));
         let msg = err.to_string();
         assert!(msg.contains("Not authorized"));
         assert!(msg.contains("non-active session"));
 
         // A signal kill still names the server rather than passing for success.
-        let killed = result_from_cli_exit(None, String::new(), String::new(), "sys").unwrap_err();
+        let killed =
+            result_from_cli_exit(None, String::new(), String::new(), "sys", false).unwrap_err();
+        assert!(killed.to_string().contains("signal"));
+    }
+
+    /// A cancelled or refused `sudo -A` is not polkit's doing: the message
+    /// names the program that asked (Project-JARVIS#310).
+    #[test]
+    fn a_refused_sudo_elevation_names_sudo_not_polkit() {
+        let by_sudo = format!("{}\n", AUTH_WAITING_NOTICE_SUDO);
+        let err = result_from_cli_exit(Some(1), String::new(), by_sudo, "sys", false).unwrap_err();
+        assert!(matches!(err, CallError::SudoElevationFailed(ref id, _) if id == "sys"));
+        let msg = err.to_string();
+        assert!(msg.contains("through sudo"));
+        assert!(msg.contains("DMCP_SUDO_ASKPASS"));
+        assert!(!msg.contains("polkit"));
+
+        let by_pkexec = format!("{}\n", crate::elevation::AUTH_WAITING_NOTICE);
+        let err =
+            result_from_cli_exit(Some(1), String::new(), by_pkexec, "sys", false).unwrap_err();
+        assert!(err.to_string().contains("non-active session"));
+    }
+
+    /// The waiting notice is printed before sudo or pkexec asks, so it is in
+    /// stderr after an accepted password too: a server failing as root then is
+    /// not a refused password (the model would ask for it again).
+    #[test]
+    fn a_server_failing_after_elevation_is_not_a_refused_password() {
+        for notice in [
+            AUTH_WAITING_NOTICE_SUDO,
+            crate::elevation::AUTH_WAITING_NOTICE,
+        ] {
+            let stderr = format!("{}\nError: Tool call failed: boom\n", notice);
+            let err =
+                result_from_cli_exit(Some(1), String::new(), stderr, "sys", true).unwrap_err();
+            assert!(matches!(err, CallError::ToolCallFailed(_)), "{:?}", err);
+            let msg = err.to_string();
+            assert!(msg.contains("password was accepted"), "{}", msg);
+            assert!(msg.contains("boom"), "{}", msg);
+            assert!(!msg.contains("not granted"), "{}", msg);
+        }
+        let killed =
+            result_from_cli_exit(None, String::new(), String::new(), "sys", true).unwrap_err();
         assert!(killed.to_string().contains("signal"));
     }
 
@@ -1342,6 +1431,10 @@ mod tests {
         assert!(retained_text.contains("polkit chatter"));
         assert!(retained_text.contains("server output"));
         assert!(!retained_text.contains("dmcp:elevation-authenticated"));
+        assert!(
+            retained.authenticated,
+            "a fast failure after auth still knows it"
+        );
 
         let mut sunk = Vec::new();
         sink_out.read_to_end(&mut sunk).await.unwrap();
@@ -1497,7 +1590,7 @@ mod tests {
     fn complete(bytes: &[u8]) -> RetainedStderr {
         RetainedStderr {
             bytes: bytes.to_vec(),
-            truncated: false,
+            ..Default::default()
         }
     }
 
@@ -1528,6 +1621,7 @@ mod tests {
         let retained = RetainedStderr {
             bytes: b"tail of the flood".to_vec(),
             truncated: true,
+            ..Default::default()
         };
         let err = attach_stderr_detail(CallError::ToolCallFailed("boom".into()), &retained);
         assert!(err.to_string().contains(&format!(
