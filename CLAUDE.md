@@ -71,7 +71,8 @@ src/
 All paths are env-var-overridable before the XDG defaults apply
 (`MCP_USER_SOURCES_PATH`, `MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`,
 `MCP_SYSTEM_INSTALL_DIR`, `MCP_VECTOR_INDEX_DIR`), loaded from `.env` via
-dotenvy.
+dotenvy, except in the root half of an elevation re-exec
+(`elevation::is_root_half`).
 
 **System-scope elevation reaches the agent surface by delegation.** The one-shot
 `dmcp call` re-execs through pkexec before the runtime, so a system-scope
@@ -323,6 +324,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-11-15:* the root half of an elevation re-exec no longer reads `.env`. `main` ran `dotenvy::dotenv()` in every process, and `sudo -A` keeps the caller's working directory, so a `.env` in that directory or a parent set `LD_PRELOAD`, `PATH` or the `MCP_*` paths for root and for the server root spawned. pkexec changes to `/root` first, so only root-owned `.env` files could reach it there, but it is skipped too. `elevation::is_root_half` is the check `announce_auth_granted` already made (euid 0 and `PKEXEC_UID`, or `SUDO_UID` behind `SUDO_REEXEC_FLAG`); a dmcp deliberately started as root still reads `.env`. `tests/dotenv_root_half.rs` runs dmcp as root in a user namespace (`unshare --map-root-user`) with each marker, plus a user run and a marker-less root run that must still load it.
 
 *2026-11-15:* a refused `sudo -A` elevation says so instead of blaming polkit (Project-JARVIS#310). On the delegated path (`call_tool_elevated`), a child that elevated with `sudo -A` and was cancelled or refused (JARVIS's popup kills that sudo on cancel) came back as `ElevationFailed`, whose text explains polkit denying an inactive session. `result_from_cli_exit` now reads the child's own `AUTH_WAITING_NOTICE_SUDO` line and returns `SudoElevationFailed`, which names sudo and the askpass program in `DMCP_SUDO_ASKPASS`; pkexec's text is unchanged. That notice is printed before sudo or pkexec asks, so it is in stderr after an accepted password too; when the elevation sentinel went by (`RetainedStderr::authenticated`, or the `PreAuth::Authenticated` arm), a non-0/2 exit is `ToolCallFailed` "was elevated (the password was accepted), then failed: …" for either program, never a refused password.
 
