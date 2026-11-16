@@ -4,8 +4,9 @@
 //! appends `.exe` to a bare name but never `.cmd` or `.bat`, so spawning `npx`
 //! fails with "program not found" on a machine where it is installed. The
 //! resolution here is a pure function of the command, the two variables and a
-//! file-existence probe, so it is tested on every host; only the call site in
-//! `call.rs` is Windows-only.
+//! file-existence probe, so it is tested on every host; only [`launch_program`],
+//! which `dmcp call`, the session broker and `dmcp run` spawn through, is
+//! Windows-only.
 //!
 //! The result is spawned directly. Rust's `Command` runs a `.cmd`/`.bat`
 //! through `cmd.exe` itself and refuses arguments it cannot escape safely, so
@@ -26,11 +27,23 @@ pub struct NotFound {
 
 impl std::fmt::Display for NotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.searched.is_empty() {
+            return write!(
+                f,
+                "'{}' was not found: PATH is unset or empty",
+                self.command
+            );
+        }
+        let searched: Vec<String> = self
+            .searched
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
         write!(
             f,
-            "'{}' was not found on PATH ({} directories searched) with extensions {}",
+            "'{}' was not found in {} with extensions {}",
             self.command,
-            self.searched.len(),
+            searched.join(", "),
             self.extensions.join(";")
         )
     }
@@ -125,6 +138,24 @@ pub fn resolve_command(
     })
 }
 
+/// The program to spawn for a manifest's launch `command`: the file
+/// [`resolve_command`] finds on Windows, the command as written elsewhere
+/// (exec looks it up on `PATH` itself).
+#[cfg(windows)]
+pub fn launch_program(command: &str) -> Result<PathBuf, NotFound> {
+    resolve_command(
+        command,
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("PATHEXT").as_deref(),
+        |p| p.is_file(),
+    )
+}
+
+#[cfg(not(windows))]
+pub fn launch_program(command: &str) -> Result<PathBuf, NotFound> {
+    Ok(PathBuf::from(command))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,10 +243,7 @@ mod tests {
         let err = resolve_command("ghost", Some(&p), None, files(&[])).unwrap_err();
         assert_eq!(err.searched, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         let msg = err.to_string();
-        assert!(
-            msg.contains("'ghost'") && msg.contains("2 directories"),
-            "{msg}"
-        );
+        assert!(msg.contains("'ghost'") && msg.contains("/a, /b"), "{msg}");
         assert!(msg.contains(".CMD"), "{msg}");
     }
 
@@ -223,5 +251,6 @@ mod tests {
     fn no_path_variable_is_a_miss_not_a_panic() {
         let err = resolve_command("npx", None, None, files(&[])).unwrap_err();
         assert!(err.searched.is_empty());
+        assert!(err.to_string().contains("PATH is unset or empty"), "{err}");
     }
 }

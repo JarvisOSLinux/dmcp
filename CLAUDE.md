@@ -50,6 +50,7 @@ src/
 ├── config.rs         Per-server config get/set
 ├── manifest_io.rs    Atomic, owner-only writes for the manifests that hold server credentials
 ├── run.rs            Spawn stdio servers, print SSE/WS URLs
+├── pathext.rs        Resolve a launch command via PATH + PATHEXT on Windows (call, broker, run)
 ├── setup.rs          Execute setup scripts
 ├── call.rs           Call tools on MCP servers
 ├── serve.rs          Run dmcp as MCP server for LLM integration (incl. `update_server` + drift fields)
@@ -323,6 +324,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-11-15:* `dmcp run` resolves `.cmd`/`.bat` shims on Windows, and a miss names where it looked (gaps left by #66). Only `call::build_stdio_command` (the one-shot call and the broker) went through the PATHEXT resolver; `run::run_stdio` spawned the manifest's command as written, so `dmcp run` of an `npx`/`uvx` server still failed with "Command not found". Both now spawn `pathext::launch_program`, which replaced call.rs's private copy. `NotFound` printed only a count ("2 directories searched"); it now lists the directories, or says PATH is unset or empty. Tests: the message cases on every host, and `run_stdio` launching `srv.cmd` named as `srv` (Windows only; checked locally under wine).
 
 *2026-11-15:* a refused `sudo -A` elevation says so instead of blaming polkit (Project-JARVIS#310). On the delegated path (`call_tool_elevated`), a child that elevated with `sudo -A` and was cancelled or refused (JARVIS's popup kills that sudo on cancel) came back as `ElevationFailed`, whose text explains polkit denying an inactive session. `result_from_cli_exit` now reads the child's own `AUTH_WAITING_NOTICE_SUDO` line and returns `SudoElevationFailed`, which names sudo and the askpass program in `DMCP_SUDO_ASKPASS`; pkexec's text is unchanged. That notice is printed before sudo or pkexec asks, so it is in stderr after an accepted password too; when the elevation sentinel went by (`RetainedStderr::authenticated`, or the `PreAuth::Authenticated` arm), a non-0/2 exit is `ToolCallFailed` "was elevated (the password was accepted), then failed: …" for either program, never a refused password.
 
