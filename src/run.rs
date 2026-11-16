@@ -35,6 +35,7 @@ pub enum RunError {
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
     CommandNotFound(String),
+    NotOnPath(crate::pathext::NotFound),
     SpawnFailed(io::Error),
     ProcessExited(i32),
 }
@@ -50,6 +51,7 @@ impl std::fmt::Display for RunError {
                 "Server has no stdio transport (remote servers: use the printed URL to connect)"
             ),
             RunError::CommandNotFound(cmd) => write!(f, "Command not found: {}", cmd),
+            RunError::NotOnPath(e) => write!(f, "{}", e),
             RunError::SpawnFailed(e) => write!(f, "Failed to spawn process: {}", e),
             RunError::ProcessExited(code) => write!(f, "Process exited with code {}", code),
         }
@@ -121,7 +123,8 @@ fn run_stdio(
         .map(|a| a.iter().map(String::as_str).collect())
         .unwrap_or_default();
 
-    let mut child = match Command::new(command)
+    let program = crate::pathext::launch_program(command).map_err(RunError::NotOnPath)?;
+    let mut child = match Command::new(program)
         .args(&args)
         .current_dir(&install_dir)
         .envs(env)
@@ -195,4 +198,33 @@ fn run_remote(manifest: &Manifest, transport_name: &str, url: &str) -> Result<()
         .unwrap_or(manifest.id.as_deref().unwrap_or("MCP Server"));
     println!("{} is running on {} ({})", name, url, transport_name);
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// A manifest command naming a `.cmd` shim without its extension launches
+    /// under `dmcp run`, as it does under `dmcp call` (#66).
+    #[test]
+    fn run_launches_a_cmd_shim_named_without_its_extension() {
+        let dir = std::env::temp_dir().join(format!("dmcp-run-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("srv.cmd"), "@exit /b 0\r\n").unwrap();
+        let manifest = Manifest {
+            install_dir: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let paths = Paths {
+            user_sources: dir.join("u.list"),
+            user_install_dir: dir.join("u"),
+            system_sources: dir.join("s.list"),
+            system_install_dir: dir.join("s"),
+            vector_index_dir: dir.join("v"),
+        };
+
+        let command = dir.join("srv");
+        let got = run_stdio(&paths, &manifest, "srv", &command.to_string_lossy(), None);
+        assert!(got.is_ok(), "{}", got.unwrap_err());
+    }
 }
