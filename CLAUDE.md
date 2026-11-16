@@ -72,7 +72,8 @@ src/
 All paths are env-var-overridable before the XDG defaults apply
 (`MCP_USER_SOURCES_PATH`, `MCP_USER_INSTALL_DIR`, `MCP_SYSTEM_SOURCES_PATH`,
 `MCP_SYSTEM_INSTALL_DIR`, `MCP_VECTOR_INDEX_DIR`), loaded from `.env` via
-dotenvy.
+dotenvy, except in the root half of an elevation re-exec
+(`elevation::is_root_half`).
 
 **System-scope elevation reaches the agent surface by delegation.** The one-shot
 `dmcp call` re-execs through pkexec before the runtime, so a system-scope
@@ -324,6 +325,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-11-15:* the root half of an elevation re-exec no longer reads `.env`. `main` ran `dotenvy::dotenv()` in every process, and `sudo -A` keeps the caller's working directory, so a `.env` in that directory or a parent set `LD_PRELOAD`, `PATH` or the `MCP_*` paths for root and for the server root spawned. pkexec changes to `/root` first, so only root-owned `.env` files could reach it there, but it is skipped too. `elevation::is_root_half` is the check `announce_auth_granted` already made (euid 0 and `PKEXEC_UID`, or `SUDO_UID` behind `SUDO_REEXEC_FLAG`); a dmcp deliberately started as root still reads `.env`. `tests/dotenv_root_half.rs` runs dmcp as root in a user namespace (`unshare --map-root-user`) with each marker, plus a user run and a marker-less root run that must still load it.
 
 *2026-11-15:* `dmcp run` resolves `.cmd`/`.bat` shims on Windows, and a miss names where it looked (gaps left by #66). Only `call::build_stdio_command` (the one-shot call and the broker) went through the PATHEXT resolver; `run::run_stdio` spawned the manifest's command as written, so `dmcp run` of an `npx`/`uvx` server still failed with "Command not found". Both now spawn `pathext::launch_program`, which replaced call.rs's private copy. `NotFound` printed only a count ("2 directories searched"); it now lists the directories, or says PATH is unset or empty. Tests: the message cases on every host, and `run_stdio` launching `srv.cmd` named as `srv` (Windows only; checked locally under wine).
 

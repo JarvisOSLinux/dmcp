@@ -80,18 +80,25 @@ pub fn is_elevation_reexec(euid: u32, invoking: Option<u32>) -> bool {
     euid == 0 && invoking.is_some()
 }
 
-/// Announce on stderr that the password was accepted. No-op unless this
-/// process is the root half of a re-exec.
+/// True when this process is the root half of its own pkexec or sudo re-exec
+/// (`by_sudo` from [`SUDO_REEXEC_FLAG`]).
 #[cfg(target_os = "linux")]
-pub fn announce_auth_granted(by_sudo: bool) {
-    let euid = nix::unistd::geteuid().as_raw();
-    if is_elevation_reexec(euid, reexec_uid(by_sudo)) {
-        eprintln!("{}", AUTH_GRANTED_NOTICE);
-    }
+pub fn is_root_half(by_sudo: bool) -> bool {
+    is_elevation_reexec(nix::unistd::geteuid().as_raw(), reexec_uid(by_sudo))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn announce_auth_granted(_by_sudo: bool) {}
+pub fn is_root_half(_by_sudo: bool) -> bool {
+    false
+}
+
+/// Announce on stderr that the password was accepted. No-op unless this
+/// process is the root half of a re-exec.
+pub fn announce_auth_granted(by_sudo: bool) {
+    if is_root_half(by_sudo) {
+        eprintln!("{}", AUTH_GRANTED_NOTICE);
+    }
+}
 
 /// Returns true if the path is under the system install directory.
 pub fn is_system_scope(path: &Path, system_install_dir: &Path) -> bool {

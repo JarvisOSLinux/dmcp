@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag, strip_internal_flag};
 use dmcp::config;
 use dmcp::elevation::{
-    announce_auth_granted, is_elevated, is_system_scope, re_exec_elevated,
+    announce_auth_granted, is_elevated, is_root_half, is_system_scope, re_exec_elevated,
     restore_invoking_user_home, SUDO_REEXEC_FLAG,
 };
 use dmcp::manifest_io::{write_manifest_atomic, Readers};
@@ -476,7 +476,11 @@ fn main() {
         emit_elevation_sentinel();
     }
 
-    dotenvy::dotenv().ok();
+    // sudo keeps the caller's working directory, so a .env there would hand
+    // root (and every server it spawns) the caller's LD_PRELOAD or PATH.
+    if !is_root_half(by_sudo) {
+        dotenvy::dotenv().ok();
+    }
     let cli = Cli::parse_from(raw_args);
     let paths = Paths::resolve();
     let debug = cli.debug;
