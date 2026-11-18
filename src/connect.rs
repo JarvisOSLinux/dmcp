@@ -85,6 +85,9 @@ fn connect_manifest(
             return Err(ConnectError::PlatformUnsupported(refusal));
         }
     }
+    if let Some(e) = crate::models::Manifest::load_error(&manifest) {
+        return Err(ConnectError::InvalidManifest(e));
+    }
 
     let id = id_override
         .map(String::from)
@@ -325,6 +328,7 @@ pub enum ConnectError {
     ParseIndex(serde_json::Error),
     IndexError(String),
     PlatformUnsupported(crate::platform::UnsupportedHost),
+    InvalidManifest(String),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -338,6 +342,11 @@ impl std::fmt::Display for ConnectError {
             ConnectError::ParseIndex(e) => write!(f, "Failed to parse index: {}", e),
             ConnectError::IndexError(s) => write!(f, "{}", s),
             ConnectError::PlatformUnsupported(refusal) => write!(f, "{}", refusal),
+            ConnectError::InvalidManifest(e) => write!(
+                f,
+                "Refusing to install: dmcp could not load this manifest afterwards: {}",
+                e
+            ),
         }
     }
 }
@@ -473,6 +482,27 @@ mod tests {
 
         let err = connect_with(&paths, m, false, false).unwrap_err();
         assert!(matches!(err, ConnectError::PlatformUnsupported(_)));
+        assert!(!paths.user_install_dir().join("com.test.connected").exists());
+    }
+
+    /// The URL path refuses a manifest dmcp could not load afterwards, as the
+    /// registry path does, before writing anything.
+    #[test]
+    fn a_manifest_dmcp_could_not_load_is_refused() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let mut m = manifest(None, None);
+        m["transports"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "stdio",
+                "command": "srv",
+                "execution": {"wrapper": []},
+            }));
+
+        let err = connect_with(&paths, m, false, false).unwrap_err();
+        assert!(matches!(err, ConnectError::InvalidManifest(_)), "{err:?}");
         assert!(!paths.user_install_dir().join("com.test.connected").exists());
     }
 

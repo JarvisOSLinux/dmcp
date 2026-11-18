@@ -194,6 +194,16 @@ impl Manifest {
             self.setup_script.as_deref(),
         )
     }
+
+    /// Why `raw` would not load as an installed manifest, or `None` when it
+    /// would. Install and connect ask before touching the host: every later
+    /// `list`, `call` and `run` reads the manifest through this type, so one that
+    /// fails here would install cleanly and then be "Server not found" forever.
+    /// The likeliest cause is a malformed `execution` block, which is rejected at
+    /// parse on purpose (see `crate::execution`).
+    pub fn load_error(raw: &serde_json::Value) -> Option<String> {
+        Manifest::deserialize(raw).err().map(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

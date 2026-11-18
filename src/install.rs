@@ -38,6 +38,11 @@ pub fn install(
             return Err(InstallError::PlatformUnsupported(refusal));
         }
     }
+    // Also ahead of the wipe below: a manifest dmcp cannot load would replace a
+    // working install with one that is invisible to every later command.
+    if let Some(e) = crate::models::Manifest::load_error(&server) {
+        return Err(InstallError::InvalidManifest(e));
+    }
 
     let install_dir = match scope {
         crate::discovery::Scope::User => paths.user_install_dir().join(id),
@@ -731,6 +736,7 @@ pub enum InstallError {
     SourceRevMismatch { requested: String, got: String },
     TrustDenied(String),
     PlatformUnsupported(crate::platform::UnsupportedHost),
+    InvalidManifest(String),
 }
 
 impl std::fmt::Display for InstallError {
@@ -768,6 +774,11 @@ impl std::fmt::Display for InstallError {
                 write!(f, "Refused by trust policy: {}", reason)
             }
             InstallError::PlatformUnsupported(refusal) => write!(f, "{}", refusal),
+            InstallError::InvalidManifest(e) => write!(
+                f,
+                "Refusing to install: dmcp could not load this manifest afterwards: {}",
+                e
+            ),
         }
     }
 }
@@ -1257,6 +1268,53 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, InstallError::PlatformUnsupported(_)));
         assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+    }
+
+    /// A typo in an `execution` block fails the whole manifest parse, so before
+    /// this check the install succeeded and the server was "not found" from then
+    /// on — after the install had already wiped the working copy.
+    #[test]
+    fn a_manifest_dmcp_could_not_load_is_refused_before_the_wipe() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server("")),
+            false,
+            false,
+        )
+        .expect("baseline install");
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        let mut broken = remote_server("");
+        broken["transports"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "stdio",
+                "command": "srv",
+                "execution": {"type": "docker", "imgae": "python:3-slim"},
+            }));
+        let err = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(broken),
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, InstallError::InvalidManifest(_)),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("imgae"), "{err}");
+        assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+        assert!(crate::discovery::get_server(&paths, "test.server").is_some());
     }
 
     #[test]
