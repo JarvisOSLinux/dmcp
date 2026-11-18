@@ -1246,8 +1246,14 @@ mod tests {
             vector_index_dir: root.join("v"),
         };
 
-        let transport: Transport =
-            serde_json::from_value(serde_json::json!({"type": "stdio", "command": "srv"})).unwrap();
+        // On Windows `build_stdio_command` resolves the program through PATH and
+        // PATHEXT, so a bare `srv` is `NotFound` there. The test binary's own
+        // path resolves on every OS; nothing is spawned.
+        let exe = std::env::current_exe().unwrap();
+        let transport: Transport = serde_json::from_value(
+            serde_json::json!({"type": "stdio", "command": exe.to_string_lossy()}),
+        )
+        .unwrap();
         let cmd = build_stdio_command(&paths, &manifest, "srv", Scope::User, &transport).unwrap();
 
         assert_eq!(
