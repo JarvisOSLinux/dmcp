@@ -991,7 +991,12 @@ mod tests {
             vector_index_dir: root.join("v"),
         };
 
-        let cmd = build_stdio_command(&paths, &manifest, "srv", "srv", None).unwrap();
+        // On Windows `build_stdio_command` resolves the program through PATH and
+        // PATHEXT, so a bare `srv` is `NotFound` there. The test binary's own
+        // path resolves on every OS; nothing is spawned.
+        let exe = std::env::current_exe().unwrap();
+        let cmd =
+            build_stdio_command(&paths, &manifest, "srv", &exe.to_string_lossy(), None).unwrap();
         let envs: Vec<(String, Option<String>)> = cmd
             .as_std()
             .get_envs()
