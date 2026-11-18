@@ -16,6 +16,22 @@ pub struct EmbeddingSpec {
     pub dimensions: usize,
 }
 
+/// Whether a search may return entries the registry flagged as test fixtures.
+///
+/// Named rather than a bare bool because the two call sites want opposite
+/// things for non-obvious reasons, and `search(.., true)` at a call site says
+/// none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fixtures {
+    /// Drop flagged entries before ranking. What every consumer query wants:
+    /// a fixture is never the answer to "play some music".
+    Exclude,
+    /// Rank flagged entries like any other — for this crate's own tests, and
+    /// for `dmcp browse --vector --include-fixtures`, which is how a fixture
+    /// stays reachable at all.
+    Include,
+}
+
 /// A single entry in the vector index (server-level or tool-level).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorEntry {
@@ -44,6 +60,15 @@ pub struct VectorEntry {
     /// host that is searching, not the host that synced.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub platforms_malformed: bool,
+    /// The registry flagged this entry as a test fixture: a server that exists
+    /// to exercise the registry's gates and this crate's tests rather than to
+    /// answer anyone's question. Copied at sync time like `platforms`, and for
+    /// the same reason — what an entry *is* belongs in the index, what a caller
+    /// *wants* belongs in the query. False for an index synced before the flag
+    /// existed, which is the safe reading: it shows a fixture rather than
+    /// hiding a real server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fixture: bool,
 }
 
 impl VectorEntry {
@@ -95,6 +120,22 @@ pub struct SearchResult {
     /// it vouches for nothing readable. Omitted for every well-formed entry.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub platforms_malformed: bool,
+    /// Whether this server is installed on this host, at either scope. Always
+    /// serialized: JARVIS labels each hit [INSTALLED] or [available] and its
+    /// planner installs whatever reads as available, so a missing flag does
+    /// not read as "unknown" -- it reads as "not installed", and the agent
+    /// re-installs a server it already has on every query. The index cannot
+    /// know this (it is a cache of the registry, carried between hosts), so
+    /// `search` leaves it false and the caller marks it with [`mark_installed`],
+    /// exactly as keyword browse fills `RegistryServer::installed`.
+    pub installed: bool,
+}
+
+/// Set `installed` on search results from the ids installed on this host.
+pub fn mark_installed(results: &mut [SearchResult], installed: &std::collections::HashSet<String>) {
+    for result in results {
+        result.installed = installed.contains(&result.server_id);
+    }
 }
 
 impl VectorIndex {
@@ -137,12 +178,25 @@ impl VectorIndex {
     /// The host verdict is decided here rather than at sync time, so an index
     /// copied between machines — or synced before a host was re-imaged — still
     /// answers for the machine doing the searching.
-    pub fn search(&self, query: &[f32], top_k: usize, min_score: f32) -> Vec<SearchResult> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        min_score: f32,
+        fixtures: Fixtures,
+    ) -> Vec<SearchResult> {
         let host = crate::platform::host_platform();
         let mut scored: Vec<(f32, &VectorEntry)> = self
             .entries
             .iter()
             .filter_map(|entry| {
+                // Before the sort, and so before the truncation: a fixture
+                // dropped from the *results* has already taken a top-k slot
+                // from a real server, which is the whole problem. Dropping it
+                // here means the slot goes to the next real match instead.
+                if fixtures == Fixtures::Exclude && entry.fixture {
+                    return None;
+                }
                 let score = Self::cosine_similarity(query, &entry.vector);
                 if score >= min_score {
                     Some((score, entry))
@@ -168,6 +222,7 @@ impl VectorIndex {
                 platforms: entry.platforms.clone(),
                 unsupported_on_host: entry.unsupported_on(host),
                 platforms_malformed: entry.platforms_malformed,
+                installed: false,
             })
             .collect()
     }
@@ -178,10 +233,11 @@ impl VectorIndex {
         queries: &[Vec<f32>],
         top_k: usize,
         min_score: f32,
+        fixtures: Fixtures,
     ) -> Vec<Vec<SearchResult>> {
         queries
             .iter()
-            .map(|q| self.search(q, top_k, min_score))
+            .map(|q| self.search(q, top_k, min_score, fixtures))
             .collect()
     }
 
@@ -233,6 +289,7 @@ mod tests {
             source: "registry".to_string(),
             platforms,
             platforms_malformed: malformed,
+            fixture: false,
         }
     }
 
@@ -243,11 +300,155 @@ mod tests {
         }
     }
 
+    fn fixture_entry(id: &str, vector: Vec<f32>, fixture: bool) -> VectorEntry {
+        VectorEntry {
+            server_id: id.to_string(),
+            server_name: id.to_string(),
+            server_description: None,
+            tool_name: None,
+            tool_description: None,
+            parameter_schema: None,
+            vector,
+            source: "registry".to_string(),
+            platforms: None,
+            platforms_malformed: false,
+            fixture,
+        }
+    }
+
+    /// The reason the filter runs before the truncation rather than over the
+    /// results. The fixture is the better cosine match here, so a filter applied
+    /// after `truncate(1)` would return nothing at all — the slot was already
+    /// spent. This is the measured case in miniature: against the real registry,
+    /// "play some music" ranked slow-mcp first.
+    #[test]
+    fn a_fixture_does_not_spend_a_top_k_slot() {
+        let index = index(vec![
+            fixture_entry("com.example.mcp.fixture", vec![1.0, 0.0], true),
+            fixture_entry("com.example.mcp.real", vec![0.92, 0.39], false),
+        ]);
+
+        let results = index.search(&[1.0, 0.0], 1, 0.0, Fixtures::Exclude);
+        assert_eq!(results.len(), 1, "the slot goes to the next real match");
+        assert_eq!(results[0].server_id, "com.example.mcp.real");
+
+        let results = index.search(&[1.0, 0.0], 1, 0.0, Fixtures::Include);
+        assert_eq!(
+            results[0].server_id, "com.example.mcp.fixture",
+            "and the fixture still outranks it when asked for"
+        );
+    }
+
+    #[test]
+    fn excluding_fixtures_is_the_default_for_every_query_shape() {
+        let index = index(vec![
+            fixture_entry("com.example.mcp.fixture", vec![1.0, 0.0], true),
+            fixture_entry("com.example.mcp.real", vec![0.0, 1.0], false),
+        ]);
+
+        let results = index.search(&[1.0, 0.0], 5, 0.0, Fixtures::Exclude);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.server_id != "com.example.mcp.fixture"),
+            "a flagged entry never ranks"
+        );
+
+        let batch =
+            index.search_batch(&[vec![1.0, 0.0], vec![0.0, 1.0]], 5, 0.0, Fixtures::Exclude);
+        assert!(
+            batch
+                .iter()
+                .flatten()
+                .all(|r| r.server_id != "com.example.mcp.fixture"),
+            "batch search applies the same policy to every query"
+        );
+
+        let batch = index.search_batch(&[vec![1.0, 0.0]], 5, 0.0, Fixtures::Include);
+        assert!(batch[0]
+            .iter()
+            .any(|r| r.server_id == "com.example.mcp.fixture"));
+    }
+
+    /// The index outlives the sync, so the flag has to survive a round trip —
+    /// and an index written before the flag existed has to load as "not a
+    /// fixture" rather than failing to parse.
+    #[test]
+    fn the_flag_survives_a_round_trip_and_an_older_index_still_loads() {
+        // Same idiom as the other temp-dir tests in this crate: no tempfile
+        // dependency, pid-scoped so parallel test binaries cannot collide.
+        let dir = std::env::temp_dir().join(format!("dmcp-fixture-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.json");
+
+        let saved = index(vec![
+            fixture_entry("com.example.mcp.fixture", vec![1.0, 0.0], true),
+            fixture_entry("com.example.mcp.real", vec![0.0, 1.0], false),
+        ]);
+        saved.save(&path).unwrap();
+
+        let loaded = VectorIndex::load(&path).unwrap();
+        let flags: Vec<bool> = loaded.entries.iter().map(|e| e.fixture).collect();
+        assert_eq!(flags, vec![true, false]);
+
+        // False is skipped on the wire, so the real server costs no bytes.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"fixture\"").count(), 1);
+
+        // An index synced before the field existed.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "entries": [{
+                    "server_id": "com.example.mcp.old",
+                    "server_name": "Old",
+                    "vector": [1.0, 0.0],
+                    "source": "registry",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = VectorIndex::load(&path).unwrap();
+        assert!(!loaded.entries[0].fixture, "absent reads as not a fixture");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn search_one(entry: VectorEntry) -> SearchResult {
         let index = index(vec![entry]);
-        let mut results = index.search(&[1.0, 0.0], 5, 0.0);
+        let mut results = index.search(&[1.0, 0.0], 5, 0.0, Fixtures::Exclude);
         assert_eq!(results.len(), 1);
         results.remove(0)
+    }
+
+    /// The index is a registry cache carried between hosts, so it cannot know
+    /// what is installed here; `search` must leave that to the caller rather
+    /// than guess. `mark_installed` then sets it from the host's install set,
+    /// and overwrites a stale `true` as readily as it sets one.
+    #[test]
+    fn install_status_is_left_to_the_caller_and_marked_both_ways() {
+        let mut results =
+            index(vec![entry(None, false)]).search(&[1.0, 0.0], 5, 0.0, Fixtures::Exclude);
+        assert!(!results[0].installed, "search leaves install status unset");
+
+        let mut here = std::collections::HashSet::new();
+        here.insert("com.example.mcp.thing".to_string());
+        mark_installed(&mut results, &here);
+        assert!(results[0].installed);
+
+        mark_installed(&mut results, &std::collections::HashSet::new());
+        assert!(
+            !results[0].installed,
+            "an uninstalled server is cleared, not left stale"
+        );
+
+        let json = serde_json::to_value(&results[0]).unwrap();
+        assert_eq!(
+            json["installed"],
+            serde_json::json!(false),
+            "false is stated, not omitted: an absent flag is read as not installed"
+        );
     }
 
     /// The `--json` payload of `dmcp browse --vector` is what JARVIS's
@@ -311,7 +512,7 @@ mod tests {
             }]
         });
         let index: VectorIndex = serde_json::from_value(legacy).unwrap();
-        let results = index.search(&[1.0, 0.0], 5, 0.0);
+        let results = index.search(&[1.0, 0.0], 5, 0.0, Fixtures::Exclude);
         assert_eq!(results.len(), 1);
         assert!(!results[0].unsupported_on_host);
         assert_eq!(results[0].platforms, None);
@@ -334,7 +535,8 @@ mod tests {
             Some(vec![foreign_platform().to_string()]),
             false,
         )]);
-        let batch = index.search_batch(&[vec![1.0, 0.0], vec![0.0, 1.0]], 5, 0.5);
+        let batch =
+            index.search_batch(&[vec![1.0, 0.0], vec![0.0, 1.0]], 5, 0.5, Fixtures::Exclude);
         assert!(batch[0][0].unsupported_on_host);
         assert!(batch[1].is_empty(), "min_score still applies per query");
     }

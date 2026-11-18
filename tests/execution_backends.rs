@@ -33,6 +33,7 @@ fn manifest_for(install_dir: &std::path::Path, transport: serde_json::Value) -> 
         "id": "com.test.execution",
         "installDir": install_dir.to_string_lossy(),
         "transports": [transport],
+        "configurableProperties": [{"key": "DMCP_EXEC_TEST_TOKEN", "sensitive": true}],
         "config": {"DMCP_EXEC_TEST_TOKEN": "token-from-config"},
     }))
     .expect("fixture manifest must parse")

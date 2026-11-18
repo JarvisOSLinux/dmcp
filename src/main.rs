@@ -1,10 +1,11 @@
 //! dmcp - MCP Manager CLI
 
 use clap::{Parser, Subcommand};
-use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag};
+use dmcp::call::{emit_elevation_sentinel, strip_elevation_sentinel_flag, strip_internal_flag};
 use dmcp::config;
 use dmcp::elevation::{
-    is_elevated, is_system_scope, re_exec_with_pkexec, restore_invoking_user_home,
+    announce_auth_granted, is_elevated, is_root_half, is_system_scope, re_exec_elevated,
+    restore_invoking_user_home, SUDO_REEXEC_FLAG,
 };
 use dmcp::manifest_io::{write_manifest_atomic, Readers};
 use dmcp::{
@@ -13,7 +14,7 @@ use dmcp::{
     list_sources, remove_source, run, run_setup, scope_from_registry_server, set_config_value,
     uninstall, Paths,
 };
-use dmcp::{sync_index, VectorEntry, VectorIndex};
+use dmcp::{sync_index, Fixtures, VectorEntry, VectorIndex};
 
 #[derive(Parser)]
 #[command(name = "dmcp")]
@@ -198,6 +199,13 @@ enum Commands {
         #[arg(long)]
         args: Option<String>,
 
+        /// A phone passkey's signed approval for exactly this command. polkit
+        /// reads it from the pkexec command line before dmcp runs as root
+        /// (JarvisOSLinux/jarvisos `jarvis-approval-check`); dmcp itself ignores
+        /// it. Must come after --args. Project-JARVIS#310.
+        #[arg(long, hide = true)]
+        approval: Option<String>,
+
         /// Keep the server alive across calls under this session id (stateful,
         /// user-scope servers only). Routes the call through the broker so
         /// in-process state (a browser, a REPL) survives between calls.
@@ -263,6 +271,13 @@ enum Commands {
         /// Minimum cosine similarity score 0.0–1.0 (default: 0.0)
         #[arg(long, default_value = "0.0")]
         min_score: f32,
+
+        /// Include servers the registry flagged as test fixtures. They are
+        /// dropped from vector search by default: a fixture exists to exercise
+        /// the registry's gates, not to answer a query, and one that ranks has
+        /// taken a slot from a real server.
+        #[arg(long)]
+        include_fixtures: bool,
     },
 
     /// Count visible MCP servers (local + reachable registries)
@@ -325,8 +340,15 @@ enum ConfigAction {
         /// Config key
         key: String,
 
-        /// Config value
-        value: String,
+        /// Config value (omit with --stdin)
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        value: Option<String>,
+
+        /// Read the value from standard input (a trailing newline is dropped)
+        /// and do not echo it. For secrets: any local user can read a running
+        /// process's command line.
+        #[arg(long)]
+        stdin: bool,
     },
 }
 
@@ -395,12 +417,53 @@ enum SourcesAction {
     },
 }
 
+/// The value for `config set --stdin`: all of stdin, less one trailing newline.
+fn read_value_from_stdin() -> String {
+    use std::io::Read;
+    let mut value = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut value) {
+        eprintln!("Error: could not read the value from stdin: {e}");
+        std::process::exit(1);
+    }
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn set_config_or_exit(paths: &Paths, id: &str, key: &str, value: &str, quiet_value: bool) {
+    match set_config_value(paths, id, key, value) {
+        Ok(()) if quiet_value => println!("Set {key}"),
+        Ok(()) => println!("Set {key} = {value}"),
+        Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
+            if is_system_scope(&manifest_path, paths.system_install_dir()) {
+                re_exec_elevated();
+            } else {
+                eprintln!("Error: Failed to write manifest (permission denied)");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     // FIRST, before dotenvy, Paths::resolve, and any thread/runtime: a pkexec
     // re-exec lands here with HOME reset to root's; restore the invoking user's
     // HOME from PKEXEC_UID so config resolution reads their sources.list, not
     // /root's (issue #52). set_var is process-global — sound only single-threaded.
-    restore_invoking_user_home();
+    // Read before anything else too, without touching the environment: whether
+    // this is the root half of our own sudo re-exec, the only case SUDO_UID
+    // names the user who asked.
+    let (raw_args, by_sudo) = strip_internal_flag(std::env::args_os().collect(), SUDO_REEXEC_FLAG);
+    restore_invoking_user_home(by_sudo);
+    announce_auth_granted(by_sudo);
 
     // A delegated elevation re-exec carries an internal flag (pkexec/sudo strip
     // the environment, so it cannot ride an env var): if present, this is the
@@ -408,13 +471,16 @@ fn main() {
     // the parent watches for, then strip the flag so clap never sees it (#51).
     // args_os() rather than args() so a non-UTF-8 argv element passes through
     // instead of panicking the process before clap can handle it.
-    let (raw_args, delegated_authenticated) =
-        strip_elevation_sentinel_flag(std::env::args_os().collect());
+    let (raw_args, delegated_authenticated) = strip_elevation_sentinel_flag(raw_args);
     if delegated_authenticated {
         emit_elevation_sentinel();
     }
 
-    dotenvy::dotenv().ok();
+    // sudo keeps the caller's working directory, so a .env there would hand
+    // root (and every server it spawns) the caller's LD_PRELOAD or PATH.
+    if !is_root_half(by_sudo) {
+        dotenvy::dotenv().ok();
+    }
     let cli = Cli::parse_from(raw_args);
     let paths = Paths::resolve();
     let debug = cli.debug;
@@ -471,21 +537,25 @@ fn main() {
             }
         },
         Commands::Config { id, action } => match action {
-            ConfigAction::Set { key, value } => match set_config_value(&paths, &id, &key, &value) {
-                Ok(()) => println!("Set {} = {}", key, value),
-                Err(config::SetConfigError::WriteFailed(_, manifest_path)) if !is_elevated() => {
-                    if is_system_scope(&manifest_path, paths.system_install_dir()) {
-                        re_exec_with_pkexec();
-                    } else {
-                        eprintln!("Error: Failed to write manifest (permission denied)");
-                        std::process::exit(1);
+            ConfigAction::Set { key, value, stdin } => {
+                let value = match value {
+                    Some(value) => value,
+                    None => {
+                        // A system-scope manifest is written as root. Elevate
+                        // before reading: the re-exec'd copy reads stdin, which
+                        // this process would otherwise already have consumed.
+                        if !is_elevated() {
+                            if let Some(path) = dmcp::get_manifest_path(&paths, &id) {
+                                if is_system_scope(&path, paths.system_install_dir()) {
+                                    re_exec_elevated();
+                                }
+                            }
+                        }
+                        read_value_from_stdin()
                     }
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            },
+                };
+                set_config_or_exit(&paths, &id, &key, &value, stdin)
+            }
             ConfigAction::Get { key, json } => match get_server(&paths, &id) {
                 Some((manifest, _)) => {
                     if let Some(k) = key {
@@ -555,7 +625,7 @@ fn main() {
                 };
                 // System scope needs root for create_dir + write; re-exec upfront
                 if scope == dmcp::SourceScope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match add_source(&paths, &url, scope) {
                     Ok(()) => println!("Added {}", url),
@@ -573,7 +643,7 @@ fn main() {
                 };
                 // System scope needs root; re-exec upfront
                 if scope == dmcp::SourceScope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match remove_source(&paths, &url, scope) {
                     Ok(()) => println!("Removed {}", url),
@@ -600,7 +670,7 @@ fn main() {
                     dmcp::discovery::Scope::User
                 };
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match connect(
                     &paths,
@@ -651,7 +721,7 @@ fn main() {
                     scope_from_registry_server(&server)
                 };
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
                 match install(&paths, &id, scope, Some(server), run_setup, ignore_platform) {
                     Ok(()) => println!("Installed {}", id),
@@ -673,7 +743,7 @@ fn main() {
         Commands::Uninstall { id } => {
             if let Some((_, _, scope)) = discovery::get_uninstall_info(&paths, &id) {
                 if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
             }
             match uninstall(&paths, &id) {
@@ -791,7 +861,7 @@ fn main() {
                         );
                         continue;
                     }
-                    re_exec_with_pkexec();
+                    re_exec_elevated();
                 }
 
                 match dmcp::update::refresh_install(&paths, id, a.scope, ignore_platform) {
@@ -823,7 +893,7 @@ fn main() {
                 dmcp::discovery::Scope::User
             };
             if scope == dmcp::discovery::Scope::System && !is_elevated() {
-                re_exec_with_pkexec();
+                re_exec_elevated();
             }
             let config_ref: Vec<(String, String)> = config.to_vec();
             let run_setup = !no_setup;
@@ -847,6 +917,16 @@ fn main() {
             }
         }
         Commands::Setup { id } => {
+            // A system-scope server's files are root's: its setup script (a
+            // chmod, a pip install into its dir) and the timestamp written
+            // back into its manifest both need root, as uninstall does.
+            if !is_elevated() {
+                if let Some(path) = discovery::get_manifest_path(&paths, &id) {
+                    if is_system_scope(&path, paths.system_install_dir()) {
+                        re_exec_elevated();
+                    }
+                }
+            }
             match get_server(&paths, &id) {
                 Some((manifest, _)) => {
                     let setup_script = manifest.setup_script_for_host(dmcp::host_platform());
@@ -953,6 +1033,7 @@ fn main() {
             id,
             tool,
             args,
+            approval: _,
             session,
             interactive,
         } => {
@@ -1077,7 +1158,24 @@ fn main() {
             vectors,
             top_k,
             min_score,
+            include_fixtures,
         } => {
+            let fixtures = if include_fixtures {
+                Fixtures::Include
+            } else {
+                Fixtures::Exclude
+            };
+            // Same scope rule keyword browse applies below. Computed here because
+            // both vector branches return before reaching it -- which is how the
+            // vector results came to carry no install status at all.
+            let installed_ids = || -> std::collections::HashSet<String> {
+                let include_user = user || !system;
+                let include_system = system || !user;
+                list_servers(&paths, include_user, include_system, false)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect()
+            };
             // Vector search mode: search the local index, bypass registry
             if let Some(ref vec_str) = vector {
                 let query: Vec<f32> = match serde_json::from_str(vec_str) {
@@ -1099,7 +1197,8 @@ fn main() {
                     eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
                     std::process::exit(1);
                 }
-                let results = index.search(&query, top_k, min_score);
+                let mut results = index.search(&query, top_k, min_score, fixtures);
+                dmcp::mark_installed(&mut results, &installed_ids());
                 if json {
                     println!("{}", serde_json::to_string_pretty(&results).unwrap());
                 } else if results.is_empty() {
@@ -1133,7 +1232,11 @@ fn main() {
                     eprintln!("Vector index is empty. Run `dmcp sync-index` to populate it.");
                     std::process::exit(1);
                 }
-                let batch = index.search_batch(&queries, top_k, min_score);
+                let mut batch = index.search_batch(&queries, top_k, min_score, fixtures);
+                let installed = installed_ids();
+                for results in &mut batch {
+                    dmcp::mark_installed(results, &installed);
+                }
                 if json {
                     println!("{}", serde_json::to_string_pretty(&batch).unwrap());
                 } else {
@@ -1171,12 +1274,19 @@ fn main() {
                 (user || !system, system || !user)
             };
             let installed = list_servers(&paths, include_user, include_system, false);
-            let installed_hashes: std::collections::HashMap<String, Option<String>> = installed
+            let installed_hashes: std::collections::HashMap<
+                String,
+                (Option<String>, Option<String>),
+            > = installed
                 .iter()
                 .map(|s| {
+                    let path = std::path::Path::new(&s.manifest_path);
                     (
                         s.id.clone(),
-                        dmcp::update::read_installed_hash(std::path::Path::new(&s.manifest_path)),
+                        (
+                            dmcp::update::read_installed_hash(path),
+                            dmcp::update::read_installed_setup_hash(path),
+                        ),
                     )
                 })
                 .collect();
@@ -1187,12 +1297,18 @@ fn main() {
                 s.installed = installed_ids.contains(&s.id);
                 // Flag drift only for installed servers whose registry entry
                 // records a manifest hash to compare against.
-                if s.installed {
-                    if let Some(reg) = s.registry_manifest_sha256.clone() {
-                        let inst = installed_hashes.get(&s.id).cloned().flatten();
-                        s.update_available =
-                            Some(dmcp::update::is_drifted(inst.as_deref(), Some(&reg)));
-                    }
+                if s.installed && s.registry_manifest_sha256.is_some() {
+                    let (manifest, setup) =
+                        installed_hashes.get(&s.id).cloned().unwrap_or_default();
+                    s.update_available = Some(
+                        dmcp::update::is_drifted(
+                            manifest.as_deref(),
+                            s.registry_manifest_sha256.as_deref(),
+                        ) || dmcp::update::is_drifted(
+                            setup.as_deref(),
+                            s.registry_setup_sha256.as_deref(),
+                        ),
+                    );
                 }
             }
             servers = filter_servers_by_keywords(servers, &keyword);
@@ -1338,6 +1454,7 @@ fn main() {
                         // reading an absent `platforms` gets everywhere else.
                         platforms: None,
                         platforms_malformed: false,
+                        fixture: false,
                     });
                 }
             }
@@ -1364,6 +1481,7 @@ fn main() {
                                 source: "local".to_string(),
                                 platforms: None,
                                 platforms_malformed: false,
+                                fixture: false,
                             });
                         }
                     }
@@ -1618,14 +1736,18 @@ fn print_drift_check(assessed: &[dmcp::AssessedServer]) {
             actionable = true;
         } else if a.report.update_available {
             println!("{}: update available", id);
-            println!(
-                "        installed: {}",
-                a.report.installed_hash.as_deref().unwrap_or("(none)")
-            );
-            println!(
-                "        registry:  {}",
-                a.report.registry_hash.as_deref().unwrap_or("(none)")
-            );
+            if a.report.installed_hash == a.report.registry_hash {
+                println!("        the manifest is unchanged; its setup script changed");
+            } else {
+                println!(
+                    "        installed: {}",
+                    a.report.installed_hash.as_deref().unwrap_or("(none)")
+                );
+                println!(
+                    "        registry:  {}",
+                    a.report.registry_hash.as_deref().unwrap_or("(none)")
+                );
+            }
             actionable = true;
         } else {
             println!("{}: up to date", id);
@@ -1727,6 +1849,31 @@ fn resolve_doc_comment_descriptions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// polkit reads `--approval` off the pkexec command line (#310); dmcp must
+    /// still parse the call once it is root, with and without `--args`.
+    #[test]
+    fn call_accepts_an_approval_after_its_args() {
+        for argv in [
+            vec![
+                "dmcp",
+                "call",
+                "s",
+                "t",
+                "--args",
+                "{\"a\":1}",
+                "--approval",
+                "QUJD",
+            ],
+            vec!["dmcp", "call", "s", "t", "--approval", "QUJD"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parses");
+            match cli.command {
+                Commands::Call { approval, .. } => assert_eq!(approval.as_deref(), Some("QUJD")),
+                _ => panic!("not a call"),
+            }
+        }
+    }
 
     /// A platform that is never the host, so the refusal paths are exercised
     /// the same way whichever OS the suite runs on.

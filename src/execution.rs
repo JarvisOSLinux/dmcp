@@ -292,7 +292,7 @@ fn forwardable_keys(env: &HashMap<String, OsString>) -> Vec<String> {
 /// `None` when the combination does not arise.
 ///
 /// Checked before any spawn and before any elevation. A system-scope server runs
-/// by re-execing dmcp through pkexec, and what that re-exec means once the
+/// by re-execing dmcp as root (pkexec, or `sudo -A`), and what that re-exec means once the
 /// launch line is inside a container or on the far side of an ssh hop is
 /// undefined: the elevated process would be the docker client, not the server,
 /// so "the tool runs as root" would silently stop being true.
@@ -307,8 +307,8 @@ pub fn system_scope_refusal(
     Some(format!(
         "Server '{id}': execution backends are not supported for system-scope \
          servers yet. A system-scope server is launched by re-execing dmcp \
-         through pkexec, and pkexec's re-exec semantics inside a container or \
-         behind a wrapper are undefined — the elevated process would be the \
+         as root (through pkexec, or sudo -A), and what that re-exec means inside \
+         a container or behind a wrapper is undefined — the elevated process would be the \
          backend, not the server. Install the server in user scope, or drop the \
          `execution` block from its transport."
     ))

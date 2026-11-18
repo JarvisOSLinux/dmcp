@@ -156,6 +156,16 @@ fn embeddings_from_registry(registry: &serde_json::Value) -> RegistryEmbeddings 
         let platforms = decl.names().map(<[String]>::to_vec);
         let platforms_malformed = decl.is_malformed();
 
+        // Copied, not interpreted, for the same reason as `platforms` above.
+        // Only a literal `true` counts: the registry validator rejects any other
+        // type, so anything else here came from a source that does not run that
+        // gate, and reading a stray string as "fixture" would hide a real
+        // server. Failing toward *showing* an entry is the safe direction.
+        let fixture = server
+            .get("fixture")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
         let server_name = server
             .get("name")
             .and_then(|n| n.as_str())
@@ -218,6 +228,7 @@ fn embeddings_from_registry(registry: &serde_json::Value) -> RegistryEmbeddings 
                 source: "registry".to_string(),
                 platforms: platforms.clone(),
                 platforms_malformed,
+                fixture,
             });
         }
 
@@ -258,6 +269,7 @@ fn embeddings_from_registry(registry: &serde_json::Value) -> RegistryEmbeddings 
                     source: "registry".to_string(),
                     platforms: platforms.clone(),
                     platforms_malformed,
+                    fixture,
                 });
             }
         }
@@ -405,6 +417,65 @@ mod tests {
         let mut fetched = embeddings_from_registry(&registry(platforms));
         assert_eq!(fetched.len(), 1);
         fetched.remove(0).1
+    }
+
+    /// The same one-server registry with whatever `fixture` the case wants,
+    /// including a value the registry validator would have rejected.
+    fn entries_with_fixture(flag: Option<serde_json::Value>) -> Vec<VectorEntry> {
+        let mut doc = registry(None);
+        if let Some(value) = flag {
+            doc["servers"]["com.example.mcp.thing"]["fixture"] = value;
+        }
+        let mut fetched = embeddings_from_registry(&doc);
+        assert_eq!(fetched.len(), 1);
+        fetched.remove(0).1
+    }
+
+    /// Both levels carry the flag, for the same reason both carry `platforms`:
+    /// a tool-level hit is the common case, so flagging only the server entry
+    /// would let a fixture's tools go on ranking.
+    #[test]
+    fn every_entry_carries_the_fixture_flag() {
+        let entries = entries_with_fixture(Some(serde_json::json!(true)));
+        assert_eq!(
+            entries.len(),
+            2,
+            "one server-level and one tool-level entry"
+        );
+        for e in &entries {
+            assert!(e.fixture, "entry {:?} must carry the flag", e.tool_name);
+        }
+    }
+
+    #[test]
+    fn an_entry_without_the_flag_is_not_a_fixture() {
+        for e in entries_with_fixture(None) {
+            assert!(!e.fixture);
+        }
+        for e in entries_with_fixture(Some(serde_json::json!(false))) {
+            assert!(!e.fixture);
+        }
+    }
+
+    /// Only a literal `true` counts. The registry validator rejects every other
+    /// type, so a value of another shape came from a source that does not run
+    /// that gate — and reading `"true"` or `1` as "fixture" would hide a real
+    /// server from every consumer query. Failing toward showing is the safe
+    /// direction, the opposite of the platform rule, where a declaration that
+    /// cannot be read must not read as "no restriction".
+    #[test]
+    fn a_non_boolean_flag_reads_as_not_a_fixture() {
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+            serde_json::json!({"fixture": true}),
+            serde_json::json!(["true"]),
+        ] {
+            for e in entries_with_fixture(Some(value.clone())) {
+                assert!(!e.fixture, "{value} must not read as a fixture");
+            }
+        }
     }
 
     /// Both levels carry the declaration: a tool-level hit is the one the agent

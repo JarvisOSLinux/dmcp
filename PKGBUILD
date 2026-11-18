@@ -1,15 +1,16 @@
 # Maintainer: Yakup Atahanov <yakup.atahanow.b@gmail.com>
 pkgname=dmcp
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='MCP Manager - discover, manage, and invoke MCP servers'
 url='https://github.com/JarvisOSLinux/dmcp'
 license=('GPL-3.0-only')
 arch=('x86_64' 'armv6h' 'armv7h' 'aarch64')
 makedepends=('cargo')
+options=('!lto')
 depends=('gcc-libs')
 optdepends=('polkit: for system-scope operations (pkexec)')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {

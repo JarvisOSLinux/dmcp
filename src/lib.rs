@@ -16,6 +16,7 @@ pub mod install;
 pub mod manifest_io;
 pub mod models;
 pub mod orchestrator;
+pub mod pathext;
 pub mod paths;
 pub mod platform;
 pub mod run;
@@ -45,4 +46,6 @@ pub use setup::run_setup;
 pub use sources::{add_source, list_sources, remove_source, SourceScope, SourcesError};
 pub use sync_index::{sync_index, SyncResult};
 pub use update::{assess_servers, refresh_install, AssessedServer, DriftReport, UpdateError};
-pub use vector_index::{EmbeddingSpec, SearchResult, VectorEntry, VectorIndex};
+pub use vector_index::{
+    mark_installed, EmbeddingSpec, Fixtures, SearchResult, VectorEntry, VectorIndex,
+};

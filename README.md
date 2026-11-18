@@ -263,10 +263,10 @@ fails to parse instead: `dmcp list` warns by name that it does not parse, and
 removable.
 
 **Not available in system scope.** A system-scope server is launched by
-re-execing dmcp through pkexec, and what that means once the launch line is
+re-execing dmcp as root (pkexec, or `sudo -A`), and what that means once the launch line is
 inside a container or on the far side of an ssh hop is undefined — the elevated
 process would be the backend, not the server. `call`, `tools` and `run` all
-refuse the combination before any spawn, and before the polkit prompt, so nobody
+refuse the combination before any spawn, and before the password prompt, so nobody
 authenticates their way to a refusal.
 
 Every spawn site honours the same plan: the one-shot `call`, `tools`, `run` and

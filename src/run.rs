@@ -5,7 +5,8 @@
 //!
 //! Config keys are passed directly as environment variables using the key name stored
 //! in the manifest (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY). This matches
-//! what upstream servers expect based on their configurableProperties definitions.
+//! what upstream servers expect based on their configurableProperties definitions,
+//! and only those: a key the manifest does not declare is not passed.
 //!
 //! ## System-scoped servers
 //!
@@ -17,12 +18,12 @@
 //!
 //! See `policy/org.jarvisos.dmcp.policy` for the polkit action definition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::{Command, Stdio};
 
 use crate::discovery::{get_server, Scope};
-use crate::elevation::{is_elevated, re_exec_with_pkexec};
+use crate::elevation::{is_elevated, re_exec_elevated};
 use crate::models::{Manifest, Transport};
 use crate::paths::Paths;
 
@@ -37,6 +38,7 @@ pub enum RunError {
     /// comes from `crate::execution` so every surface says the same thing.
     ExecutionInSystemScope(String),
     CommandNotFound(String),
+    NotOnPath(crate::pathext::NotFound),
     SpawnFailed(io::Error),
     ProcessExited(i32),
 }
@@ -53,6 +55,7 @@ impl std::fmt::Display for RunError {
             ),
             RunError::ExecutionInSystemScope(msg) => write!(f, "{}", msg),
             RunError::CommandNotFound(cmd) => write!(f, "Command not found: {}", cmd),
+            RunError::NotOnPath(e) => write!(f, "{}", e),
             RunError::SpawnFailed(e) => write!(f, "Failed to spawn process: {}", e),
             RunError::ProcessExited(code) => write!(f, "Process exited with code {}", code),
         }
@@ -90,13 +93,13 @@ pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
     // a transport declared for another platform is not the one being spawned —
     // so the decision reads the host-selected transport, not entry zero. A
     // transport with an execution backend is refused below, so it must not cost
-    // a polkit prompt on the way there.
+    // a password prompt on the way there.
     if scope == Scope::System && !is_elevated() {
         if let Ok(selected @ Transport::Stdio { .. }) =
             crate::transport::select(manifest.transports.as_deref())
         {
             if selected.execution().is_none() {
-                re_exec_with_pkexec();
+                re_exec_elevated();
             }
         }
     }
@@ -137,7 +140,8 @@ fn run_stdio(
         crate::call::stdio_spawn_plan(paths, manifest, id, scope, transport).map_err(plan_error)?;
     let program = plan.program.clone();
 
-    let mut child = match Command::new(&plan.program)
+    let launch = crate::pathext::launch_program(&plan.program).map_err(RunError::NotOnPath)?;
+    let mut child = match Command::new(launch)
         .args(&plan.args)
         .current_dir(&plan.current_dir)
         .envs(plan.env)
@@ -165,19 +169,43 @@ fn run_stdio(
     Ok(())
 }
 
-/// Convert manifest config to env vars using the key name as-is.
-/// Config keys in configurableProperties ARE the expected env var names
-/// (e.g. GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY).
-pub fn config_to_env(
-    config: &std::collections::HashMap<String, serde_json::Value>,
-) -> HashMap<String, std::ffi::OsString> {
+/// The environment a server starts with: its config, keyed by name, limited to
+/// the settings its manifest declares.
+///
+/// A key becomes an environment variable as-is, so an undeclared one such as
+/// NODE_OPTIONS or LD_PRELOAD would run arbitrary code in the server. A stored
+/// key the manifest does not declare is left out, and named on stderr.
+pub fn config_to_env(manifest: &Manifest) -> HashMap<String, std::ffi::OsString> {
+    let declared: HashSet<&str> = manifest
+        .configurable_properties
+        .iter()
+        .map(|p| p.key.as_str())
+        .collect();
     let mut env = HashMap::new();
-    for (key, value) in config {
+    let mut skipped: Vec<&str> = Vec::new();
+    for (key, value) in &manifest.config {
+        if !declared.contains(key.as_str()) {
+            skipped.push(key);
+            continue;
+        }
         let env_val = match value {
             serde_json::Value::String(s) => s.clone(),
             _ => value.to_string(),
         };
         env.insert(key.clone(), std::ffi::OsString::from(env_val));
+    }
+    if !skipped.is_empty() {
+        skipped.sort_unstable();
+        let name = manifest.id.as_deref().unwrap_or("the server");
+        eprintln!(
+            "dmcp: not passing {} to {name}: its manifest does not declare {}",
+            skipped.join(", "),
+            if skipped.len() == 1 {
+                "that setting"
+            } else {
+                "those settings"
+            }
+        );
     }
     env
 }
@@ -216,5 +244,35 @@ mod tests {
 
     fn docker() -> crate::execution::Execution {
         serde_json::from_str(r#"{"type":"docker","image":"img"}"#).unwrap()
+    }
+
+    /// A manifest command naming a `.cmd` shim without its extension launches
+    /// under `dmcp run`, as it does under `dmcp call` (#66).
+    #[cfg(windows)]
+    #[test]
+    fn run_launches_a_cmd_shim_named_without_its_extension() {
+        let dir = std::env::temp_dir().join(format!("dmcp-run-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("srv.cmd"), "@exit /b 0\r\n").unwrap();
+        let manifest = Manifest {
+            install_dir: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let paths = Paths {
+            user_sources: dir.join("u.list"),
+            user_install_dir: dir.join("u"),
+            system_sources: dir.join("s.list"),
+            system_install_dir: dir.join("s"),
+            vector_index_dir: dir.join("v"),
+        };
+
+        let command = dir.join("srv");
+        let transport: Transport = serde_json::from_value(serde_json::json!({
+            "type": "stdio",
+            "command": command.to_string_lossy(),
+        }))
+        .unwrap();
+        let got = run_stdio(&paths, &manifest, "srv", Scope::User, &transport);
+        assert!(got.is_ok(), "{}", got.unwrap_err());
     }
 }
