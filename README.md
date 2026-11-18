@@ -219,16 +219,25 @@ container on Linux and natively elsewhere.
 `extraArgs` are inserted into `docker run` before the image. dmcp spawns:
 
 ```
-docker run -i --rm -v <installDir>:<installDir>:ro -w <installDir> \
-           -e KEY … --cpus 1 python:3-slim python3 /srv/app/server.py
+docker run --env-file <file> -i --rm \
+           --mount 'type=bind,"src=<installDir>","dst=<installDir>",readonly' \
+           -w <installDir> --cpus 1 python:3-slim python3 /srv/app/server.py
 ```
 
 The install dir is mounted at the same path it has on the host and is the
-working directory inside the container, so `args` need no rewriting. Each config
-key becomes a **bare** `-e KEY`: docker forwards the value from its own
-environment, which dmcp has set, so a token never appears in a command line that
-every local account can read out of `/proc`. (A config key that is empty or
-contains `=` is not forwarded — it would put the value back in argv.)
+working directory inside the container, so `args` need no rewriting. `--mount`
+rather than `-v`, so a path with a `:` or `,` mounts intact. On an
+SELinux-enforcing host the install dir needs a container label
+(`chcon -Rt container_file_t <installDir>`); dmcp does not relabel host files.
+
+The config goes into the `--env-file` (`--env-file` only appears when there is
+config): a file only you can read, in dmcp's private runtime directory, removed
+once the server has started (for `dmcp run`, when it exits). So a token never appears in a
+command line that every local account can read out of `/proc`, and none of the
+settings is set on the `docker` command itself: a setting named `DOCKER_HOST`,
+`HOME` or `PATH` is for the server, not for docker. A setting docker's env file
+cannot carry (a line break in the value, or `=` or a space in the name) is
+refused by name rather than dropped.
 
 **Wrapper.**
 
@@ -252,7 +261,10 @@ is SHA-256 verified against the registry entry at install and gated by the same
 trust tier as every other server. An execution block grants a manifest no reach
 it did not already have through `command` — it could always have named `docker`
 there. What it buys is validation, the plumbing above, and keeping secrets out of
-the process table.
+the process table. `dmcp info`, `dmcp list` and `dmcp browse` show where a server
+runs (`Runs in: docker image …, extra docker flags: …`, or `wrapper: …`), so a
+`--privileged` flag or a `sudo -E` wrapper is visible before you install or run
+it.
 
 **Malformed blocks are refused, never ignored.** Both forms at once, an empty
 `wrapper`, `docker` with no `image`, or any unknown key inside `execution` is a

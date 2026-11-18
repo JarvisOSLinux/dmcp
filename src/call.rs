@@ -734,23 +734,27 @@ pub fn stdio_spawn_plan(
 /// Factored out of the one-shot call path so the session broker spawns servers
 /// with byte-identical semantics; the one-shot and session paths must not drift
 /// in how a server is launched.
+///
+/// The `EnvFile`, when there is one, is the container's environment: keep it
+/// until the server has answered the MCP handshake (see `SpawnPlan::prepare`).
 pub fn build_stdio_command(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
     scope: Scope,
     transport: &Transport,
-) -> Result<Command, CallError> {
+) -> Result<(Command, Option<crate::execution::EnvFile>), CallError> {
     let plan = stdio_spawn_plan(paths, manifest, id, scope, transport)?;
     // The host resolves only the program it starts: behind a backend that is
     // `docker` or the wrapper, and the launch line runs wherever it takes it.
     let program = crate::pathext::launch_program(&plan.program)
         .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let (args, env_file) = plan.prepare().map_err(CallError::ConnectionFailed)?;
     let mut cmd = Command::new(program);
-    cmd.args(&plan.args)
+    cmd.args(&args)
         .current_dir(&plan.current_dir)
         .envs(plan.env);
-    Ok(cmd)
+    Ok((cmd, env_file))
 }
 
 /// Call a tool on an installed MCP server.
@@ -808,7 +812,7 @@ async fn call_tool_stdio(
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let cmd = build_stdio_command(paths, manifest, id, scope, transport)?;
+    let (cmd, _env_file) = build_stdio_command(paths, manifest, id, scope, transport)?;
 
     // Piped instead of rmcp's inherited default: the relay keeps the same live
     // view a caller had under inheritance, and the retained copy lets a failed
@@ -925,7 +929,7 @@ async fn list_tools_stdio(
     scope: Scope,
     transport: &Transport,
 ) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    let cmd = build_stdio_command(paths, manifest, id, scope, transport)?;
+    let (cmd, _env_file) = build_stdio_command(paths, manifest, id, scope, transport)?;
 
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
@@ -1036,37 +1040,36 @@ mod tests {
         }
     }
 
-    /// What a built `Command` will actually exec, read back for assertions.
+    /// What the spawn plan says will exec, read back for assertions. Read from
+    /// `stdio_spawn_plan`, which does no PATH lookup, so a bare `python3` or
+    /// `docker` plans the same on every host (Windows resolves through PATHEXT
+    /// in `build_stdio_command`, where an uninstalled program is `NotFound`).
     #[derive(Debug)]
     struct Spawned {
         program: String,
         args: Vec<String>,
-        cwd: Option<PathBuf>,
+        cwd: PathBuf,
         env: Vec<(String, String)>,
+        container_env: Vec<(String, String)>,
     }
 
     fn plan_for(manifest: &Manifest, scope: Scope) -> Result<Spawned, CallError> {
         let transport = crate::transport::select(manifest.transports.as_deref()).unwrap();
-        let cmd = build_stdio_command(&paths(), manifest, "com.test.s", scope, transport)?;
-        let std = cmd.as_std();
-        let mut env: Vec<(String, String)> = std
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.unwrap_or_default().to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
+        let plan = stdio_spawn_plan(&paths(), manifest, "com.test.s", scope, transport)?;
+        let text =
+            |(k, v): (&String, &std::ffi::OsString)| (k.clone(), v.to_string_lossy().into_owned());
+        let mut env: Vec<(String, String)> = plan.env.iter().map(text).collect();
         env.sort();
         Ok(Spawned {
-            program: std.get_program().to_string_lossy().into_owned(),
-            args: std
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect(),
-            cwd: std.get_current_dir().map(|p| p.to_path_buf()),
+            program: plan.program,
+            args: plan.args,
+            cwd: plan.current_dir,
             env,
+            container_env: plan
+                .container_env
+                .iter()
+                .map(|(k, v)| text((k, v)))
+                .collect(),
         })
     }
 
@@ -1084,19 +1087,21 @@ mod tests {
             args,
             cwd,
             env,
+            container_env,
         } = plan_for(&manifest, Scope::User).unwrap();
 
         assert_eq!(program, "python3");
         assert_eq!(args, vec!["server.py"]);
-        assert_eq!(cwd, Some(PathBuf::from("/srv/app")));
+        assert_eq!(cwd, PathBuf::from("/srv/app"));
         assert_eq!(
             env,
             vec![("BRAVE_API_KEY".to_string(), "bsk-secret-value".to_string())]
         );
+        assert!(container_env.is_empty());
     }
 
     #[test]
-    fn a_docker_transport_spawns_the_container_with_values_only_in_the_env() {
+    fn a_docker_transport_gives_the_settings_to_the_container_not_to_docker() {
         let manifest = manifest_with(
             serde_json::json!({
                 "type": "stdio",
@@ -1115,6 +1120,7 @@ mod tests {
             args,
             cwd,
             env,
+            container_env,
         } = plan_for(&manifest, Scope::User).unwrap();
 
         assert_eq!(program, "docker");
@@ -1124,12 +1130,10 @@ mod tests {
                 "run",
                 "-i",
                 "--rm",
-                "-v",
-                "/srv/app:/srv/app:ro",
+                "--mount",
+                "type=bind,\"src=/srv/app\",\"dst=/srv/app\",readonly",
                 "-w",
                 "/srv/app",
-                "-e",
-                "BRAVE_API_KEY",
                 "--cpus",
                 "1",
                 "python:3-slim",
@@ -1142,13 +1146,17 @@ mod tests {
             "the token must not be in the command line: {args:?}"
         );
         assert_eq!(
-            env,
+            container_env,
             vec![("BRAVE_API_KEY".to_string(), "bsk-secret-value".to_string())],
-            "the token reaches the container through docker's own environment"
+            "the token goes to the container, through the env file"
+        );
+        assert!(
+            env.is_empty(),
+            "nothing is set on the docker client: {env:?}"
         );
         assert_eq!(
             cwd,
-            Some(PathBuf::from("/srv/app")),
+            PathBuf::from("/srv/app"),
             "the host cwd is unchanged; -w governs the path inside"
         );
     }
@@ -1169,11 +1177,12 @@ mod tests {
             args,
             cwd,
             env,
+            ..
         } = plan_for(&manifest, Scope::User).unwrap();
 
         assert_eq!(program, "ssh");
         assert_eq!(args, vec!["build-host", "--", "python3", "server.py"]);
-        assert_eq!(cwd, Some(PathBuf::from("/srv/app")));
+        assert_eq!(cwd, PathBuf::from("/srv/app"));
         assert_eq!(
             env,
             vec![("TOKEN".to_string(), "s3cr3t".to_string())],
@@ -1254,7 +1263,8 @@ mod tests {
             serde_json::json!({"type": "stdio", "command": exe.to_string_lossy()}),
         )
         .unwrap();
-        let cmd = build_stdio_command(&paths, &manifest, "srv", Scope::User, &transport).unwrap();
+        let (cmd, _) =
+            build_stdio_command(&paths, &manifest, "srv", Scope::User, &transport).unwrap();
 
         assert_eq!(
             spawn_env(&cmd),
@@ -1262,9 +1272,9 @@ mod tests {
         );
     }
 
-    /// The declared-keys filter holds behind a container too: docker forwards
-    /// exactly the variables it is handed and names, so an undeclared stored key
-    /// must be missing from both, or `NODE_OPTIONS` would run inside the image.
+    /// The declared-keys filter holds behind a container too: the container
+    /// gets exactly the env file's variables, so an undeclared stored key must
+    /// be missing from it, or `NODE_OPTIONS` would run inside the image.
     #[test]
     fn a_container_gets_only_the_settings_its_manifest_declares() {
         let manifest = Manifest {
@@ -1296,17 +1306,16 @@ mod tests {
 
         let plan = stdio_spawn_plan(&paths, &manifest, "srv", Scope::User, &transport).unwrap();
         assert_eq!(plan.program, "docker");
-        assert!(
-            plan.args.windows(2).any(|w| w == ["-e", "API_KEY"]),
-            "{:?}",
-            plan.args
+        assert_eq!(
+            plan.container_env,
+            vec![("API_KEY".to_string(), std::ffi::OsString::from("k-1"))]
         );
+        assert!(plan.env.is_empty(), "{:?}", plan.env);
         assert!(
             !plan.args.iter().any(|a| a.contains("NODE_OPTIONS")),
             "{:?}",
             plan.args
         );
-        assert_eq!(plan.env.keys().collect::<Vec<_>>(), vec!["API_KEY"]);
     }
 
     fn spawn_env(cmd: &Command) -> Vec<(String, Option<String>)> {

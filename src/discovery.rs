@@ -14,6 +14,10 @@ pub struct ServerInfo {
     pub name: String,
     pub version: String,
     pub transport_type: String,
+    /// Where that transport's launch line runs, when not directly on the host
+    /// (see `Execution::describe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
     pub scope: Scope,
     /// Path to manifest.json (or install dir for backwards compatibility in JSON)
     #[serde(alias = "install_dir")]
@@ -119,18 +123,23 @@ fn load_from_scope(base: &Path, scope: Scope, debug: bool) -> Option<Vec<ServerI
         // Report the transport this host would launch. Falling back to the first
         // entry keeps the listing informative for a server declared only for
         // other platforms, rather than blanking it out to "unknown".
-        let transport_type = manifest
+        let shown = manifest
             .transports
             .as_ref()
-            .and_then(|t| crate::transport::select(Some(t)).ok().or_else(|| t.first()))
+            .and_then(|t| crate::transport::select(Some(t)).ok().or_else(|| t.first()));
+        let transport_type = shown
             .map(transport_type_name)
             .unwrap_or_else(|| "unknown".to_string());
+        let execution = shown
+            .and_then(crate::models::Transport::execution)
+            .map(crate::execution::Execution::describe);
 
         servers.push(ServerInfo {
             id: manifest.id.unwrap_or(id),
             name: manifest.name.unwrap_or_else(|| "Unknown".to_string()),
             version: manifest.version.unwrap_or_else(|| "?".to_string()),
             transport_type,
+            execution,
             scope,
             manifest_path: entry.location.clone(),
         });

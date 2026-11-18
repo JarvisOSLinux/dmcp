@@ -206,6 +206,12 @@ impl DmcpServer {
                         "transports".into(),
                         serde_json::to_string_pretty(&types).unwrap().into(),
                     );
+                    if let Some(e) = crate::transport::select(Some(t))
+                        .ok()
+                        .and_then(crate::models::Transport::execution)
+                    {
+                        out.insert("execution".into(), e.describe().into());
+                    }
                 }
                 // Drift at the point of use (#39): the agent is about to call
                 // this server, and this is where it can learn that a fixed

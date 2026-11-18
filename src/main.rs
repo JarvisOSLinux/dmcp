@@ -1557,9 +1557,17 @@ fn format_transports(transports: &[dmcp::models::Transport]) -> String {
     transports
         .iter()
         .map(|t| match t {
-            dmcp::models::Transport::Stdio { command, args, .. } => {
+            dmcp::models::Transport::Stdio {
+                command,
+                args,
+                execution,
+                ..
+            } => {
                 let args_str = args.as_ref().map(|a| a.join(" ")).unwrap_or_default();
-                format!("stdio ({command} {args_str})")
+                match execution {
+                    Some(e) => format!("stdio ({command} {args_str}) in {}", e.describe()),
+                    None => format!("stdio ({command} {args_str})"),
+                }
             }
             dmcp::models::Transport::Sse { url, .. } => format!("sse ({url})"),
             dmcp::models::Transport::WebSocket { ws_url, .. } => format!("websocket ({ws_url})"),
@@ -1649,6 +1657,9 @@ fn print_list_table(servers: &[dmcp::ServerInfo]) {
         println!("{}Name:      {}", INDENT, s.name);
         println!("{}Version:   {}", INDENT, s.version);
         println!("{}Transport: {}", INDENT, s.transport_type);
+        if let Some(ref e) = s.execution {
+            println!("{}Runs in:   {}", INDENT, e);
+        }
         println!("{}Scope:     {}", INDENT, scope);
         println!("{}Manifest: {}", INDENT, s.manifest_path);
         println!();
@@ -1788,6 +1799,9 @@ fn print_browse_table(servers: &[dmcp::RegistryServer]) {
         println!("{}Name:      {}", INDENT, s.name);
         println!("{}Version:   {}", INDENT, s.version);
         println!("{}Transport: {}", INDENT, s.transport);
+        if let Some(ref e) = s.execution {
+            println!("{}Runs in:   {}", INDENT, e);
+        }
         println!("{}Status:    {}", INDENT, status);
         if s.platforms_malformed {
             println!(

@@ -23,6 +23,10 @@ pub struct RegistryServer {
     pub summary: String,
     pub version: String,
     pub transport: String,
+    /// Where that transport's launch line runs, when not directly on the host
+    /// (see `Execution::describe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
     pub source: String,
     /// Whether this server is installed (user or system scope).
     pub installed: bool,
@@ -188,13 +192,15 @@ fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> R
     // The transport this host would launch, so the column matches what an
     // install here actually starts; the first entry still stands in when the
     // list declares nothing for this host.
-    let transport = server
+    let shown = server
         .get("transports")
         .and_then(|t| t.as_array())
-        .and_then(|a| crate::transport::select_json(a).ok().or_else(|| a.first()))
+        .and_then(|a| crate::transport::select_json(a).ok().or_else(|| a.first()));
+    let transport = shown
         .and_then(|t| t.get("type").and_then(|x| x.as_str()))
         .map(String::from)
         .unwrap_or_else(|| "?".to_string());
+    let execution = shown.and_then(crate::execution::describe_json);
 
     let keywords: Vec<String> = server
         .get("keywords")
@@ -224,6 +230,7 @@ fn registry_server_from_entry(server: &serde_json::Value, source_url: &str) -> R
         summary: str_field("summary", ""),
         version: str_field("version", "?"),
         transport,
+        execution,
         source: source_url.to_string(),
         installed: false,
         keywords,
@@ -381,5 +388,25 @@ mod tests {
         let s = registry_server_from_entry(&e, SOURCE);
         assert_eq!(s.transport, "sse");
         assert!(s.unsupported_on_host);
+    }
+
+    /// Toufic's review of #63: a container's extra flags or a `sudo -E`
+    /// wrapper must not be shown as a plain host launch.
+    #[test]
+    fn an_entry_with_an_execution_backend_says_where_it_runs() {
+        let s = registry_server_from_entry(&entry(None), SOURCE);
+        assert_eq!(s.execution, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("execution"));
+
+        let mut e = entry(None);
+        e["transports"][0]["execution"] = serde_json::json!({"wrapper": ["sudo", "-E"]});
+        let s = registry_server_from_entry(&e, SOURCE);
+        assert_eq!(s.transport, "stdio");
+        assert_eq!(s.execution.as_deref(), Some("wrapper: sudo -E"));
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["execution"],
+            "wrapper: sudo -E",
+            "the --json browse output the agent reads carries it too"
+        );
     }
 }

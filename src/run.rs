@@ -141,8 +141,12 @@ fn run_stdio(
     let program = plan.program.clone();
 
     let launch = crate::pathext::launch_program(&plan.program).map_err(RunError::NotOnPath)?;
+    // Held until the child exits below.
+    let (args, _env_file) = plan
+        .prepare()
+        .map_err(|e| RunError::SpawnFailed(io::Error::other(e)))?;
     let mut child = match Command::new(launch)
-        .args(&plan.args)
+        .args(&args)
         .current_dir(&plan.current_dir)
         .envs(plan.env)
         .stdin(Stdio::inherit())

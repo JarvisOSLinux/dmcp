@@ -16,7 +16,7 @@
 //! spawn time as "No such file or directory"; the container gets the install dir,
 //! the working directory and the configured environment without the manifest
 //! restating them; and, for docker, the configured **values** stay out of the
-//! process table (see `plan_spawn`).
+//! process table and off the docker client (see `SpawnPlan::prepare`).
 //!
 //! Trust is unchanged by this feature. An execution block is part of the
 //! manifest, so it is trusted exactly as far as that manifest is — SHA-256
@@ -45,14 +45,34 @@ pub enum MountInstallDir {
 }
 
 impl MountInstallDir {
-    /// The `:mode` suffix of the `-v` flag, or `None` when nothing is mounted.
-    fn volume_mode(self) -> Option<&'static str> {
-        match self {
-            MountInstallDir::Ro => Some("ro"),
-            MountInstallDir::Rw => Some("rw"),
-            MountInstallDir::None => Option::None,
+    /// The `--mount` value that binds `dir` at the same path, or `None` when
+    /// nothing is mounted.
+    ///
+    /// `--mount`, not `-v`: `-v` splits its value at every `:`, so an install
+    /// dir holding one could not be written at all. `--mount` is one CSV record,
+    /// so the path goes in quoted fields, where a `,` or `"` stays part of it.
+    fn bind_mount(self, dir: &str) -> Option<String> {
+        let readonly = match self {
+            MountInstallDir::Ro => true,
+            MountInstallDir::Rw => false,
+            MountInstallDir::None => return Option::None,
+        };
+        let mut spec = format!(
+            "type=bind,{},{}",
+            csv_field(&format!("src={dir}")),
+            csv_field(&format!("dst={dir}"))
+        );
+        if readonly {
+            spec.push_str(",readonly");
         }
+        Some(spec)
     }
+}
+
+/// One quoted field of the CSV record docker reads `--mount` as (Go's
+/// `encoding/csv`): inside quotes a `,` is data and `""` is one `"`.
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// A validated execution backend.
@@ -189,6 +209,49 @@ impl From<Execution> for ExecutionRepr {
     }
 }
 
+impl Execution {
+    /// One line saying where the launch line runs, for `info`, `list`,
+    /// `browse` and the agent's `get_server_info`. Extra docker flags and the
+    /// wrapper's argv are spelled out in full: `--privileged -v /:/host` or a
+    /// `sudo -E` wrapper is exactly what must not look like a plain host launch.
+    pub fn describe(&self) -> String {
+        match self {
+            Execution::Docker {
+                image,
+                mount_install_dir,
+                extra_args,
+            } => {
+                let mount = match mount_install_dir {
+                    MountInstallDir::Ro => "install dir read-only",
+                    MountInstallDir::Rw => "install dir writable",
+                    MountInstallDir::None => "install dir not mounted",
+                };
+                let mut line = format!("docker image {image}, {mount}");
+                if !extra_args.is_empty() {
+                    line.push_str(&format!(", extra docker flags: {}", extra_args.join(" ")));
+                }
+                line
+            }
+            Execution::Wrapper { program, args } => {
+                let mut argv = vec![program.as_str()];
+                argv.extend(args.iter().map(String::as_str));
+                format!("wrapper: {}", argv.join(" "))
+            }
+        }
+    }
+}
+
+/// [`Execution::describe`] for a transport read as raw JSON (a registry
+/// entry), or `None` when it declares no backend. A block that does not parse
+/// says so, since dmcp would refuse to install it.
+pub fn describe_json(transport: &serde_json::Value) -> Option<String> {
+    let raw = transport.get("execution")?;
+    Some(match Execution::deserialize(raw) {
+        Ok(execution) => execution.describe(),
+        Err(e) => format!("unreadable execution block ({e})"),
+    })
+}
+
 /// Exactly what gets spawned: the whole decision, before any process exists.
 ///
 /// Every stdio spawn site builds its `Command` from one of these and nothing
@@ -199,7 +262,153 @@ pub struct SpawnPlan {
     pub program: String,
     pub args: Vec<String>,
     pub current_dir: PathBuf,
+    /// Set on the spawned process itself.
     pub env: HashMap<String, OsString>,
+    /// Docker only: the container's environment, sorted by key. It reaches
+    /// docker through an `--env-file` that [`SpawnPlan::prepare`] writes, and
+    /// is never set on the docker client.
+    pub container_env: Vec<(String, OsString)>,
+}
+
+impl SpawnPlan {
+    /// The argv to spawn, plus the env file it names when the container has an
+    /// environment.
+    ///
+    /// The env file goes right after `run`, is written 0600 in dmcp's private
+    /// runtime directory, and is removed when the returned [`EnvFile`] drops.
+    /// docker reads it while parsing its own flags, before it starts the
+    /// container, so a caller keeps it until the server has answered the MCP
+    /// handshake (or the child has exited) and may drop it after.
+    pub fn prepare(&self) -> Result<(Vec<String>, Option<EnvFile>), String> {
+        if self.container_env.is_empty() {
+            return Ok((self.args.clone(), None));
+        }
+        let contents = env_file_contents(&self.container_env)?;
+        let file = EnvFile::write(&contents)
+            .map_err(|e| format!("could not write the container's env file: {e}"))?;
+        let mut args = self.args.clone();
+        args.splice(
+            1..1,
+            [
+                "--env-file".to_string(),
+                file.path().to_string_lossy().into_owned(),
+            ],
+        );
+        Ok((args, Some(file)))
+    }
+}
+
+/// A container's env file, removed when dropped.
+#[derive(Debug)]
+pub struct EnvFile {
+    path: PathBuf,
+}
+
+impl EnvFile {
+    fn write(contents: &str) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let dir = env_file_dir()?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        for _ in 0..16 {
+            let path = dir.join(format!(
+                "env-{}-{}-{nanos}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut f) => {
+                    // The guard exists before the write, so a failed write
+                    // still removes the file.
+                    let file = EnvFile { path };
+                    f.write_all(contents.as_bytes())?;
+                    return Ok(file);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("no free env file name in {}", dir.display()),
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EnvFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The broker's directory: 0700 and owned by this uid, or refused.
+#[cfg(unix)]
+fn env_file_dir() -> std::io::Result<PathBuf> {
+    let dir = crate::broker::broker_dir();
+    crate::broker::ensure_broker_dir(&dir).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(dir)
+}
+
+/// The per-user temp directory.
+#[cfg(not(unix))]
+fn env_file_dir() -> std::io::Result<PathBuf> {
+    Ok(std::env::temp_dir())
+}
+
+/// The `--env-file` text for `vars`, or why one of them cannot be carried.
+///
+/// docker reads the file a line at a time (lines up to 64 KiB), splits each at
+/// its first `=`, and rejects a name with whitespace. A setting that does not
+/// fit is refused rather than dropped, since a server started without one of
+/// its settings fails somewhere else, later, for no stated reason. The message
+/// names the key, never the value.
+fn env_file_contents(vars: &[(String, OsString)]) -> Result<String, String> {
+    const MAX_LINE: usize = 64 * 1024 - 1;
+    let mut out = String::new();
+    for (key, value) in vars {
+        if key.is_empty()
+            || key.starts_with('#')
+            || key.contains(|c: char| c == '=' || c == '\0' || c.is_whitespace())
+        {
+            return Err(format!(
+                "setting {key:?} is not a name docker's --env-file can carry"
+            ));
+        }
+        let value = value
+            .to_str()
+            .ok_or_else(|| format!("setting {key} is not valid UTF-8"))?;
+        if value.contains(['\n', '\r', '\0']) {
+            return Err(format!(
+                "setting {key} contains a line break, which docker's --env-file cannot carry"
+            ));
+        }
+        if key.len() + 1 + value.len() > MAX_LINE {
+            return Err(format!(
+                "setting {key} is longer than docker's --env-file reads (64 KiB a line)"
+            ));
+        }
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Turn a launch line plus its backend into the process to spawn.
@@ -209,11 +418,13 @@ pub struct SpawnPlan {
 /// wrapper, where a relative script (`./run-remote.sh`) has to resolve against
 /// the server's own directory.
 ///
-/// `env` — the manifest's config — is set on the spawned process in every case.
-/// Under docker that process is the docker client, and the bare `-e KEY` flags
-/// below forward the values from there into the container. Behind a wrapper it
-/// is the wrapper itself: whether the values travel any further is the wrapper's
-/// business, and an `ssh` hop does **not** carry them by default.
+/// `env` is the manifest's config. Without a backend it is set on the server
+/// process. Behind a wrapper it is set on the wrapper: whether the values
+/// travel any further is the wrapper's business, and an `ssh` hop does **not**
+/// carry them by default. Under docker it becomes `container_env` and is not
+/// set on the docker client at all: a setting named `DOCKER_HOST`, `HOME` or
+/// `PATH` is meant for the server, and on the client it would redirect docker
+/// itself.
 pub fn plan_spawn(
     execution: Option<&Execution>,
     command: &str,
@@ -222,8 +433,14 @@ pub fn plan_spawn(
     env: HashMap<String, OsString>,
 ) -> SpawnPlan {
     let current_dir = install_dir.to_path_buf();
-    let (program, argv) = match execution {
-        None => (command.to_string(), args.to_vec()),
+    match execution {
+        None => SpawnPlan {
+            program: command.to_string(),
+            args: args.to_vec(),
+            current_dir,
+            env,
+            container_env: Vec::new(),
+        },
         Some(Execution::Wrapper {
             program,
             args: prefix,
@@ -231,7 +448,13 @@ pub fn plan_spawn(
             let mut argv = prefix.clone();
             argv.push(command.to_string());
             argv.extend_from_slice(args);
-            (program.clone(), argv)
+            SpawnPlan {
+                program: program.clone(),
+                args: argv,
+                current_dir,
+                env,
+                container_env: Vec::new(),
+            }
         }
         Some(Execution::Docker {
             image,
@@ -240,52 +463,29 @@ pub fn plan_spawn(
         }) => {
             let dir = install_dir.to_string_lossy().into_owned();
             let mut argv = vec!["run".to_string(), "-i".to_string(), "--rm".to_string()];
-            if let Some(mode) = mount_install_dir.volume_mode() {
-                argv.push("-v".to_string());
-                argv.push(format!("{dir}:{dir}:{mode}"));
+            if let Some(spec) = mount_install_dir.bind_mount(&dir) {
+                argv.push("--mount".to_string());
+                argv.push(spec);
             }
             argv.push("-w".to_string());
             argv.push(dir);
-            // Config VALUES never reach argv. The bare `-e KEY` form tells docker
-            // to forward KEY from its own environment — which `env` below is
-            // about to set — so an API token stays out of /proc/<pid>/cmdline,
-            // which every local account can read.
-            for key in forwardable_keys(&env) {
-                argv.push("-e".to_string());
-                argv.push(key);
-            }
             argv.extend_from_slice(extra_args);
             argv.push(image.clone());
             argv.push(command.to_string());
             argv.extend_from_slice(args);
-            ("docker".to_string(), argv)
+            // Sorted: a HashMap's order is arbitrary, and an env file that
+            // varies run to run is neither reproducible nor testable.
+            let mut container_env: Vec<(String, OsString)> = env.into_iter().collect();
+            container_env.sort();
+            SpawnPlan {
+                program: "docker".to_string(),
+                args: argv,
+                current_dir,
+                env: HashMap::new(),
+                container_env,
+            }
         }
-    };
-    SpawnPlan {
-        program,
-        args: argv,
-        current_dir,
-        env,
     }
-}
-
-/// The config keys safe to name in a bare `-e KEY` flag, in a stable order.
-///
-/// A key containing `=` would turn the bare form into `-e KEY=VALUE` and put a
-/// value on the command line after all; a key that is empty or carries a NUL is
-/// not a usable environment name either. Such keys are dropped from the
-/// forwarding list rather than spelled out in argv — they are still set on the
-/// docker client's own environment, so nothing is hidden, only unforwarded.
-/// Sorted because a `HashMap`'s order is arbitrary and an argv that varies run
-/// to run is neither reproducible nor testable.
-fn forwardable_keys(env: &HashMap<String, OsString>) -> Vec<String> {
-    let mut keys: Vec<String> = env
-        .keys()
-        .filter(|k| !k.is_empty() && !k.contains('=') && !k.contains('\0'))
-        .cloned()
-        .collect();
-    keys.sort();
-    keys
 }
 
 /// The refusal when a system-scope server declares an execution backend, or
@@ -462,8 +662,12 @@ mod tests {
                 args: vec!["server.py".to_string()],
                 current_dir: PathBuf::from("/srv/app"),
                 env,
+                container_env: Vec::new(),
             }
         );
+        let (args, env_file) = plan.prepare().unwrap();
+        assert_eq!(args, plan.args);
+        assert!(env_file.is_none());
     }
 
     #[test]
@@ -486,14 +690,10 @@ mod tests {
                 "run",
                 "-i",
                 "--rm",
-                "-v",
-                "/srv/app:/srv/app:ro",
+                "--mount",
+                r#"type=bind,"src=/srv/app","dst=/srv/app",readonly"#,
                 "-w",
                 "/srv/app",
-                "-e",
-                "A_KEY",
-                "-e",
-                "B_KEY",
                 "--cpus",
                 "1",
                 "python:3-slim",
@@ -502,16 +702,55 @@ mod tests {
             ]
         );
         assert_eq!(
+            plan.container_env,
+            vec![
+                ("A_KEY".to_string(), OsString::from("first")),
+                ("B_KEY".to_string(), OsString::from("second")),
+            ],
+            "sorted, so the env file is the same every run"
+        );
+        assert!(plan.env.is_empty());
+        assert_eq!(
             plan.current_dir,
             PathBuf::from("/srv/app"),
             "the host cwd is kept; -w governs the path inside the container"
         );
     }
 
-    /// The property the `-e KEY` bare form exists for: a token is in the
-    /// environment of the process dmcp spawns, and nowhere in its command line.
+    /// Toufic's review of #63: config and the docker client shared one
+    /// environment, so a setting named `DOCKER_HOST`, `HOME` or `PATH` meant for
+    /// the server redirected docker itself.
     #[test]
-    fn config_values_are_passed_by_environment_and_never_by_argv() {
+    fn settings_docker_itself_reads_go_to_the_container_only() {
+        let execution = parse(r#"{"type":"docker","image":"img"}"#).unwrap();
+        let plan = plan_spawn(
+            Some(&execution),
+            "server",
+            &[],
+            Path::new("/srv/app"),
+            env_of(&[
+                ("DOCKER_HOST", "tcp://elsewhere:2375"),
+                ("HOME", "/data"),
+                ("PATH", "/opt/bin"),
+            ]),
+        );
+        assert!(plan.env.is_empty(), "{:?}", plan.env);
+        let (args, env_file) = plan.prepare().unwrap();
+        let env_file = env_file.expect("an env file for the container");
+        assert_eq!(
+            std::fs::read_to_string(env_file.path()).unwrap(),
+            "DOCKER_HOST=tcp://elsewhere:2375\nHOME=/data\nPATH=/opt/bin\n"
+        );
+        assert_eq!(
+            &args[..3],
+            ["run", "--env-file", &*env_file.path().to_string_lossy()]
+        );
+    }
+
+    /// The env file holds what the docker client's environment used to: owner
+    /// only, and only while the container starts.
+    #[test]
+    fn the_env_file_is_private_and_removed_on_drop() {
         let execution = parse(r#"{"type":"docker","image":"img"}"#).unwrap();
         let plan = plan_spawn(
             Some(&execution),
@@ -520,47 +759,53 @@ mod tests {
             Path::new("/srv/app"),
             env_of(&[("BRAVE_API_KEY", "bsk-secret-value")]),
         );
-
+        let (args, env_file) = plan.prepare().unwrap();
+        let env_file = env_file.unwrap();
+        let path = env_file.path().to_path_buf();
         assert!(
-            plan.args.iter().any(|a| a == "BRAVE_API_KEY"),
-            "the key is forwarded: {:?}",
-            plan.args
+            !args.iter().any(|a| a.contains("bsk-secret-value")),
+            "no config value may appear in argv: {args:?}"
         );
-        assert!(
-            !plan.args.iter().any(|a| a.contains("bsk-secret-value")),
-            "no config value may appear in argv: {:?}",
-            plan.args
-        );
-        assert_eq!(
-            plan.env.get("BRAVE_API_KEY").map(|v| v.to_string_lossy()),
-            Some("bsk-secret-value".into())
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{path:?}");
+        }
+        drop(env_file);
+        assert!(!path.exists(), "{path:?}");
     }
 
-    /// A key carrying `=` would smuggle a value into argv through the bare form.
+    /// docker reads the file a line at a time and splits at the first `=`, so
+    /// what it cannot carry is refused by name, never written half-right.
     #[test]
-    fn a_key_that_would_carry_a_value_into_argv_is_not_forwarded() {
-        let execution = parse(r#"{"type":"docker","image":"img"}"#).unwrap();
-        let plan = plan_spawn(
-            Some(&execution),
-            "server",
-            &[],
-            Path::new("/srv"),
-            env_of(&[("SNEAKY=INJECTED", "x"), ("PLAIN", "y")]),
-        );
+    fn a_setting_the_env_file_cannot_carry_is_refused_by_name() {
+        let refused = |key: &str, value: &str| {
+            let vars = vec![(key.to_string(), OsString::from(value))];
+            env_file_contents(&vars).unwrap_err()
+        };
+        assert!(refused("SNEAKY=INJECTED", "x").contains("SNEAKY=INJECTED"));
+        assert!(refused("TWO WORDS", "x").contains("TWO WORDS"));
+        assert!(refused("", "x").contains("not a name"));
+        assert!(refused("#COMMENT", "x").contains("#COMMENT"));
+        let msg = refused("PEM", "-----BEGIN-----\nsecret-body\n");
+        assert!(msg.contains("PEM") && msg.contains("line break"), "{msg}");
         assert!(
-            !plan.args.iter().any(|a| a.contains('=')),
-            "{:?}",
-            plan.args
+            !msg.contains("secret-body"),
+            "the value is never echoed: {msg}"
         );
-        assert!(plan.args.iter().any(|a| a == "PLAIN"));
+        assert!(refused("CR", "a\rb").contains("line break"));
+        assert!(refused("LONG", &"x".repeat(64 * 1024)).contains("64 KiB"));
+
+        let vars = vec![("OK".to_string(), OsString::from("a = b # c, \"d\""))];
+        assert_eq!(env_file_contents(&vars).unwrap(), "OK=a = b # c, \"d\"\n");
     }
 
     #[test]
-    fn mount_none_omits_the_volume_and_rw_asks_for_it() {
+    fn mount_none_omits_the_mount_and_rw_drops_readonly() {
         let none = parse(r#"{"type":"docker","image":"i","mountInstallDir":"none"}"#).unwrap();
         let plan = plan_spawn(Some(&none), "s", &[], Path::new("/srv"), HashMap::new());
-        assert!(!plan.args.iter().any(|a| a == "-v"), "{:?}", plan.args);
+        assert!(!plan.args.iter().any(|a| a == "--mount"), "{:?}", plan.args);
         assert!(
             plan.args.windows(2).any(|w| w == ["-w", "/srv"]),
             "the working directory is set even with nothing mounted: {:?}",
@@ -570,9 +815,25 @@ mod tests {
         let rw = parse(r#"{"type":"docker","image":"i","mountInstallDir":"rw"}"#).unwrap();
         let plan = plan_spawn(Some(&rw), "s", &[], Path::new("/srv"), HashMap::new());
         assert!(
-            plan.args.iter().any(|a| a == "/srv:/srv:rw"),
+            plan.args
+                .windows(2)
+                .any(|w| w == ["--mount", r#"type=bind,"src=/srv","dst=/srv""#]),
             "{:?}",
             plan.args
+        );
+    }
+
+    /// `-v` split at every `:`, so such a path could not be mounted at all, and
+    /// a `,` or `"` would end a field of `--mount`'s CSV record unless quoted.
+    #[test]
+    fn an_install_dir_with_colons_commas_or_quotes_mounts_intact() {
+        let ro = parse(r#"{"type":"docker","image":"i"}"#).unwrap();
+        let dir = Path::new(r#"/home/a:b/c,d/"e""#);
+        let plan = plan_spawn(Some(&ro), "s", &[], dir, HashMap::new());
+        let spec = &plan.args[plan.args.iter().position(|a| a == "--mount").unwrap() + 1];
+        assert_eq!(
+            spec,
+            r#"type=bind,"src=/home/a:b/c,d/""e""","dst=/home/a:b/c,d/""e""",readonly"#
         );
     }
 
@@ -600,6 +861,40 @@ mod tests {
             plan.args
         );
         assert_eq!(plan.current_dir, PathBuf::from("/srv/app"));
+    }
+
+    #[test]
+    fn describe_spells_out_what_widens_the_servers_reach() {
+        let docker = parse(
+            r#"{"type":"docker","image":"img:1","extraArgs":["--privileged","-v","/:/host"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            docker.describe(),
+            "docker image img:1, install dir read-only, extra docker flags: --privileged -v /:/host"
+        );
+        let rw = parse(r#"{"type":"docker","image":"i","mountInstallDir":"rw"}"#).unwrap();
+        assert_eq!(rw.describe(), "docker image i, install dir writable");
+        let none = parse(r#"{"type":"docker","image":"i","mountInstallDir":"none"}"#).unwrap();
+        assert_eq!(none.describe(), "docker image i, install dir not mounted");
+        let wrapper = parse(r#"{"wrapper":["sudo","-E"]}"#).unwrap();
+        assert_eq!(wrapper.describe(), "wrapper: sudo -E");
+    }
+
+    #[test]
+    fn describe_json_reads_a_raw_transport() {
+        let plain = serde_json::json!({"type": "stdio", "command": "s"});
+        assert_eq!(describe_json(&plain), None);
+        let wrapped = serde_json::json!({"type": "stdio", "command": "s",
+            "execution": {"wrapper": ["env"]}});
+        assert_eq!(describe_json(&wrapped).as_deref(), Some("wrapper: env"));
+        let typo = serde_json::json!({"type": "stdio", "command": "s",
+            "execution": {"type": "docker", "imgae": "i"}});
+        let shown = describe_json(&typo).unwrap();
+        assert!(
+            shown.starts_with("unreadable execution block") && shown.contains("imgae"),
+            "{shown}"
+        );
     }
 
     #[test]

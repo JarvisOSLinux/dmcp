@@ -232,14 +232,22 @@ default) means directly on the host, exactly as before the field existed.
 Spawned as:
 
 ```
-docker run -i --rm [-v <installDir>:<installDir>:<mode>] -w <installDir> \
-           [-e KEY ...] [extraArgs ...] <image> <command> <args ...>
+docker run [--env-file <file>] -i --rm \
+           [--mount 'type=bind,"src=<installDir>","dst=<installDir>"[,readonly]'] \
+           -w <installDir> [extraArgs ...] <image> <command> <args ...>
 ```
 
-One `-e KEY` per config key, in the **bare** form: docker forwards the value
-from its own environment, which dmcp sets, so config **values** never appear in
-the command line. A key that is empty or contains `=` is not forwarded (it would
-turn the bare form back into `-e KEY=VALUE`).
+The config keys go into the `--env-file`, one `KEY=VALUE` line each, sorted.
+The file is mode 0600 in dmcp's private runtime directory (`$XDG_RUNTIME_DIR/dmcp`,
+the per-user temp directory on Windows) and is removed once the server has
+answered the MCP handshake. Config **values** therefore never appear in a command
+line, and no config key is set on the docker client, whose own `DOCKER_*`,
+`HOME` and `PATH` stay dmcp's. A key that is empty, starts with `#`, or contains
+`=` or whitespace, or a value with a line break, cannot be written in docker's
+env-file format and makes the spawn fail, naming the key.
+
+`--mount` is a CSV record, so `src` and `dst` are quoted fields: an install dir
+containing `:`, `,` or `"` mounts intact. `--mount` does not relabel for SELinux.
 
 **wrapper:**
 

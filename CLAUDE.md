@@ -301,14 +301,18 @@ Two mutually exclusive forms:
 "execution": {"wrapper": ["ssh", "build-host", "--"]}
 ```
 
-- **docker** → `docker run -i --rm [-v <dir>:<dir>:ro|rw] -w <dir> [-e KEY …]
-  [extraArgs …] <image> <command> <args …>`. `mountInstallDir` defaults to
-  `"ro"`; `"none"` omits the volume but keeps `-w`. One **bare** `-e KEY` per
-  config key: docker forwards the value from its own environment (which
-  `Command::envs` sets), so config **values** never enter argv and therefore
-  never `/proc/<pid>/cmdline`. Keys are sorted for a reproducible argv, and a key
-  that is empty or contains `=` is not forwarded — it would turn the bare form
-  back into `-e KEY=VALUE`.
+- **docker** → `docker run [--env-file <file>] -i --rm [--mount type=bind,"src=<dir>","dst=<dir>"[,readonly]]
+  -w <dir> [extraArgs …] <image> <command> <args …>`. `mountInstallDir` defaults
+  to `"ro"`; `"none"` omits the mount but keeps `-w`. `--mount`, not `-v`: `-v`
+  splits at every `:`; the CSV fields are quoted, so `,` and `"` survive too. The
+  config is `SpawnPlan::container_env`, never `env`: `SpawnPlan::prepare` writes
+  it to a 0600 env file in the broker's directory and splices `--env-file` in
+  after `run`, and the returned `EnvFile` removes it on drop. Every spawn site
+  holds it until the handshake (`run` until the child exits). So config
+  **values** never enter argv (`/proc/<pid>/cmdline`), and a config key named
+  `DOCKER_HOST`/`HOME`/`PATH` reaches the container without redirecting the
+  docker client. What docker's env-file format cannot carry (a line break in a
+  value; `=`, whitespace or a leading `#` in a key) fails the spawn by key name.
 - **wrapper** → `wrapper… <command> <args …>`, an argv prefix dmcp knows nothing
   about. The config env is set on the **wrapper** process and goes no further by
   itself: an `ssh` hop does not carry it, and saying so is the contract.
@@ -325,6 +329,13 @@ execution struct, plus form validation): both forms at once, an empty `wrapper`,
 outcome a manifest asking for a container must never get. The cost is that such a
 manifest does not parse at all — `dmcp list` warns by name, and `uninstall` reads
 the index, so the server is still removable.
+
+**Install refuses a manifest it could not load** (`Manifest::load_error`, in
+`install` and `connect`, ahead of the wipe), and `discovery::get_server` answers
+from the first scope whose index lists the id, so a user-scope manifest that does
+not load is "not found" rather than resolving to a same-id system-scope server.
+`info`, `list`, `browse` (and `--json`) and `get_server_info` show the backend
+through `Execution::describe`, extra docker flags and wrapper argv in full.
 
 **System scope + `execution` is refused** (`execution::system_scope_refusal`),
 before any spawn *and* before the elevation re-exec, on all of `call`, `tools` and
@@ -377,6 +388,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-11-18:* execution backends, after Toufic's review of #63. **Install:** `install` and `connect` copied the manifest JSON to disk unparsed, so a malformed `execution` block installed cleanly (after wiping any working copy) and was "Server not found" from then on; both now refuse up front through `Manifest::load_error`. `discovery::get_server`/`get_manifest_path` no longer fall through to system scope when the user scope lists the id but its manifest does not load, which resolved the name to a same-id server running as root. **Docker env:** config and the docker client shared one environment (bare `-e KEY` read from the client's own), so a setting named `DOCKER_HOST`, `DOCKER_CONFIG`, `HOME` or `PATH` redirected docker itself. `SpawnPlan` now carries `container_env` separately; `SpawnPlan::prepare` writes it to a 0600 `--env-file` in the broker's directory, held by an `EnvFile` guard until the handshake (`run`: until exit), and the docker client gets no config at all. What the env-file format cannot carry is refused by key name rather than dropped. **Mount:** `-v dir:dir:mode` could not express a `:` in the path; `--mount type=bind` with quoted CSV fields can, and survives `,` and `"`. **Visibility:** `info`, `list`, `browse` (and its `--json`) and `get_server_info` show the backend via `Execution::describe`, extra docker flags and wrapper argv in full. **Tests:** `plan_for` asserts on `stdio_spawn_plan`, which does no PATH lookup, so the planning tests pass on Windows; the real-container test now uses an install dir containing `:` and `,` and a `DOCKER_HOST` setting pointing nowhere, which reaches the container while docker still reaches its daemon. Not yet addressed: an older dmcp ignores `execution` and launches on the host (needs a format decision), container cleanup on kill, first-run image pulls inside the handshake, and wrapper quoting.
 
 *2026-11-17:* execution backends (#62). `src/execution.rs` added: `Execution` (validated `Docker`/`Wrapper` variants, parsed through a `deny_unknown_fields` repr so a typo can never read as "no backend"), `plan_spawn` → `SpawnPlan` (program, argv, cwd, env), and `system_scope_refusal`. `Transport::Stdio` gains `execution` plus a `Transport::execution()` accessor; `call::stdio_spawn_plan` is the single decision `build_stdio_command` (one-shot `call`, `tools`, the broker) and `run::run_stdio` both build from, so `dmcp run` cannot be the one surface that ignores a container. Docker argv is `run -i --rm [-v dir:dir:ro|rw] -w dir [-e KEY …] [extraArgs …] image command args…`, with config **values** carried by the environment (bare `-e KEY`, keys sorted, `=`-bearing keys dropped) rather than argv; a wrapper is a plain prefix and the config env stops at the wrapper process. System scope plus a backend is refused before the spawn and before the pkexec re-exec in `call_tool`, `elevate_call_for_system_scope` and `run`, so nobody authenticates their way to a refusal. Verified red-then-green: the integration file does not compile against the pre-feature source; targeted mutations (dropping `deny_unknown_fields`, the mutual-exclusion arm, the required-field checks, the bare `-e` form, the `extraArgs` position, the scope guard, and honouring `execution` at all) each fail exactly the test that names the behaviour, while the no-execution regression pin keeps passing. `tests/execution_backends.rs` runs a real container when `docker ps` works and the image is present or pullable (skips cleanly otherwise), asserting the launch line ran inside the container, the install dir is mounted and current, the config value arrived, and the value is absent from argv. Merged onto the November elevation and Windows work: `pathext::launch_program` resolves only the program the host starts (`docker` or the wrapper's first word, never the launch line that runs inside), the config env is `config_to_env(manifest)`'s declared keys, so an undeclared stored key reaches a container no more than the host, and the system-scope refusal stands in front of `re_exec_elevated`, so it saves a `sudo -A` popup as well as a polkit prompt.
 

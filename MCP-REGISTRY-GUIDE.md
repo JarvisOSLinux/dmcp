@@ -285,12 +285,13 @@ exclusive forms:
 
 **docker** — `image` is required, `mountInstallDir` is `"ro"` (default), `"rw"`
 or `"none"`, and `extraArgs` are inserted before the image. dmcp spawns
-`docker run -i --rm [-v <installDir>:<installDir>:<mode>] -w <installDir>
-[-e KEY …] [extraArgs …] <image> <command> <args …>`, so the install dir is
+`docker run [--env-file <file>] -i --rm [--mount type=bind,src=<installDir>,dst=<installDir>[,readonly]]
+-w <installDir> [extraArgs …] <image> <command> <args …>`, so the install dir is
 mounted at the same path it has on the host and is the working directory inside
-the container — `args` need no rewriting. Each config key is passed as a **bare**
-`-e KEY`, which forwards the value from dmcp's own environment, so config values
-never appear in a command line.
+the container — `args` need no rewriting. The config goes to the container in a
+private env file, so config values never appear in a command line and are never
+set on the docker client itself. A setting docker's env file cannot carry (a
+line break in its value) makes the spawn fail, naming the setting.
 
 **wrapper** — a plain argv prefix; dmcp runs `wrapper… <command> <args …>` and
 knows nothing more about it. **The config environment does not cross a wrapper**:
