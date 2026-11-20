@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::execution::Execution;
 use crate::platform::PlatformDecl;
 
 /// Index file at `<base>/mcp/installed/index.json`
@@ -97,6 +98,12 @@ pub struct Manifest {
     /// pass the gate — an unreadable declaration covers no host.
     #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
     pub platforms: PlatformDecl,
+    /// dmcp features this manifest cannot run without, e.g. `["execution"]`.
+    /// Kept raw and checked by `crate::features` rather than at parse: a list
+    /// naming a feature this dmcp lacks must still load, so `list`, `info` and
+    /// `uninstall` can see the server that every launch path refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_features: Option<serde_json::Value>,
 }
 
 /// One user-facing configuration field declared by a server manifest.
@@ -135,6 +142,12 @@ pub enum Transport {
         /// manifest launching exactly as before.
         #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
         platforms: PlatformDecl,
+        /// Where this launch line runs: in a container, behind an argv prefix,
+        /// or — absent, the default — directly on the host. Per-transport like
+        /// `platforms`, because the backend belongs to the launch line it wraps.
+        /// See `crate::execution`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<Execution>,
     },
     Sse {
         url: String,
@@ -165,6 +178,16 @@ impl Transport {
             | Transport::WebSocket { platforms, .. } => platforms,
         }
     }
+
+    /// The execution backend this transport declares, if any. Only a stdio
+    /// transport has a process to place: a remote endpoint is already running
+    /// wherever its owner put it.
+    pub fn execution(&self) -> Option<&Execution> {
+        match self {
+            Transport::Stdio { execution, .. } => execution.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 impl Manifest {
@@ -176,6 +199,16 @@ impl Manifest {
             self.setup_script_windows.as_deref(),
             self.setup_script.as_deref(),
         )
+    }
+
+    /// Why `raw` would not load as an installed manifest, or `None` when it
+    /// would. Install and connect ask before touching the host: every later
+    /// `list`, `call` and `run` reads the manifest through this type, so one that
+    /// fails here would install cleanly and then be "Server not found" forever.
+    /// The likeliest cause is a malformed `execution` block, which is rejected at
+    /// parse on purpose (see `crate::execution`).
+    pub fn load_error(raw: &serde_json::Value) -> Option<String> {
+        Manifest::deserialize(raw).err().map(|e| e.to_string())
     }
 }
 

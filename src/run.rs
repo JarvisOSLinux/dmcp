@@ -34,6 +34,11 @@ pub enum RunError {
     NoTransports,
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
+    /// The manifest lists `requiredFeatures` this dmcp doesn't have.
+    UnmetFeatures(crate::features::Unmet),
+    /// A system-scope server declares an execution backend; the refusal text
+    /// comes from `crate::execution` so every surface says the same thing.
+    ExecutionInSystemScope(String),
     CommandNotFound(String),
     NotOnPath(crate::pathext::NotFound),
     SpawnFailed(io::Error),
@@ -50,6 +55,8 @@ impl std::fmt::Display for RunError {
                 f,
                 "Server has no stdio transport (remote servers: use the printed URL to connect)"
             ),
+            RunError::ExecutionInSystemScope(msg) => write!(f, "{}", msg),
+            RunError::UnmetFeatures(u) => write!(f, "Refusing to run this server: {}", u),
             RunError::CommandNotFound(cmd) => write!(f, "Command not found: {}", cmd),
             RunError::NotOnPath(e) => write!(f, "{}", e),
             RunError::SpawnFailed(e) => write!(f, "Failed to spawn process: {}", e),
@@ -67,6 +74,7 @@ impl From<crate::transport::SelectError> for RunError {
             crate::transport::SelectError::ForeignHost(detail) => {
                 RunError::NoTransportForHost(detail)
             }
+            crate::transport::SelectError::Unmet(u) => RunError::UnmetFeatures(u),
         }
     }
 }
@@ -87,23 +95,37 @@ pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
     // Re-execute dmcp through pkexec so polkit can authenticate the user.
     // Remote transports (SSE/WebSocket) just print a URL and need no root, and
     // a transport declared for another platform is not the one being spawned —
-    // so the decision reads the host-selected transport, not entry zero.
+    // so the decision reads the host-selected transport, not entry zero. A
+    // transport with an execution backend is refused below, so it must not cost
+    // a password prompt on the way there.
     if scope == Scope::System && !is_elevated() {
-        if let Ok(Transport::Stdio { .. }) =
-            crate::transport::select(manifest.transports.as_deref())
+        if let Ok(selected @ Transport::Stdio { .. }) = crate::transport::select_runnable(&manifest)
         {
-            re_exec_elevated();
+            if selected.execution().is_none() {
+                re_exec_elevated();
+            }
         }
     }
 
-    let primary = crate::transport::select(manifest.transports.as_deref())?;
+    let primary = crate::transport::select_runnable(&manifest)?;
 
     match primary {
-        Transport::Stdio { command, args, .. } => {
-            run_stdio(paths, &manifest, id, command, args.as_deref())
-        }
+        Transport::Stdio { .. } => run_stdio(paths, &manifest, id, scope, primary),
         Transport::Sse { url, .. } => run_remote(&manifest, "SSE", url),
         Transport::WebSocket { ws_url, .. } => run_remote(&manifest, "WebSocket", ws_url),
+    }
+}
+
+/// A spawn plan that could not be built, as `run` reports it. Only two of the
+/// call path's failures can reach here — everything else in `CallError` is about
+/// connecting or elevating, which planning does not do — and the system-scope
+/// refusal is passed through verbatim so `run` and `call` say the same words.
+fn plan_error(e: crate::call::CallError) -> RunError {
+    match e {
+        crate::call::CallError::ExecutionInSystemScope(msg) => {
+            RunError::ExecutionInSystemScope(msg)
+        }
+        _ => RunError::NoStdioTransport,
     }
 }
 
@@ -111,23 +133,25 @@ fn run_stdio(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
-    command: &str,
-    args: Option<&[String]>,
+    scope: Scope,
+    transport: &Transport,
 ) -> Result<(), RunError> {
-    let install_dir = crate::call::resolve_stdio_install_dir(paths, manifest, id)
-        .ok_or(RunError::NoStdioTransport)?;
+    // The same plan the call, tools and session paths spawn from, so `dmcp run`
+    // cannot be the one surface that ignores an execution backend and starts a
+    // containerized server's launch line on the host instead.
+    let plan =
+        crate::call::stdio_spawn_plan(paths, manifest, id, scope, transport).map_err(plan_error)?;
+    let program = plan.program.clone();
 
-    let env = config_to_env(manifest);
-
-    let args: Vec<&str> = args
-        .map(|a| a.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-
-    let program = crate::pathext::launch_program(command).map_err(RunError::NotOnPath)?;
-    let mut child = match Command::new(program)
+    let launch = crate::pathext::launch_program(&plan.program).map_err(RunError::NotOnPath)?;
+    // Held until the child exits below.
+    let (args, _env_file) = plan
+        .prepare()
+        .map_err(|e| RunError::SpawnFailed(io::Error::other(e)))?;
+    let mut child = match Command::new(launch)
         .args(&args)
-        .current_dir(&install_dir)
-        .envs(env)
+        .current_dir(&plan.current_dir)
+        .envs(plan.env)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -135,7 +159,9 @@ fn run_stdio(
     {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(RunError::CommandNotFound(command.to_string()));
+            // The program that is missing, which behind a backend is `docker` or
+            // the wrapper itself, not the manifest's `command`.
+            return Err(RunError::CommandNotFound(program));
         }
         Err(e) => return Err(RunError::SpawnFailed(e)),
     };
@@ -200,12 +226,36 @@ fn run_remote(manifest: &Manifest, transport_name: &str, url: &str) -> Result<()
     Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `dmcp run` refuses the system-scope/execution collision in the same words
+    /// `dmcp call` does — one explanation, wherever the operator meets it.
+    #[test]
+    fn the_system_scope_refusal_survives_the_trip_into_run() {
+        let refusal =
+            crate::execution::system_scope_refusal(Scope::System, Some(&docker()), "com.test.s")
+                .expect("the collision must be refused");
+        let mapped = plan_error(crate::call::CallError::ExecutionInSystemScope(
+            refusal.clone(),
+        ));
+        assert!(matches!(mapped, RunError::ExecutionInSystemScope(_)));
+        assert_eq!(mapped.to_string(), refusal);
+
+        assert!(matches!(
+            plan_error(crate::call::CallError::NoStdioTransport),
+            RunError::NoStdioTransport
+        ));
+    }
+
+    fn docker() -> crate::execution::Execution {
+        serde_json::from_str(r#"{"type":"docker","image":"img"}"#).unwrap()
+    }
+
     /// A manifest command naming a `.cmd` shim without its extension launches
     /// under `dmcp run`, as it does under `dmcp call` (#66).
+    #[cfg(windows)]
     #[test]
     fn run_launches_a_cmd_shim_named_without_its_extension() {
         let dir = std::env::temp_dir().join(format!("dmcp-run-shim-{}", std::process::id()));
@@ -224,7 +274,12 @@ mod tests {
         };
 
         let command = dir.join("srv");
-        let got = run_stdio(&paths, &manifest, "srv", &command.to_string_lossy(), None);
+        let transport: Transport = serde_json::from_value(serde_json::json!({
+            "type": "stdio",
+            "command": command.to_string_lossy(),
+        }))
+        .unwrap();
+        let got = run_stdio(&paths, &manifest, "srv", Scope::User, &transport);
         assert!(got.is_ok(), "{}", got.unwrap_err());
     }
 }

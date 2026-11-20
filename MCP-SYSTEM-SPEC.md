@@ -111,7 +111,7 @@ Each server object in `servers`:
 
 **Required:** `id`, `name`, `summary`, `version`, and either inline `transports` + `source` (for stdio) **or** a `manifest` URL pointing to the server's `manifest.json` (the form the JARVIS mcp-registry uses — transports/source are then fetched from the manifest).
 
-**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`, `setupScriptWindowsSha256`), `platforms` (vetted platforms), `setupScriptWindows` (Windows setup script)
+**Optional:** `requiredFeatures` (dmcp features the manifest needs, §6.1.2), `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`, `setupScriptWindowsSha256`), `platforms` (vetted platforms), `setupScriptWindows` (Windows setup script)
 
 **Integrity:** at install, dmcp verifies the fetched manifest's raw bytes
 against `integrity.manifestSha256` (hard failure on mismatch) and setup scripts
@@ -182,6 +182,7 @@ Structure matches the registry server entry, plus:
 - `command`: Executable (e.g. `python3`, `node`)
 - `args`: Arguments, relative to project root (install dir)
 - Process is spawned with `cwd` = install dir
+- `execution` (optional): run that launch line somewhere other than the host — see 6.1.1
 
 **sse (remote):**
 
@@ -201,6 +202,97 @@ Structure matches the registry server entry, plus:
   "wsUrl": "wss://api.example.com/mcp/ws"
 }
 ```
+
+#### 6.1.1 Execution Backends (stdio only, optional)
+
+A stdio transport may carry an `execution` object — a sibling of `command`,
+`args` and `platforms` — saying where that launch line runs. Absent (the
+default) means directly on the host, exactly as before the field existed.
+
+**docker:**
+
+```json
+{
+  "type": "stdio",
+  "command": "python3",
+  "args": ["/srv/app/server.py"],
+  "execution": {
+    "type": "docker",
+    "image": "python:3-slim",
+    "mountInstallDir": "ro",
+    "extraArgs": ["--cpus", "1"]
+  }
+}
+```
+
+- `image` (required)
+- `mountInstallDir`: `"ro"` (default) | `"rw"` | `"none"`
+- `extraArgs` (optional): inserted into `docker run` **before** the image
+
+Spawned as:
+
+```
+docker run [--env-file <file>] -i --rm \
+           [--mount 'type=bind,"src=<installDir>","dst=<installDir>"[,readonly]'] \
+           -w <installDir> [extraArgs ...] <image> <command> <args ...>
+```
+
+The config keys go into the `--env-file`, one `KEY=VALUE` line each, sorted.
+The file is mode 0600 in dmcp's private runtime directory (`$XDG_RUNTIME_DIR/dmcp`,
+the per-user temp directory on Windows) and is removed once the server has
+answered the MCP handshake. Config **values** therefore never appear in a command
+line, and no config key is set on the docker client, whose own `DOCKER_*`,
+`HOME` and `PATH` stay dmcp's. A key that is empty, starts with `#`, or contains
+`=` or whitespace, or a value with a line break, cannot be written in docker's
+env-file format and makes the spawn fail, naming the key.
+
+`--mount` is a CSV record, so `src` and `dst` are quoted fields: an install dir
+containing `:`, `,` or `"` mounts intact. `--mount` does not relabel for SELinux.
+
+**wrapper:**
+
+```json
+{"execution": {"wrapper": ["ssh", "build-host", "--"]}}
+```
+
+Spawned as `wrapper... <command> <args ...>`. dmcp knows nothing about the
+wrapper; the config environment is set on the wrapper process only, and a
+wrapper that crosses a machine boundary (`ssh`) does not carry it further by
+itself.
+
+In both forms `cwd` stays the host `installDir` (docker's `-w` governs the path
+inside the container; a wrapper needs it so relative paths resolve).
+
+**Rejected, at parse time and never ignored:** both forms in one object, an
+empty `wrapper`, `docker` without an `image`, and any unknown key inside
+`execution`. A typo (`"imgae"`) must not degrade into an unwrapped host spawn,
+so the whole manifest fails to parse instead; `uninstall` reads the index rather
+than the manifest, so such a server is still removable.
+
+**Not supported in system scope.** A system-scope server is launched by
+re-execing dmcp as root (pkexec, or `sudo -A` when `DMCP_SUDO_ASKPASS` answers), whose
+semantics inside a container or behind a wrapper are undefined; the combination is
+refused before any spawn or password prompt.
+
+**Older dmcp.** dmcp 0.2.0 and earlier skip `execution` like any unknown field
+and would launch the line on the host. A registry should not publish manifests
+that use it while such versions are in use; `requiredFeatures` (§6.1.2) covers
+every later version.
+
+#### 6.1.2 Required features (optional)
+
+```json
+"requiredFeatures": ["execution"]
+```
+
+Top-level manifest field: the dmcp features the manifest cannot run without.
+An implementation that does not know a listed name must refuse the manifest at
+install and connect (before any write, clone or setup script; the platform
+override does not apply) and before every launch of an installed copy (before
+any elevation prompt). Such a manifest must still load, so listing, `info` and
+uninstall keep working. Absent or `[]` requires nothing; a value that is not an
+array of strings is refused. Names are matched exactly. Defined names:
+`execution` (§6.1.1).
 
 ### 6.2 Source (for stdio)
 
@@ -331,7 +423,7 @@ When spawning a stdio server:
 2. Load manifest.json
 3. Get the primary transport: the first entry in `transports` whose `platforms` include the host (an entry without `platforms` matches every host) with `type == "stdio"`. If no entry covers the host, the invocation fails naming the platforms the manifest declares
 4. `cwd` = `installDir` from manifest (or dir containing manifest.json)
-5. Execute `command` with `args`
+5. Execute `command` with `args`, through the transport's `execution` backend when it declares one (§6.1.1)
 6. Config is delivered via environment variables (the manifest `config` map, keys verbatim, declared keys only)
 
 Environment: inherit from parent, plus the injected config variables.
@@ -357,6 +449,8 @@ For robustness, an implementation may support:
 ---
 
 ## Changelog — corrected claims
+
+*2026-11-19:* `requiredFeatures` documented (§6.1.2), with the note that dmcp 0.2.0 and older ignore `execution` (§6.1.1).
 
 *2026-07-25:* `platforms` reading rules stated for both fields — absent and empty mean unrestricted, a value that is not an array of platform names is refused on every host, and neither state can make a manifest unparseable.
 

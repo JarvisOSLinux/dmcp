@@ -105,6 +105,7 @@ src/
 ├── vector_index.rs # Semantic search (cosine similarity over embeddings)
 ├── doc_comments.rs # Extract @mcp.tool docstrings from Python servers (search-index fallback)
 ├── elevation.rs # Privilege elevation (Linux: pkexec/polkit; macOS: sudo/osascript)
+├── execution.rs # Execution backends (docker / wrapper) for a stdio launch line
 └── models.rs    # Index, Manifest, Transport structs
 ```
 
@@ -186,6 +187,131 @@ name — PowerShell runs nothing but a `.ps1`, so the entry is what is missing a
 `setupScriptWindows`. On Unix a `#!/usr/bin/env bash` shebang is honoured
 rather than forcing every script through `sh`; a host with no bash falls back to
 `sh` with a warning, so a POSIX script carrying a bash shebang still installs.
+
+## Execution backends
+
+A stdio transport says *what* to launch. An optional `execution` object on that
+transport says *where* it runs — in a container, or behind an argv prefix of the
+manifest's choosing. Absent, the default, means directly on the host, exactly as
+before the field existed.
+
+It sits on the transport, beside `command`, `args` and `platforms`, because the
+backend belongs to the launch line it wraps: the same server can run in a
+container on Linux and natively elsewhere.
+
+**Docker.**
+
+```json
+"transports": [{
+  "type": "stdio",
+  "command": "python3",
+  "args": ["/srv/app/server.py"],
+  "execution": {
+    "type": "docker",
+    "image": "python:3-slim",
+    "mountInstallDir": "ro",
+    "extraArgs": ["--cpus", "1"]
+  }
+}]
+```
+
+`image` is required; `mountInstallDir` is `"ro"` (default), `"rw"` or `"none"`;
+`extraArgs` are inserted into `docker run` before the image. dmcp spawns:
+
+```
+docker run --env-file <file> -i --rm \
+           --mount 'type=bind,"src=<installDir>","dst=<installDir>",readonly' \
+           -w <installDir> --cpus 1 python:3-slim python3 /srv/app/server.py
+```
+
+The install dir is mounted at the same path it has on the host and is the
+working directory inside the container, so `args` need no rewriting. `--mount`
+rather than `-v`, so a path with a `:` or `,` mounts intact. On an
+SELinux-enforcing host the install dir needs a container label
+(`chcon -Rt container_file_t <installDir>`); dmcp does not relabel host files.
+
+The config goes into the `--env-file` (`--env-file` only appears when there is
+config): a file only you can read, in dmcp's private runtime directory, removed
+once the server has started (for `dmcp run`, when it exits). So a token never appears in a
+command line that every local account can read out of `/proc`, and none of the
+settings is set on the `docker` command itself: a setting named `DOCKER_HOST`,
+`HOME` or `PATH` is for the server, not for docker. A setting docker's env file
+cannot carry (a line break in the value, or `=` or a space in the name) is
+refused by name rather than dropped.
+
+**Wrapper.**
+
+```json
+"execution": {"wrapper": ["ssh", "build-host", "--"]}
+```
+
+A generic argv prefix: dmcp runs `ssh build-host -- python3 server.py` and knows
+nothing else about it. **The config environment does not cross a wrapper.** It
+is set on the wrapper process, which is as far as dmcp can take it; forwarding
+it onward (`ssh -o SendEnv`, a `sudo -E`, a script that re-exports) is the
+wrapper's job. A server that needs its API key on the far side of an `ssh` hop
+must arrange that itself.
+
+In both forms the working directory stays the host install dir — harmless under
+docker, where `-w` governs the path inside, and necessary for a wrapper so a
+relative script resolves against the server's own directory.
+
+**Trust.** A wrapper is trusted exactly as far as its manifest is: the manifest
+is SHA-256 verified against the registry entry at install and gated by the same
+trust tier as every other server. An execution block grants a manifest no reach
+it did not already have through `command` — it could always have named `docker`
+there. What it buys is validation, the plumbing above, and keeping secrets out of
+the process table. `dmcp info`, `dmcp list` and `dmcp browse` show where a server
+runs (`Runs in: docker image …, extra docker flags: …`, or `wrapper: …`), so a
+`--privileged` flag or a `sudo -E` wrapper is visible before you install or run
+it.
+
+**Malformed blocks are refused, never ignored.** Both forms at once, an empty
+`wrapper`, `docker` with no `image`, or any unknown key inside `execution` is a
+parse error. A typo like `"imgae"` must not quietly become "no backend declared"
+and start a containerized server's launch line on the host, so the whole manifest
+fails to parse instead: `dmcp list` warns by name that it does not parse, and
+`uninstall` reads the index rather than the manifest, so the server is still
+removable.
+
+**Not available in system scope.** A system-scope server is launched by
+re-execing dmcp as root (pkexec, or `sudo -A`), and what that means once the launch line is
+inside a container or on the far side of an ssh hop is undefined — the elevated
+process would be the backend, not the server. `call`, `tools` and `run` all
+refuse the combination before any spawn, and before the password prompt, so nobody
+authenticates their way to a refusal.
+
+Every spawn site honours the same plan: the one-shot `call`, `tools`, `run` and
+the session broker all build their process from `call::stdio_spawn_plan`, so a
+container cannot be honoured on one path and skipped on another.
+
+**Older dmcp.** dmcp 0.2.0 and earlier don't know `execution` and skip it like any
+field they don't know, so they would run the launch line on the host. Nothing in a
+manifest can change a version that is already released, so the JarvisOS registry
+holds back servers that use `execution` until those versions are out of use. A
+manifest that uses it lists it in `requiredFeatures` (below), which covers every
+dmcp from this one on.
+
+## Required features
+
+```json
+"requiredFeatures": ["execution"]
+```
+
+`requiredFeatures` names the dmcp features a manifest cannot run without. dmcp
+skips manifest fields it doesn't know, so without this list a manifest written
+for a newer dmcp would run in an older one with the new part silently dropped.
+A dmcp that doesn't know a listed name refuses the manifest instead:
+
+- `install` and `connect` refuse it before anything is written or run
+  (`--ignore-platform` does not reach past this);
+- for a server that is already installed (by a newer dmcp before a downgrade,
+  say), `call`, `tools`, `run`, the session broker and `setup` refuse it before
+  the spawn and before any password prompt. It still loads, so `list`, `info`
+  and `uninstall` see it.
+
+Absent or `[]` requires nothing; a value that is not a list of names is refused.
+Names this dmcp knows: `execution`.
 
 ## System-scoped servers
 
@@ -317,6 +443,10 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 
 ## Changelog — corrected claims
+
+*2026-11-19:* `requiredFeatures` (#63 review item 3) — a manifest names the dmcp features it cannot run without, and a dmcp that lacks one refuses it at install, `connect`, and before every launch, instead of running it with the feature dropped. dmcp 0.2.0 and older predate the field, so `execution` manifests are held back by the registry until those are out of use; the Execution backends section says so.
+
+*2026-09-01:* execution backends (#62) — a stdio transport may declare `execution`, either `{"type": "docker", …}` or `{"wrapper": [...]}`, and every spawn site (`call`, `tools`, `run`, the session broker) builds its process from the same plan. Config values reach a container through bare `-e KEY` flags rather than argv; a wrapper does not forward the config environment by itself, which the section above states plainly; a malformed `execution` block is a parse error rather than a silent unwrapped host spawn; and system scope plus a backend is refused before any spawn or polkit prompt.
 
 *2026-07-25:* semantic search carries the platform state too — `sync-index` copies each entry's `platforms` into the vector index and `browse --vector`/`--vectors` mark `unsupported_on_host` in the table and in `--json`, the surface an agent reaches through dispatch. Re-run `dmcp sync-index` to fill an older index. A Windows host with no `setupScriptWindows` now refuses by name instead of handing `setup.sh` to PowerShell.
 

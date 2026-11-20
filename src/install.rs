@@ -38,6 +38,17 @@ pub fn install(
             return Err(InstallError::PlatformUnsupported(refusal));
         }
     }
+    // Also ahead of the wipe below. Features first: a manifest written for a
+    // newer dmcp may also fail to load here, and "update dmcp" is the useful
+    // answer. `--ignore-platform` does not reach past this one.
+    if let Some(unmet) = crate::features::unmet_in(&server) {
+        return Err(InstallError::UnmetFeatures(unmet));
+    }
+    // A manifest dmcp cannot load would replace a working install with one that
+    // is invisible to every later command.
+    if let Some(e) = crate::models::Manifest::load_error(&server) {
+        return Err(InstallError::InvalidManifest(e));
+    }
 
     let install_dir = match scope {
         crate::discovery::Scope::User => paths.user_install_dir().join(id),
@@ -731,6 +742,8 @@ pub enum InstallError {
     SourceRevMismatch { requested: String, got: String },
     TrustDenied(String),
     PlatformUnsupported(crate::platform::UnsupportedHost),
+    UnmetFeatures(crate::features::Unmet),
+    InvalidManifest(String),
 }
 
 impl std::fmt::Display for InstallError {
@@ -768,6 +781,12 @@ impl std::fmt::Display for InstallError {
                 write!(f, "Refused by trust policy: {}", reason)
             }
             InstallError::PlatformUnsupported(refusal) => write!(f, "{}", refusal),
+            InstallError::UnmetFeatures(u) => write!(f, "Refusing to install this server: {}", u),
+            InstallError::InvalidManifest(e) => write!(
+                f,
+                "Refusing to install: dmcp could not load this manifest afterwards: {}",
+                e
+            ),
         }
     }
 }
@@ -1289,6 +1308,113 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, InstallError::PlatformUnsupported(_)));
         assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+    }
+
+    /// A typo in an `execution` block fails the whole manifest parse, so before
+    /// this check the install succeeded and the server was "not found" from then
+    /// on — after the install had already wiped the working copy.
+    #[test]
+    fn a_manifest_dmcp_could_not_load_is_refused_before_the_wipe() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server("")),
+            false,
+            false,
+        )
+        .expect("baseline install");
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        let mut broken = remote_server("");
+        broken["transports"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "stdio",
+                "command": "srv",
+                "execution": {"type": "docker", "imgae": "python:3-slim"},
+            }));
+        let err = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(broken),
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, InstallError::InvalidManifest(_)),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("imgae"), "{err}");
+        assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+        assert!(crate::discovery::get_server(&paths, "test.server").is_some());
+    }
+
+    #[test]
+    fn a_manifest_needing_a_newer_dmcp_is_refused_before_the_wipe() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(remote_server("")),
+            false,
+            false,
+        )
+        .expect("baseline install");
+        let manifest_path = paths.user_install_dir().join("test.server/manifest.json");
+        let before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        let mut newer = remote_server("");
+        newer["requiredFeatures"] = serde_json::json!(["execution", "teleport"]);
+        // `--ignore-platform` is the override for the platform gate only.
+        let err = install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(newer),
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, InstallError::UnmetFeatures(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("teleport") && !msg.contains("execution,"),
+            "{msg}"
+        );
+        assert_eq!(before, std::fs::read_to_string(&manifest_path).unwrap());
+    }
+
+    #[test]
+    fn a_manifest_listing_only_known_features_installs_and_keeps_the_list() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let mut m = remote_server("");
+        m["requiredFeatures"] = serde_json::json!(["execution"]);
+        install(
+            &paths,
+            "test.server",
+            crate::discovery::Scope::User,
+            Some(m),
+            false,
+            false,
+        )
+        .expect("install");
+        let (manifest, _) = crate::discovery::get_server(&paths, "test.server").unwrap();
+        assert_eq!(
+            manifest.required_features,
+            Some(serde_json::json!(["execution"]))
+        );
     }
 
     #[test]

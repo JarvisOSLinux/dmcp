@@ -538,7 +538,7 @@ fn ping(sock: &Path) -> bool {
 /// Create the socket directory 0700 and verify it is owned by the current uid.
 /// Refuse a directory owned by anyone else — the socket must not be hijackable.
 #[cfg(unix)]
-fn ensure_broker_dir(dir: &Path) -> Result<(), SessionError> {
+pub(crate) fn ensure_broker_dir(dir: &Path) -> Result<(), SessionError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     if !dir.exists() {
@@ -918,25 +918,20 @@ mod server {
             // already checked. A raw request over the socket for a stateless or
             // system-scope id must be refused here, never spawned.
             session_gate(scope, manifest.stateful)?;
-            let primary = crate::transport::select(manifest.transports.as_deref())
-                .map_err(|e| e.to_string())?;
-            let (command, args) =
-                match primary {
-                    Transport::Stdio { command, args, .. } => (command.clone(), args.clone()),
-                    _ => return Err(
-                        "session broker supports stdio (local) servers only; remote servers are \
-                         already long-lived"
-                            .to_string(),
-                    ),
-                };
-            let cmd = crate::call::build_stdio_command(
-                &self.paths,
-                &manifest,
-                id,
-                &command,
-                args.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
+            let primary =
+                crate::transport::select_runnable(&manifest).map_err(|e| e.to_string())?;
+            if !matches!(primary, Transport::Stdio { .. }) {
+                return Err(
+                    "session broker supports stdio (local) servers only; remote servers are \
+                     already long-lived"
+                        .to_string(),
+                );
+            }
+            // Held to the end of this function: docker has read the env file
+            // by the time the server answers the handshake below.
+            let (cmd, _env_file) =
+                crate::call::build_stdio_command(&self.paths, &manifest, id, scope, primary)
+                    .map_err(|e| e.to_string())?;
             // `TokioChildProcess::new` spawns the child immediately; `serve`
             // then blocks on the MCP `initialize` handshake. Bound that await:
             // on timeout the serve future (owning `transport`) is dropped, and

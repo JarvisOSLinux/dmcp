@@ -143,6 +143,7 @@ refused, and `community` installs are flagged as not maintainer-reviewed. See
 | `changelog`          | string | Changelog text.                                                 |
 | `scope`              | string | `"user"` (default) or `"system"`. See Scope below.              |
 | `platforms`          | array  | Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`. Omit for unrestricted. See Platforms below. |
+| `requiredFeatures`   | array  | dmcp features the manifest cannot run without, e.g. `["execution"]`. A dmcp that lacks one refuses the manifest. See Required features below. |
 | `setupScript`        | string | For local servers: filename of a shell script inside the server folder (e.g. `"setup.sh"`). For remote servers: URL to download the script. See Setup Script below. |
 | `setupScriptWindows` | string | Windows counterpart of `setupScript` (e.g. `"setup.ps1"`), run through PowerShell. Omit when the server has no Windows setup. |
 
@@ -211,6 +212,7 @@ Runs as a local process. The `command` and `args` are executed from the project 
 | `args`        | array  | Arguments, relative to project root.          |
 | `description` | string | Optional description of this entrypoint.       |
 | `platforms`   | array  | Platforms this entrypoint is for (`"linux"`, `"darwin"`, `"windows"`). Omit to match every host. See Per-transport platforms below. |
+| `execution`   | object | Where this launch line runs — a container, or an argv prefix. Omit to run it on the host. See Execution backends below. |
 
 ### sse (Server-Sent Events)
 
@@ -267,6 +269,64 @@ would launch elsewhere instead of blanking it out — they describe the entry,
 they do not start it. This is per-transport dispatch, not a second trust
 decision — the top-level `platforms` list is what decides whether the server may
 be installed here at all.
+
+### Execution backends
+
+A stdio transport says what to launch; an optional `execution` object on the
+same transport says **where** it runs. Omitting it — the default — runs the
+launch line on the host, exactly as before the field existed. Two mutually
+exclusive forms:
+
+```json
+"execution": {"type": "docker", "image": "python:3-slim",
+              "mountInstallDir": "ro", "extraArgs": ["--cpus", "1"]}
+
+"execution": {"wrapper": ["ssh", "build-host", "--"]}
+```
+
+**docker** — `image` is required, `mountInstallDir` is `"ro"` (default), `"rw"`
+or `"none"`, and `extraArgs` are inserted before the image. dmcp spawns
+`docker run [--env-file <file>] -i --rm [--mount type=bind,src=<installDir>,dst=<installDir>[,readonly]]
+-w <installDir> [extraArgs …] <image> <command> <args …>`, so the install dir is
+mounted at the same path it has on the host and is the working directory inside
+the container — `args` need no rewriting. The config goes to the container in a
+private env file, so config values never appear in a command line and are never
+set on the docker client itself. A setting docker's env file cannot carry (a
+line break in its value) makes the spawn fail, naming the setting.
+
+**wrapper** — a plain argv prefix; dmcp runs `wrapper… <command> <args …>` and
+knows nothing more about it. **The config environment does not cross a wrapper**:
+it is set on the wrapper process, and carrying it further (an `ssh -o SendEnv`, a
+script that re-exports) is the wrapper's job.
+
+A wrapper is trusted exactly as far as its manifest — hash-verified against the
+registry's `integrity` entry and gated by the same trust tier — and grants no
+reach a manifest did not already have through `command`.
+
+Malformed blocks are refused rather than ignored: both forms at once, an empty
+`wrapper`, `docker` without an `image`, and any unknown key inside `execution`
+are parse errors, because a typo silently reading as "no backend" would start a
+containerized server's launch line on the host. Execution backends are not
+supported for **system-scope** servers; that combination is refused before any
+spawn.
+
+**Older dmcp.** dmcp 0.2.0 and earlier skip `execution` like any field they don't
+know and run the launch line on the host. Don't publish a server that relies on
+`execution` while those versions are in use; the JarvisOS registry's validator
+refuses it for now.
+
+### Required features
+
+```json
+"requiredFeatures": ["execution"]
+```
+
+List the dmcp features your manifest cannot run without. dmcp skips fields it
+doesn't know, so a manifest that needs a newer dmcp would otherwise run in an
+older one with the new part dropped. A dmcp that doesn't know a listed name
+refuses the manifest at install and connect, and before every launch of an
+installed copy. Absent or `[]` requires nothing; anything but a list of names is
+refused. Known names: `execution`. dmcp 0.2.0 and older predate the field.
 
 ### Legacy Format (unsupported)
 
@@ -556,6 +616,8 @@ Removal is a simple `rm -rf <installDir>`. All files are self-contained. For sys
 - **Provide a `bugUrl`.** Wrapper UIs can surface it as a "Report Bug" link.
 
 ## Changelog — corrected claims
+
+*2026-11-19:* `requiredFeatures` documented, and the note that dmcp 0.2.0 and older ignore `execution`, so registries should hold such servers back.
 
 *2026-07-25:* the browse marking covers the semantic-search mode too (`sync-index` copies each entry's `platforms` into the vector index; the host verdict is computed at search time), with the re-sync caveat for an older index. The Windows setup fallback corrected: a `"windows"`-vetted entry that ships only `setupScript` fails the install naming the missing `setupScriptWindows`, rather than being handed to PowerShell.
 

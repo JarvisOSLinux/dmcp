@@ -27,6 +27,12 @@ pub enum CallError {
     NoTransports,
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
+    /// The manifest lists `requiredFeatures` this dmcp doesn't have.
+    UnmetFeatures(crate::features::Unmet),
+    /// A system-scope server declares an execution backend. Carries the whole
+    /// refusal, which `crate::execution` owns so every surface says the same
+    /// thing.
+    ExecutionInSystemScope(String),
     SystemScopeRequiresElevation(String),
     ElevationFailed(String, String),
     /// [`CallError::ElevationFailed`] when the child elevated with `sudo -A`.
@@ -44,6 +50,8 @@ impl std::fmt::Display for CallError {
             CallError::NoTransports => write!(f, "No transports defined"),
             CallError::NoTransportForHost(e) => write!(f, "{}", e),
             CallError::NoStdioTransport => write!(f, "Server has no stdio transport"),
+            CallError::UnmetFeatures(u) => write!(f, "Refusing to run this server: {}", u),
+            CallError::ExecutionInSystemScope(msg) => write!(f, "{}", msg),
             CallError::SystemScopeRequiresElevation(id) => write!(
                 f,
                 "System-scope server '{}' needs root and no elevation path is \
@@ -105,6 +113,7 @@ impl From<crate::transport::SelectError> for CallError {
             crate::transport::SelectError::ForeignHost(detail) => {
                 CallError::NoTransportForHost(detail)
             }
+            crate::transport::SelectError::Unmet(u) => CallError::UnmetFeatures(u),
         }
     }
 }
@@ -665,8 +674,12 @@ async fn call_tool_elevated(
 /// run commands and the daemon calls it constantly.
 pub fn elevate_call_for_system_scope(paths: &Paths, id: &str) {
     if let Some((manifest, scope)) = get_server(paths, id) {
-        let selected = crate::transport::select(manifest.transports.as_deref()).ok();
-        if needs_system_elevation(scope, selected, is_elevated()) {
+        let selected = crate::transport::select_runnable(&manifest).ok();
+        // An execution backend in system scope is refused moments later by the
+        // spawn plan; re-execing first would make the human answer a password
+        // prompt to reach that refusal.
+        let refused = selected.and_then(Transport::execution).is_some();
+        if !refused && needs_system_elevation(scope, selected, is_elevated()) {
             re_exec_elevated();
         }
     }
@@ -686,28 +699,66 @@ pub fn resolve_stdio_install_dir(paths: &Paths, manifest: &Manifest, id: &str) -
         .or_else(|| get_manifest_path(paths, id).and_then(|p| p.parent().map(|p| p.to_path_buf())))
 }
 
-/// Build the tokio `Command` for a stdio MCP server: program, args, working
-/// directory, and config-derived env. Factored out of the one-shot call path so
-/// the session broker spawns servers with byte-identical semantics; the one-shot
-/// and session paths must not drift in how a server is launched.
+/// Decide everything about a stdio spawn without performing it: program, args,
+/// working directory, config-derived env, and the execution backend the
+/// transport asks for. The one place that reads an `execution` block, so the
+/// one-shot call, `tools`, `run` and the session broker cannot drift on how a
+/// server is launched — or on which of them honours a container.
+pub fn stdio_spawn_plan(
+    paths: &Paths,
+    manifest: &Manifest,
+    id: &str,
+    scope: Scope,
+    transport: &Transport,
+) -> Result<crate::execution::SpawnPlan, CallError> {
+    let Transport::Stdio {
+        command,
+        args,
+        execution,
+        ..
+    } = transport
+    else {
+        return Err(CallError::NoStdioTransport);
+    };
+    if let Some(msg) = crate::execution::system_scope_refusal(scope, execution.as_ref(), id) {
+        return Err(CallError::ExecutionInSystemScope(msg));
+    }
+    let install_dir =
+        resolve_stdio_install_dir(paths, manifest, id).ok_or(CallError::NoStdioTransport)?;
+    Ok(crate::execution::plan_spawn(
+        execution.as_ref(),
+        command,
+        args.as_deref().unwrap_or_default(),
+        &install_dir,
+        config_to_env(manifest),
+    ))
+}
+
+/// Build the tokio `Command` for a stdio MCP server from its spawn plan.
+/// Factored out of the one-shot call path so the session broker spawns servers
+/// with byte-identical semantics; the one-shot and session paths must not drift
+/// in how a server is launched.
+///
+/// The `EnvFile`, when there is one, is the container's environment: keep it
+/// until the server has answered the MCP handshake (see `SpawnPlan::prepare`).
 pub fn build_stdio_command(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
-    command: &str,
-    args: Option<&[String]>,
-) -> Result<Command, CallError> {
-    let install_dir =
-        resolve_stdio_install_dir(paths, manifest, id).ok_or(CallError::NoStdioTransport)?;
-    let env = config_to_env(manifest);
-    let program = crate::pathext::launch_program(command)
+    scope: Scope,
+    transport: &Transport,
+) -> Result<(Command, Option<crate::execution::EnvFile>), CallError> {
+    let plan = stdio_spawn_plan(paths, manifest, id, scope, transport)?;
+    // The host resolves only the program it starts: behind a backend that is
+    // `docker` or the wrapper, and the launch line runs wherever it takes it.
+    let program = crate::pathext::launch_program(&plan.program)
         .map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
+    let (args, env_file) = plan.prepare().map_err(CallError::ConnectionFailed)?;
     let mut cmd = Command::new(program);
-    let args: Vec<&str> = args
-        .map(|a| a.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-    cmd.args(&args).current_dir(&install_dir).envs(env);
-    Ok(cmd)
+    cmd.args(&args)
+        .current_dir(&plan.current_dir)
+        .envs(plan.env);
+    Ok((cmd, env_file))
 }
 
 /// Call a tool on an installed MCP server.
@@ -720,7 +771,13 @@ pub async fn call_tool(
     let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let primary = crate::transport::select(manifest.transports.as_deref())?;
+    let primary = crate::transport::select_runnable(&manifest)?;
+
+    // Before elevation, not after: the two are incompatible, so delegating a
+    // call that is going to be refused anyway would spend a password prompt on it.
+    if let Some(msg) = crate::execution::system_scope_refusal(scope, primary.execution(), id) {
+        return Err(CallError::ExecutionInSystemScope(msg));
+    }
 
     // A system-scope stdio server's tools must run as root. The CLI has already
     // re-exec'd by now; an unelevated caller (the agent surface) hands the call
@@ -740,17 +797,8 @@ pub async fn call_tool(
     }
 
     match primary {
-        Transport::Stdio { command, args, .. } => {
-            call_tool_stdio(
-                paths,
-                &manifest,
-                id,
-                command,
-                args.as_deref(),
-                tool_name,
-                arguments,
-            )
-            .await
+        Transport::Stdio { .. } => {
+            call_tool_stdio(paths, &manifest, id, scope, primary, tool_name, arguments).await
         }
         Transport::Sse { url, .. } => call_tool_remote(url, "sse", tool_name, arguments).await,
         Transport::WebSocket { ws_url, .. } => {
@@ -763,12 +811,12 @@ async fn call_tool_stdio(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
-    command: &str,
-    args: Option<&[String]>,
+    scope: Scope,
+    transport: &Transport,
     tool_name: &str,
     arguments: Option<serde_json::Value>,
 ) -> Result<CallToolResult, CallError> {
-    let cmd = build_stdio_command(paths, manifest, id, command, args)?;
+    let (cmd, _env_file) = build_stdio_command(paths, manifest, id, scope, transport)?;
 
     // Piped instead of rmcp's inherited default: the relay keeps the same live
     // view a caller had under inheritance, and the retained copy lets a failed
@@ -866,15 +914,13 @@ async fn call_tool_remote(
 
 /// List tools available on a server.
 pub async fn list_tools(paths: &Paths, id: &str) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    let (manifest, _) =
+    let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let primary = crate::transport::select(manifest.transports.as_deref())?;
+    let primary = crate::transport::select_runnable(&manifest)?;
 
     match primary {
-        Transport::Stdio { command, args, .. } => {
-            list_tools_stdio(paths, &manifest, id, command, args.as_deref()).await
-        }
+        Transport::Stdio { .. } => list_tools_stdio(paths, &manifest, id, scope, primary).await,
         Transport::Sse { url, .. } => list_tools_remote(url).await,
         Transport::WebSocket { ws_url, .. } => list_tools_remote(ws_url).await,
     }
@@ -884,10 +930,10 @@ async fn list_tools_stdio(
     paths: &Paths,
     manifest: &Manifest,
     id: &str,
-    command: &str,
-    args: Option<&[String]>,
+    scope: Scope,
+    transport: &Transport,
 ) -> Result<Vec<rmcp::model::Tool>, CallError> {
-    let cmd = build_stdio_command(paths, manifest, id, command, args)?;
+    let (cmd, _env_file) = build_stdio_command(paths, manifest, id, scope, transport)?;
 
     let transport =
         TokioChildProcess::new(cmd).map_err(|e| CallError::ConnectionFailed(e.to_string()))?;
@@ -961,11 +1007,243 @@ mod tests {
             args: None,
             description: None,
             platforms: PlatformDecl::Absent,
+            execution: None,
         }]
     }
 
     fn selected(transports: &[Transport]) -> Option<&Transport> {
         crate::transport::select(Some(transports)).ok()
+    }
+
+    /// A manifest whose `installDir` is absolute, so the spawn plan resolves
+    /// without an index or a manifest on disk.
+    /// A manifest that declares every key in `config`, as the registry's
+    /// manifests do: an undeclared key never reaches a spawn (`config_to_env`).
+    /// The fixtures' install dir, absolute on this host: Windows calls a path
+    /// absolute only with a drive, and an install dir that isn't absolute is
+    /// looked up in the index instead (there is none here).
+    const APP: &str = if cfg!(windows) {
+        "C:/srv/app"
+    } else {
+        "/srv/app"
+    };
+
+    fn manifest_with(transport: serde_json::Value, config: serde_json::Value) -> Manifest {
+        let declared: Vec<serde_json::Value> = config
+            .as_object()
+            .map(|c| c.keys().map(|k| serde_json::json!({"key": k})).collect())
+            .unwrap_or_default();
+        serde_json::from_value(serde_json::json!({
+            "id": "com.test.s",
+            "installDir": APP,
+            "transports": [transport],
+            "configurableProperties": declared,
+            "config": config,
+        }))
+        .expect("fixture manifest must parse")
+    }
+
+    fn paths() -> Paths {
+        Paths {
+            user_sources: PathBuf::from("/home/u/.config/mcp/sources.list"),
+            user_install_dir: PathBuf::from("/home/u/.local/share/mcp/installed"),
+            system_sources: PathBuf::from("/etc/mcp/sources.list"),
+            system_install_dir: PathBuf::from("/usr/share/mcp/installed"),
+            vector_index_dir: PathBuf::from("/home/u/.local/share/mcp/vector_index"),
+        }
+    }
+
+    /// What the spawn plan says will exec, read back for assertions. Read from
+    /// `stdio_spawn_plan`, which does no PATH lookup, so a bare `python3` or
+    /// `docker` plans the same on every host (Windows resolves through PATHEXT
+    /// in `build_stdio_command`, where an uninstalled program is `NotFound`).
+    #[derive(Debug)]
+    struct Spawned {
+        program: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+        container_env: Vec<(String, String)>,
+    }
+
+    fn plan_for(manifest: &Manifest, scope: Scope) -> Result<Spawned, CallError> {
+        let transport = crate::transport::select(manifest.transports.as_deref()).unwrap();
+        let plan = stdio_spawn_plan(&paths(), manifest, "com.test.s", scope, transport)?;
+        let text =
+            |(k, v): (&String, &std::ffi::OsString)| (k.clone(), v.to_string_lossy().into_owned());
+        let mut env: Vec<(String, String)> = plan.env.iter().map(text).collect();
+        env.sort();
+        Ok(Spawned {
+            program: plan.program,
+            args: plan.args,
+            cwd: plan.current_dir,
+            env,
+            container_env: plan
+                .container_env
+                .iter()
+                .map(|(k, v)| text((k, v)))
+                .collect(),
+        })
+    }
+
+    /// The regression pin. A manifest with no `execution` must produce exactly
+    /// the launch this built before execution backends existed: the manifest's
+    /// own command and args, the install dir as cwd, config as environment.
+    #[test]
+    fn a_transport_without_execution_spawns_exactly_as_before() {
+        let manifest = manifest_with(
+            serde_json::json!({"type": "stdio", "command": "python3", "args": ["server.py"]}),
+            serde_json::json!({"BRAVE_API_KEY": "bsk-secret-value"}),
+        );
+        let Spawned {
+            program,
+            args,
+            cwd,
+            env,
+            container_env,
+        } = plan_for(&manifest, Scope::User).unwrap();
+
+        assert_eq!(program, "python3");
+        assert_eq!(args, vec!["server.py"]);
+        assert_eq!(cwd, PathBuf::from(APP));
+        assert_eq!(
+            env,
+            vec![("BRAVE_API_KEY".to_string(), "bsk-secret-value".to_string())]
+        );
+        assert!(container_env.is_empty());
+    }
+
+    #[test]
+    fn a_docker_transport_gives_the_settings_to_the_container_not_to_docker() {
+        let manifest = manifest_with(
+            serde_json::json!({
+                "type": "stdio",
+                "command": "python3",
+                "args": ["/srv/app/server.py"],
+                "execution": {
+                    "type": "docker",
+                    "image": "python:3-slim",
+                    "extraArgs": ["--cpus", "1"],
+                },
+            }),
+            serde_json::json!({"BRAVE_API_KEY": "bsk-secret-value"}),
+        );
+        let Spawned {
+            program,
+            args,
+            cwd,
+            env,
+            container_env,
+        } = plan_for(&manifest, Scope::User).unwrap();
+
+        assert_eq!(program, "docker");
+        let mount = format!("type=bind,\"src={APP}\",\"dst={APP}\",readonly");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "--mount",
+                mount.as_str(),
+                "-w",
+                APP,
+                "--cpus",
+                "1",
+                "python:3-slim",
+                "python3",
+                "/srv/app/server.py",
+            ]
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("bsk-secret-value")),
+            "the token must not be in the command line: {args:?}"
+        );
+        assert_eq!(
+            container_env,
+            vec![("BRAVE_API_KEY".to_string(), "bsk-secret-value".to_string())],
+            "the token goes to the container, through the env file"
+        );
+        assert!(
+            env.is_empty(),
+            "nothing is set on the docker client: {env:?}"
+        );
+        assert_eq!(
+            cwd,
+            PathBuf::from(APP),
+            "the host cwd is unchanged; -w governs the path inside"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_transport_prefixes_the_launch_line() {
+        let manifest = manifest_with(
+            serde_json::json!({
+                "type": "stdio",
+                "command": "python3",
+                "args": ["server.py"],
+                "execution": {"wrapper": ["ssh", "build-host", "--"]},
+            }),
+            serde_json::json!({"TOKEN": "s3cr3t"}),
+        );
+        let Spawned {
+            program,
+            args,
+            cwd,
+            env,
+            ..
+        } = plan_for(&manifest, Scope::User).unwrap();
+
+        assert_eq!(program, "ssh");
+        assert_eq!(args, vec!["build-host", "--", "python3", "server.py"]);
+        assert_eq!(cwd, PathBuf::from(APP));
+        assert_eq!(
+            env,
+            vec![("TOKEN".to_string(), "s3cr3t".to_string())],
+            "the config env is set on the wrapper, which is as far as dmcp can take it"
+        );
+    }
+
+    /// The collision refused before anything is spawned or elevated.
+    #[test]
+    fn a_system_scope_server_with_an_execution_backend_is_refused() {
+        let manifest = manifest_with(
+            serde_json::json!({
+                "type": "stdio",
+                "command": "python3",
+                "execution": {"type": "docker", "image": "python:3-slim"},
+            }),
+            serde_json::json!({}),
+        );
+        let err = plan_for(&manifest, Scope::System).unwrap_err();
+        let CallError::ExecutionInSystemScope(ref msg) = err else {
+            panic!("expected a system-scope refusal, got {err:?}");
+        };
+        assert!(msg.contains("com.test.s"), "{msg}");
+        assert!(msg.contains("pkexec"), "the refusal says why: {msg}");
+
+        // The same server in user scope is fine — scope is the whole reason.
+        assert!(plan_for(&manifest, Scope::User).is_ok());
+    }
+
+    /// Refusing must come *before* the elevation re-exec, or a human answers a
+    /// password prompt only to be told the combination is unsupported.
+    #[test]
+    fn a_refused_combination_never_reaches_the_elevation_predicate() {
+        let transports: Vec<Transport> = serde_json::from_value(serde_json::json!([{
+            "type": "stdio",
+            "command": "python3",
+            "execution": {"type": "docker", "image": "python:3-slim"},
+        }]))
+        .unwrap();
+        let selected = selected(&transports);
+        assert!(
+            selected.and_then(Transport::execution).is_some(),
+            "the guard `elevate_call_for_system_scope` reads must see the backend"
+        );
+        // The predicate itself still says "this would need root" — the guard is
+        // what stops the re-exec, not a weakened definition of elevation.
+        assert!(needs_system_elevation(Scope::System, selected, false));
     }
 
     #[test]
@@ -995,10 +1273,67 @@ mod tests {
         // PATHEXT, so a bare `srv` is `NotFound` there. The test binary's own
         // path resolves on every OS; nothing is spawned.
         let exe = std::env::current_exe().unwrap();
-        let cmd =
-            build_stdio_command(&paths, &manifest, "srv", &exe.to_string_lossy(), None).unwrap();
-        let envs: Vec<(String, Option<String>)> = cmd
-            .as_std()
+        let transport: Transport = serde_json::from_value(
+            serde_json::json!({"type": "stdio", "command": exe.to_string_lossy()}),
+        )
+        .unwrap();
+        let (cmd, _) =
+            build_stdio_command(&paths, &manifest, "srv", Scope::User, &transport).unwrap();
+
+        assert_eq!(
+            spawn_env(&cmd),
+            vec![("API_KEY".to_string(), Some("k-1".to_string()))]
+        );
+    }
+
+    /// The declared-keys filter holds behind a container too: the container
+    /// gets exactly the env file's variables, so an undeclared stored key must
+    /// be missing from it, or `NODE_OPTIONS` would run inside the image.
+    #[test]
+    fn a_container_gets_only_the_settings_its_manifest_declares() {
+        let manifest = Manifest {
+            install_dir: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            configurable_properties: vec![crate::models::ConfigurableProperty {
+                key: "API_KEY".into(),
+                ..Default::default()
+            }],
+            config: [("API_KEY", "k-1"), ("NODE_OPTIONS", "--import=data:,x")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect(),
+            ..Default::default()
+        };
+        let root = std::env::temp_dir().join("dmcp-unused");
+        let paths = Paths {
+            user_sources: root.join("u.list"),
+            user_install_dir: root.join("u"),
+            system_sources: root.join("s.list"),
+            system_install_dir: root.join("s"),
+            vector_index_dir: root.join("v"),
+        };
+        let transport: Transport = serde_json::from_value(serde_json::json!({
+            "type": "stdio",
+            "command": "srv",
+            "execution": {"type": "docker", "image": "img"},
+        }))
+        .unwrap();
+
+        let plan = stdio_spawn_plan(&paths, &manifest, "srv", Scope::User, &transport).unwrap();
+        assert_eq!(plan.program, "docker");
+        assert_eq!(
+            plan.container_env,
+            vec![("API_KEY".to_string(), std::ffi::OsString::from("k-1"))]
+        );
+        assert!(plan.env.is_empty(), "{:?}", plan.env);
+        assert!(
+            !plan.args.iter().any(|a| a.contains("NODE_OPTIONS")),
+            "{:?}",
+            plan.args
+        );
+    }
+
+    fn spawn_env(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.as_std()
             .get_envs()
             .map(|(k, v)| {
                 (
@@ -1006,9 +1341,7 @@ mod tests {
                     v.map(|v| v.to_string_lossy().into_owned()),
                 )
             })
-            .collect();
-
-        assert_eq!(envs, vec![("API_KEY".to_string(), Some("k-1".to_string()))]);
+            .collect()
     }
 
     #[test]
@@ -1073,6 +1406,7 @@ mod tests {
                 platforms: PlatformDecl::Declared(vec![
                     crate::platform::host_platform().to_string()
                 ]),
+                execution: None,
             },
         ];
         assert!(needs_system_elevation(
@@ -1093,6 +1427,7 @@ mod tests {
             platforms: PlatformDecl::Declared(
                 vec![crate::platform::foreign_platform().to_string()],
             ),
+            execution: None,
         }];
         assert!(selected(&transports).is_none());
         assert!(!needs_system_elevation(
@@ -1113,6 +1448,7 @@ mod tests {
             platforms: PlatformDecl::Declared(
                 vec![crate::platform::foreign_platform().to_string()],
             ),
+            execution: None,
         }];
         let err: CallError = crate::transport::select(Some(&transports))
             .unwrap_err()

@@ -14,6 +14,10 @@ pub struct ServerInfo {
     pub name: String,
     pub version: String,
     pub transport_type: String,
+    /// Where that transport's launch line runs, when not directly on the host
+    /// (see `Execution::describe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
     pub scope: Scope,
     /// Path to manifest.json (or install dir for backwards compatibility in JSON)
     #[serde(alias = "install_dir")]
@@ -119,18 +123,23 @@ fn load_from_scope(base: &Path, scope: Scope, debug: bool) -> Option<Vec<ServerI
         // Report the transport this host would launch. Falling back to the first
         // entry keeps the listing informative for a server declared only for
         // other platforms, rather than blanking it out to "unknown".
-        let transport_type = manifest
+        let shown = manifest
             .transports
             .as_ref()
-            .and_then(|t| crate::transport::select(Some(t)).ok().or_else(|| t.first()))
+            .and_then(|t| crate::transport::select(Some(t)).ok().or_else(|| t.first()));
+        let transport_type = shown
             .map(transport_type_name)
             .unwrap_or_else(|| "unknown".to_string());
+        let execution = shown
+            .and_then(crate::models::Transport::execution)
+            .map(crate::execution::Execution::describe);
 
         servers.push(ServerInfo {
             id: manifest.id.unwrap_or(id),
             name: manifest.name.unwrap_or_else(|| "Unknown".to_string()),
             version: manifest.version.unwrap_or_else(|| "?".to_string()),
             transport_type,
+            execution,
             scope,
             manifest_path: entry.location.clone(),
         });
@@ -158,20 +167,31 @@ fn transport_type_name(t: &crate::models::Transport) -> String {
 
 /// Get a single server by id. User scope is checked first.
 pub fn get_server(paths: &Paths, id: &str) -> Option<(Manifest, Scope)> {
-    // Check user scope first
-    if let Some((m, scope, _)) = load_server_from_scope(paths.user_install_dir(), id, Scope::User) {
-        return Some((m, scope));
-    }
-    // Then system scope
-    load_server_from_scope(paths.system_install_dir(), id, Scope::System).map(|(m, s, _)| (m, s))
+    load_server(paths, id).map(|(m, s, _)| (m, s))
 }
 
 /// Get the path to a server's manifest.json. User scope checked first.
 pub fn get_manifest_path(paths: &Paths, id: &str) -> Option<std::path::PathBuf> {
-    if let Some((_, _, path)) = load_server_from_scope(paths.user_install_dir(), id, Scope::User) {
-        return Some(path);
+    load_server(paths, id).map(|(_, _, p)| p)
+}
+
+/// The installed server `id`, user scope first.
+///
+/// The first scope whose index lists `id` answers, even when its manifest does
+/// not load. Falling through to the next scope on a load failure would turn a
+/// broken user-scope install into the same-id system-scope server, which runs
+/// as root: a different server, at a different privilege, under the name the
+/// caller asked for.
+fn load_server(paths: &Paths, id: &str) -> Option<(Manifest, Scope, std::path::PathBuf)> {
+    for (base, scope) in [
+        (paths.user_install_dir(), Scope::User),
+        (paths.system_install_dir(), Scope::System),
+    ] {
+        if indexed_manifest_path(base, id).is_some() {
+            return load_server_from_scope(base, id, scope);
+        }
     }
-    load_server_from_scope(paths.system_install_dir(), id, Scope::System).map(|(_, _, p)| p)
+    None
 }
 
 /// Get manifest path, install dir, and scope for uninstall.
@@ -246,5 +266,67 @@ fn enrich_manifest_from_doc_comments(manifest: &mut Manifest, manifest_path: &Pa
     let docs = doc_comments::extract_tool_docs(install_dir);
     if let Some(desc) = doc_comments::first_description(&docs) {
         manifest.description = Some(desc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Tree(std::path::PathBuf);
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(name: &str) -> (Tree, Paths) {
+        let root =
+            std::env::temp_dir().join(format!("dmcp-discovery-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths {
+            user_sources: root.join("u.list"),
+            user_install_dir: root.join("user"),
+            system_sources: root.join("s.list"),
+            system_install_dir: root.join("system"),
+            vector_index_dir: root.join("v"),
+        };
+        (Tree(root), paths)
+    }
+
+    fn install_at(base: &Path, id: &str, manifest: &str) {
+        let dir = base.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("manifest.json");
+        std::fs::write(&manifest_path, manifest).unwrap();
+        let index = serde_json::json!({
+            "servers": {id: {"location": manifest_path.to_string_lossy()}}
+        });
+        std::fs::write(base.join("index.json"), index.to_string()).unwrap();
+    }
+
+    const GOOD: &str = r#"{"id": "srv", "transports": [{"type": "stdio", "command": "srv"}]}"#;
+    const BROKEN: &str = r#"{"id": "srv", "transports": [{"type": "stdio", "command": "srv",
+        "execution": {"type": "docker", "imgae": "python:3-slim"}}]}"#;
+
+    #[test]
+    fn a_user_install_that_does_not_load_does_not_resolve_to_the_system_one() {
+        let (_t, paths) = tree("no-fallthrough");
+        install_at(paths.user_install_dir(), "srv", BROKEN);
+        install_at(paths.system_install_dir(), "srv", GOOD);
+
+        assert!(get_server(&paths, "srv").is_none());
+        assert!(get_manifest_path(&paths, "srv").is_none());
+    }
+
+    #[test]
+    fn the_system_install_answers_when_user_scope_does_not_list_the_id() {
+        let (_t, paths) = tree("system-only");
+        install_at(paths.user_install_dir(), "other", GOOD);
+        install_at(paths.system_install_dir(), "srv", GOOD);
+
+        let (_, scope) = get_server(&paths, "srv").expect("system install");
+        assert_eq!(scope, Scope::System);
     }
 }
