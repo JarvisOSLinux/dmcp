@@ -32,3 +32,17 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Lib tests only: the integration tests have not been checked on
+      # Windows yet.
+      - name: Test
+        run: cargo test --lib

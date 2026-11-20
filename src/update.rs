@@ -368,13 +368,24 @@ fn fetch_registry_value(
 /// bare filesystem path. Returns `None` for `http(s)://` URLs (fetched over the
 /// network).
 fn local_path_from_url(url: &str) -> Option<PathBuf> {
+    local_path_for_host(platform::host_platform(), url)
+}
+
+fn local_path_for_host(host: &str, url: &str) -> Option<PathBuf> {
     if let Some(rest) = url.strip_prefix("file://") {
         // file:///abs → "/abs" (empty host). file://host/abs → strip the host.
         let path = if rest.starts_with('/') {
-            rest.to_string()
+            rest
         } else {
-            let i = rest.find('/')?;
-            rest[i..].to_string()
+            &rest[rest.find('/')?..]
+        };
+        // A Windows drive follows the authority's slash (`file:///C:/reg`), and
+        // `/C:/reg` is not a path Windows can open.
+        let path = match path.as_bytes() {
+            [b'/', drive, b':', ..] if host == "windows" && drive.is_ascii_alphabetic() => {
+                &path[1..]
+            }
+            _ => path,
         };
         return Some(PathBuf::from(path));
     }
@@ -653,6 +664,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_windows_file_url_maps_to_its_drive() {
+        for url in [
+            "file:///C:/reg/registry.json",
+            "file://localhost/C:/reg/registry.json",
+        ] {
+            assert_eq!(
+                local_path_for_host("windows", url),
+                Some(PathBuf::from("C:/reg/registry.json")),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            local_path_for_host("windows", "file:///reg/registry.json"),
+            Some(PathBuf::from("/reg/registry.json")),
+            "a drive-less path stays rooted on the current drive"
+        );
+        assert_eq!(
+            local_path_for_host("linux", "file:///C:/reg/registry.json"),
+            Some(PathBuf::from("/C:/reg/registry.json")),
+            "`C:` is an ordinary directory name off Windows"
+        );
+    }
+
+    #[test]
     fn parse_registry_entries_reads_object_and_array() {
         let obj = serde_json::json!({
             "servers": {
@@ -851,7 +886,15 @@ pub(crate) mod tests {
 
         let sources = paths.user_sources_path();
         std::fs::create_dir_all(sources.parent().unwrap()).unwrap();
-        std::fs::write(sources, format!("file://{}\n", reg_path.display())).unwrap();
+        std::fs::write(sources, format!("{}\n", file_url(&reg_path))).unwrap();
+    }
+
+    /// `file:///C:/…` on Windows: the drive goes after the authority's slash,
+    /// and a URL separates segments with `/`.
+    fn file_url(path: &Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        let slash = if path.starts_with('/') { "" } else { "/" };
+        format!("file://{slash}{path}")
     }
 
     /// A registry entry for a remote server: installing it clones and runs
