@@ -1019,6 +1019,15 @@ mod tests {
     /// without an index or a manifest on disk.
     /// A manifest that declares every key in `config`, as the registry's
     /// manifests do: an undeclared key never reaches a spawn (`config_to_env`).
+    /// The fixtures' install dir, absolute on this host: Windows calls a path
+    /// absolute only with a drive, and an install dir that isn't absolute is
+    /// looked up in the index instead (there is none here).
+    const APP: &str = if cfg!(windows) {
+        "C:/srv/app"
+    } else {
+        "/srv/app"
+    };
+
     fn manifest_with(transport: serde_json::Value, config: serde_json::Value) -> Manifest {
         let declared: Vec<serde_json::Value> = config
             .as_object()
@@ -1026,7 +1035,7 @@ mod tests {
             .unwrap_or_default();
         serde_json::from_value(serde_json::json!({
             "id": "com.test.s",
-            "installDir": "/srv/app",
+            "installDir": APP,
             "transports": [transport],
             "configurableProperties": declared,
             "config": config,
@@ -1096,7 +1105,7 @@ mod tests {
 
         assert_eq!(program, "python3");
         assert_eq!(args, vec!["server.py"]);
-        assert_eq!(cwd, PathBuf::from("/srv/app"));
+        assert_eq!(cwd, PathBuf::from(APP));
         assert_eq!(
             env,
             vec![("BRAVE_API_KEY".to_string(), "bsk-secret-value".to_string())]
@@ -1128,6 +1137,7 @@ mod tests {
         } = plan_for(&manifest, Scope::User).unwrap();
 
         assert_eq!(program, "docker");
+        let mount = format!("type=bind,\"src={APP}\",\"dst={APP}\",readonly");
         assert_eq!(
             args,
             vec![
@@ -1135,9 +1145,9 @@ mod tests {
                 "-i",
                 "--rm",
                 "--mount",
-                "type=bind,\"src=/srv/app\",\"dst=/srv/app\",readonly",
+                mount.as_str(),
                 "-w",
-                "/srv/app",
+                APP,
                 "--cpus",
                 "1",
                 "python:3-slim",
@@ -1160,7 +1170,7 @@ mod tests {
         );
         assert_eq!(
             cwd,
-            PathBuf::from("/srv/app"),
+            PathBuf::from(APP),
             "the host cwd is unchanged; -w governs the path inside"
         );
     }
@@ -1186,7 +1196,7 @@ mod tests {
 
         assert_eq!(program, "ssh");
         assert_eq!(args, vec!["build-host", "--", "python3", "server.py"]);
-        assert_eq!(cwd, PathBuf::from("/srv/app"));
+        assert_eq!(cwd, PathBuf::from(APP));
         assert_eq!(
             env,
             vec![("TOKEN".to_string(), "s3cr3t".to_string())],
