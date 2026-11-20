@@ -27,6 +27,8 @@ pub enum CallError {
     NoTransports,
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
+    /// The manifest lists `requiredFeatures` this dmcp doesn't have.
+    UnmetFeatures(crate::features::Unmet),
     /// A system-scope server declares an execution backend. Carries the whole
     /// refusal, which `crate::execution` owns so every surface says the same
     /// thing.
@@ -48,6 +50,7 @@ impl std::fmt::Display for CallError {
             CallError::NoTransports => write!(f, "No transports defined"),
             CallError::NoTransportForHost(e) => write!(f, "{}", e),
             CallError::NoStdioTransport => write!(f, "Server has no stdio transport"),
+            CallError::UnmetFeatures(u) => write!(f, "Refusing to run this server: {}", u),
             CallError::ExecutionInSystemScope(msg) => write!(f, "{}", msg),
             CallError::SystemScopeRequiresElevation(id) => write!(
                 f,
@@ -110,6 +113,7 @@ impl From<crate::transport::SelectError> for CallError {
             crate::transport::SelectError::ForeignHost(detail) => {
                 CallError::NoTransportForHost(detail)
             }
+            crate::transport::SelectError::Unmet(u) => CallError::UnmetFeatures(u),
         }
     }
 }
@@ -670,7 +674,7 @@ async fn call_tool_elevated(
 /// run commands and the daemon calls it constantly.
 pub fn elevate_call_for_system_scope(paths: &Paths, id: &str) {
     if let Some((manifest, scope)) = get_server(paths, id) {
-        let selected = crate::transport::select(manifest.transports.as_deref()).ok();
+        let selected = crate::transport::select_runnable(&manifest).ok();
         // An execution backend in system scope is refused moments later by the
         // spawn plan; re-execing first would make the human answer a password
         // prompt to reach that refusal.
@@ -767,7 +771,7 @@ pub async fn call_tool(
     let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let primary = crate::transport::select(manifest.transports.as_deref())?;
+    let primary = crate::transport::select_runnable(&manifest)?;
 
     // Before elevation, not after: the two are incompatible, so delegating a
     // call that is going to be refused anyway would spend a password prompt on it.
@@ -913,7 +917,7 @@ pub async fn list_tools(paths: &Paths, id: &str) -> Result<Vec<rmcp::model::Tool
     let (manifest, scope) =
         get_server(paths, id).ok_or_else(|| CallError::ServerNotFound(id.to_string()))?;
 
-    let primary = crate::transport::select(manifest.transports.as_deref())?;
+    let primary = crate::transport::select_runnable(&manifest)?;
 
     match primary {
         Transport::Stdio { .. } => list_tools_stdio(paths, &manifest, id, scope, primary).await,

@@ -111,7 +111,7 @@ Each server object in `servers`:
 
 **Required:** `id`, `name`, `summary`, `version`, and either inline `transports` + `source` (for stdio) **or** a `manifest` URL pointing to the server's `manifest.json` (the form the JARVIS mcp-registry uses — transports/source are then fetched from the manifest).
 
-**Optional:** `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`, `setupScriptWindowsSha256`), `platforms` (vetted platforms), `setupScriptWindows` (Windows setup script)
+**Optional:** `requiredFeatures` (dmcp features the manifest needs, §6.1.2), `description`, `author`, `homepage`, `bugUrl`, `donationUrl`, `icon`, `categories`, `capabilities`, `permissions`, `tools`, `configurableProperties`, `license`, `releaseDate`, `size`, `screenshots`, `changelog`, `scope`, `keywords`, `trustStatus` (`community`/`official`; `deprecated`/`removed` for revocation), `embeddings` (semantic-search vectors), `integrity` (`manifestSha256`, `setupScriptSha256`, `setupScriptWindowsSha256`), `platforms` (vetted platforms), `setupScriptWindows` (Windows setup script)
 
 **Integrity:** at install, dmcp verifies the fetched manifest's raw bytes
 against `integrity.manifestSha256` (hard failure on mismatch) and setup scripts
@@ -274,6 +274,26 @@ re-execing dmcp as root (pkexec, or `sudo -A` when `DMCP_SUDO_ASKPASS` answers),
 semantics inside a container or behind a wrapper are undefined; the combination is
 refused before any spawn or password prompt.
 
+**Older dmcp.** dmcp 0.2.0 and earlier skip `execution` like any unknown field
+and would launch the line on the host. A registry should not publish manifests
+that use it while such versions are in use; `requiredFeatures` (§6.1.2) covers
+every later version.
+
+#### 6.1.2 Required features (optional)
+
+```json
+"requiredFeatures": ["execution"]
+```
+
+Top-level manifest field: the dmcp features the manifest cannot run without.
+An implementation that does not know a listed name must refuse the manifest at
+install and connect (before any write, clone or setup script; the platform
+override does not apply) and before every launch of an installed copy (before
+any elevation prompt). Such a manifest must still load, so listing, `info` and
+uninstall keep working. Absent or `[]` requires nothing; a value that is not an
+array of strings is refused. Names are matched exactly. Defined names:
+`execution` (§6.1.1).
+
 ### 6.2 Source (for stdio)
 
 ```json
@@ -429,6 +449,8 @@ For robustness, an implementation may support:
 ---
 
 ## Changelog — corrected claims
+
+*2026-11-19:* `requiredFeatures` documented (§6.1.2), with the note that dmcp 0.2.0 and older ignore `execution` (§6.1.1).
 
 *2026-07-25:* `platforms` reading rules stated for both fields — absent and empty mean unrestricted, a value that is not an array of platform names is refused on every host, and neither state can make a manifest unparseable.
 

@@ -98,6 +98,12 @@ pub struct Manifest {
     /// pass the gate — an unreadable declaration covers no host.
     #[serde(default, skip_serializing_if = "PlatformDecl::is_absent")]
     pub platforms: PlatformDecl,
+    /// dmcp features this manifest cannot run without, e.g. `["execution"]`.
+    /// Kept raw and checked by `crate::features` rather than at parse: a list
+    /// naming a feature this dmcp lacks must still load, so `list`, `info` and
+    /// `uninstall` can see the server that every launch path refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_features: Option<serde_json::Value>,
 }
 
 /// One user-facing configuration field declared by a server manifest.

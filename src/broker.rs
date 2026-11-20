@@ -918,8 +918,8 @@ mod server {
             // already checked. A raw request over the socket for a stateless or
             // system-scope id must be refused here, never spawned.
             session_gate(scope, manifest.stateful)?;
-            let primary = crate::transport::select(manifest.transports.as_deref())
-                .map_err(|e| e.to_string())?;
+            let primary =
+                crate::transport::select_runnable(&manifest).map_err(|e| e.to_string())?;
             if !matches!(primary, Transport::Stdio { .. }) {
                 return Err(
                     "session broker supports stdio (local) servers only; remote servers are \

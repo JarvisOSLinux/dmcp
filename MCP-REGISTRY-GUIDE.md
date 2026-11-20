@@ -143,6 +143,7 @@ refused, and `community` installs are flagged as not maintainer-reviewed. See
 | `changelog`          | string | Changelog text.                                                 |
 | `scope`              | string | `"user"` (default) or `"system"`. See Scope below.              |
 | `platforms`          | array  | Platforms the registry vouches for: `"linux"`, `"darwin"`, `"windows"`. Omit for unrestricted. See Platforms below. |
+| `requiredFeatures`   | array  | dmcp features the manifest cannot run without, e.g. `["execution"]`. A dmcp that lacks one refuses the manifest. See Required features below. |
 | `setupScript`        | string | For local servers: filename of a shell script inside the server folder (e.g. `"setup.sh"`). For remote servers: URL to download the script. See Setup Script below. |
 | `setupScriptWindows` | string | Windows counterpart of `setupScript` (e.g. `"setup.ps1"`), run through PowerShell. Omit when the server has no Windows setup. |
 
@@ -308,6 +309,24 @@ are parse errors, because a typo silently reading as "no backend" would start a
 containerized server's launch line on the host. Execution backends are not
 supported for **system-scope** servers; that combination is refused before any
 spawn.
+
+**Older dmcp.** dmcp 0.2.0 and earlier skip `execution` like any field they don't
+know and run the launch line on the host. Don't publish a server that relies on
+`execution` while those versions are in use; the JarvisOS registry's validator
+refuses it for now.
+
+### Required features
+
+```json
+"requiredFeatures": ["execution"]
+```
+
+List the dmcp features your manifest cannot run without. dmcp skips fields it
+doesn't know, so a manifest that needs a newer dmcp would otherwise run in an
+older one with the new part dropped. A dmcp that doesn't know a listed name
+refuses the manifest at install and connect, and before every launch of an
+installed copy. Absent or `[]` requires nothing; anything but a list of names is
+refused. Known names: `execution`. dmcp 0.2.0 and older predate the field.
 
 ### Legacy Format (unsupported)
 
@@ -597,6 +616,8 @@ Removal is a simple `rm -rf <installDir>`. All files are self-contained. For sys
 - **Provide a `bugUrl`.** Wrapper UIs can surface it as a "Report Bug" link.
 
 ## Changelog — corrected claims
+
+*2026-11-19:* `requiredFeatures` documented, and the note that dmcp 0.2.0 and older ignore `execution`, so registries should hold such servers back.
 
 *2026-07-25:* the browse marking covers the semantic-search mode too (`sync-index` copies each entry's `platforms` into the vector index; the host verdict is computed at search time), with the re-sync caveat for an older index. The Windows setup fallback corrected: a `"windows"`-vetted entry that ships only `setupScript` fails the install naming the missing `setupScriptWindows`, rather than being handed to PowerShell.
 

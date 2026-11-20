@@ -917,6 +917,15 @@ fn main() {
             }
         }
         Commands::Setup { id } => {
+            // Ahead of elevation, so a refusal costs no password prompt: every
+            // launch path refuses a manifest whose `requiredFeatures` this dmcp
+            // lacks, and its setup script is no exception.
+            if let Some((manifest, _)) = get_server(&paths, &id) {
+                if let Some(unmet) = dmcp::features::unmet(manifest.required_features.as_ref()) {
+                    eprintln!("Error: refusing to set up this server: {}", unmet);
+                    std::process::exit(1);
+                }
+            }
             // A system-scope server's files are root's: its setup script (a
             // chmod, a pip install into its dir) and the timestamp written
             // back into its manifest both need root, as uninstall does.

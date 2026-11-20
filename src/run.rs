@@ -34,6 +34,8 @@ pub enum RunError {
     NoTransports,
     NoTransportForHost(crate::transport::NoTransportForHost),
     NoStdioTransport,
+    /// The manifest lists `requiredFeatures` this dmcp doesn't have.
+    UnmetFeatures(crate::features::Unmet),
     /// A system-scope server declares an execution backend; the refusal text
     /// comes from `crate::execution` so every surface says the same thing.
     ExecutionInSystemScope(String),
@@ -54,6 +56,7 @@ impl std::fmt::Display for RunError {
                 "Server has no stdio transport (remote servers: use the printed URL to connect)"
             ),
             RunError::ExecutionInSystemScope(msg) => write!(f, "{}", msg),
+            RunError::UnmetFeatures(u) => write!(f, "Refusing to run this server: {}", u),
             RunError::CommandNotFound(cmd) => write!(f, "Command not found: {}", cmd),
             RunError::NotOnPath(e) => write!(f, "{}", e),
             RunError::SpawnFailed(e) => write!(f, "Failed to spawn process: {}", e),
@@ -71,6 +74,7 @@ impl From<crate::transport::SelectError> for RunError {
             crate::transport::SelectError::ForeignHost(detail) => {
                 RunError::NoTransportForHost(detail)
             }
+            crate::transport::SelectError::Unmet(u) => RunError::UnmetFeatures(u),
         }
     }
 }
@@ -95,8 +99,7 @@ pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
     // transport with an execution backend is refused below, so it must not cost
     // a password prompt on the way there.
     if scope == Scope::System && !is_elevated() {
-        if let Ok(selected @ Transport::Stdio { .. }) =
-            crate::transport::select(manifest.transports.as_deref())
+        if let Ok(selected @ Transport::Stdio { .. }) = crate::transport::select_runnable(&manifest)
         {
             if selected.execution().is_none() {
                 re_exec_elevated();
@@ -104,7 +107,7 @@ pub fn run(paths: &Paths, id: &str, _verbose: bool) -> Result<(), RunError> {
         }
     }
 
-    let primary = crate::transport::select(manifest.transports.as_deref())?;
+    let primary = crate::transport::select_runnable(&manifest)?;
 
     match primary {
         Transport::Stdio { .. } => run_stdio(paths, &manifest, id, scope, primary),

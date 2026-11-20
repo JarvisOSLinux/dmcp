@@ -85,6 +85,11 @@ fn connect_manifest(
             return Err(ConnectError::PlatformUnsupported(refusal));
         }
     }
+    // Features before the load check, as in `install`: "update dmcp" is the
+    // useful answer to a manifest written for a newer one.
+    if let Some(unmet) = crate::features::unmet_in(&manifest) {
+        return Err(ConnectError::UnmetFeatures(unmet));
+    }
     if let Some(e) = crate::models::Manifest::load_error(&manifest) {
         return Err(ConnectError::InvalidManifest(e));
     }
@@ -328,6 +333,7 @@ pub enum ConnectError {
     ParseIndex(serde_json::Error),
     IndexError(String),
     PlatformUnsupported(crate::platform::UnsupportedHost),
+    UnmetFeatures(crate::features::Unmet),
     InvalidManifest(String),
 }
 
@@ -342,6 +348,7 @@ impl std::fmt::Display for ConnectError {
             ConnectError::ParseIndex(e) => write!(f, "Failed to parse index: {}", e),
             ConnectError::IndexError(s) => write!(f, "{}", s),
             ConnectError::PlatformUnsupported(refusal) => write!(f, "{}", refusal),
+            ConnectError::UnmetFeatures(u) => write!(f, "Refusing to connect this server: {}", u),
             ConnectError::InvalidManifest(e) => write!(
                 f,
                 "Refusing to install: dmcp could not load this manifest afterwards: {}",
@@ -503,6 +510,18 @@ mod tests {
 
         let err = connect_with(&paths, m, false, false).unwrap_err();
         assert!(matches!(err, ConnectError::InvalidManifest(_)), "{err:?}");
+        assert!(!paths.user_install_dir().join("com.test.connected").exists());
+    }
+
+    #[test]
+    fn a_manifest_needing_a_newer_dmcp_is_refused() {
+        let tree = TempTree::new();
+        let paths = tree.paths();
+        let mut m = manifest(None, None);
+        m["requiredFeatures"] = serde_json::json!(["teleport"]);
+
+        let err = connect_with(&paths, m, false, true).unwrap_err();
+        assert!(matches!(err, ConnectError::UnmetFeatures(_)), "{err:?}");
         assert!(!paths.user_install_dir().join("com.test.connected").exists());
     }
 

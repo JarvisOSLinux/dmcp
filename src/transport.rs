@@ -57,6 +57,9 @@ pub enum SelectError {
     Missing,
     /// Transports exist, but none of them covers this host.
     ForeignHost(NoTransportForHost),
+    /// The manifest lists `requiredFeatures` this dmcp doesn't have, so no
+    /// transport of it may run here (see `crate::features`).
+    Unmet(crate::features::Unmet),
 }
 
 impl std::fmt::Display for SelectError {
@@ -64,6 +67,7 @@ impl std::fmt::Display for SelectError {
         match self {
             SelectError::Missing => write!(f, "no transports defined"),
             SelectError::ForeignHost(e) => write!(f, "{}", e),
+            SelectError::Unmet(u) => write!(f, "refusing to run this server: {}", u),
         }
     }
 }
@@ -112,6 +116,18 @@ pub fn select_for_host<'a>(
 /// The transport to launch on this host.
 pub fn select(transports: Option<&[Transport]>) -> Result<&Transport, SelectError> {
     select_for_host(transports, host_platform())
+}
+
+/// The transport to run an installed server through, once its manifest has
+/// passed the `requiredFeatures` gate. Every path that runs a server picks its
+/// transport here: `call`, `tools`, `run`, the session broker, and the two
+/// elevation checks, which must not spend a password prompt on a manifest that
+/// is about to be refused. The plain [`select`] is for describing a server.
+pub fn select_runnable(manifest: &crate::models::Manifest) -> Result<&Transport, SelectError> {
+    if let Some(unmet) = crate::features::unmet(manifest.required_features.as_ref()) {
+        return Err(SelectError::Unmet(unmet));
+    }
+    select(manifest.transports.as_deref())
 }
 
 /// Same rule over an unparsed transports array, for the registry-entry paths

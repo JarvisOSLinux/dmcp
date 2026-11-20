@@ -285,6 +285,34 @@ Every spawn site honours the same plan: the one-shot `call`, `tools`, `run` and
 the session broker all build their process from `call::stdio_spawn_plan`, so a
 container cannot be honoured on one path and skipped on another.
 
+**Older dmcp.** dmcp 0.2.0 and earlier don't know `execution` and skip it like any
+field they don't know, so they would run the launch line on the host. Nothing in a
+manifest can change a version that is already released, so the JarvisOS registry
+holds back servers that use `execution` until those versions are out of use. A
+manifest that uses it lists it in `requiredFeatures` (below), which covers every
+dmcp from this one on.
+
+## Required features
+
+```json
+"requiredFeatures": ["execution"]
+```
+
+`requiredFeatures` names the dmcp features a manifest cannot run without. dmcp
+skips manifest fields it doesn't know, so without this list a manifest written
+for a newer dmcp would run in an older one with the new part silently dropped.
+A dmcp that doesn't know a listed name refuses the manifest instead:
+
+- `install` and `connect` refuse it before anything is written or run
+  (`--ignore-platform` does not reach past this);
+- for a server that is already installed (by a newer dmcp before a downgrade,
+  say), `call`, `tools`, `run`, the session broker and `setup` refuse it before
+  the spawn and before any password prompt. It still loads, so `list`, `info`
+  and `uninstall` see it.
+
+Absent or `[]` requires nothing; a value that is not a list of names is refused.
+Names this dmcp knows: `execution`.
+
 ## System-scoped servers
 
 System-scoped MCP servers are installed under `/usr/share/mcp/installed/` and are
@@ -415,6 +443,8 @@ See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 
 ## Changelog — corrected claims
+
+*2026-11-19:* `requiredFeatures` (#63 review item 3) — a manifest names the dmcp features it cannot run without, and a dmcp that lacks one refuses it at install, `connect`, and before every launch, instead of running it with the feature dropped. dmcp 0.2.0 and older predate the field, so `execution` manifests are held back by the registry until those are out of use; the Execution backends section says so.
 
 *2026-09-01:* execution backends (#62) — a stdio transport may declare `execution`, either `{"type": "docker", …}` or `{"wrapper": [...]}`, and every spawn site (`call`, `tools`, `run`, the session broker) builds its process from the same plan. Config values reach a container through bare `-e KEY` flags rather than argv; a wrapper does not forward the config environment by itself, which the section above states plainly; a malformed `execution` block is a parse error rather than a silent unwrapped host spawn; and system scope plus a backend is refused before any spawn or polkit prompt.
 

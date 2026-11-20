@@ -62,6 +62,7 @@ src/
 ├── elevation.rs      Privilege elevation for system scope (Linux: pkexec/polkit; macOS: sudo/osascript)
 ├── elicit.rs         Inbound `elicitation/create`: a server asking for input mid-tool-call
 ├── execution.rs      Execution backends: the parsed `execution` block + the one stdio spawn plan
+├── features.rs       `requiredFeatures`: refuse a manifest that needs a feature this dmcp lacks
 └── transport.rs      Per-host transport selection + transport-type extraction
 ```
 
@@ -337,6 +338,19 @@ not load is "not found" rather than resolving to a same-id system-scope server.
 `info`, `list`, `browse` (and `--json`) and `get_server_info` show the backend
 through `Execution::describe`, extra docker flags and wrapper argv in full.
 
+**Older dmcp and `requiredFeatures`.** dmcp 0.2.0 and earlier skip `execution`
+(an unknown field on `Transport::Stdio`) and launch on the host; no manifest
+change reaches a released binary, so the registry holds such servers back. The
+top-level `requiredFeatures` list (`src/features.rs`) is what keeps the next
+feature from repeating this: `features::KNOWN` is the names this build
+implements, `install`/`connect` refuse unknown ones before the wipe (ahead of
+`load_error`, so the answer is "update dmcp"), and every launch path picks its
+transport through `transport::select_runnable`, which refuses before selecting,
+so both elevation checks see an error and skip the re-exec. `setup` checks ahead
+of its own re-exec. The field is kept raw on `Manifest` (like `platforms`), so a
+manifest naming an unknown feature still loads for `list`/`info`/`uninstall`.
+Add a name to `KNOWN` in the same change that implements the field it stands for.
+
 **System scope + `execution` is refused** (`execution::system_scope_refusal`),
 before any spawn *and* before the elevation re-exec, on all of `call`, `tools` and
 `run`: a system-scope server is launched by re-execing dmcp as root (pkexec, or
@@ -388,6 +402,8 @@ The `dmcp serve` instructions state the retry rule: if a call to a server with
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-11-19:* the older-dmcp item of the #63 review. A released dmcp cannot be changed, so it is closed in two halves: the registry refuses `execution` for now, and `requiredFeatures` (`src/features.rs`) makes every dmcp from this one on refuse a manifest that needs a feature it lacks, at `install`/`connect` and before every launch (`transport::select_runnable` for `call`, `tools`, `run`, the broker and both elevation checks; `setup` ahead of its re-exec). Mutation-checked: dropping the gate in `select_runnable`, `install` or `connect` each fails the test that names it.
 
 *2026-11-18:* execution backends, after Toufic's review of #63. **Install:** `install` and `connect` copied the manifest JSON to disk unparsed, so a malformed `execution` block installed cleanly (after wiping any working copy) and was "Server not found" from then on; both now refuse up front through `Manifest::load_error`. `discovery::get_server`/`get_manifest_path` no longer fall through to system scope when the user scope lists the id but its manifest does not load, which resolved the name to a same-id server running as root. **Docker env:** config and the docker client shared one environment (bare `-e KEY` read from the client's own), so a setting named `DOCKER_HOST`, `DOCKER_CONFIG`, `HOME` or `PATH` redirected docker itself. `SpawnPlan` now carries `container_env` separately; `SpawnPlan::prepare` writes it to a 0600 `--env-file` in the broker's directory, held by an `EnvFile` guard until the handshake (`run`: until exit), and the docker client gets no config at all. What the env-file format cannot carry is refused by key name rather than dropped. **Mount:** `-v dir:dir:mode` could not express a `:` in the path; `--mount type=bind` with quoted CSV fields can, and survives `,` and `"`. **Visibility:** `info`, `list`, `browse` (and its `--json`) and `get_server_info` show the backend via `Execution::describe`, extra docker flags and wrapper argv in full. **Tests:** `plan_for` asserts on `stdio_spawn_plan`, which does no PATH lookup, so the planning tests pass on Windows; the real-container test now uses an install dir containing `:` and `,` and a `DOCKER_HOST` setting pointing nowhere, which reaches the container while docker still reaches its daemon. Not yet addressed: an older dmcp ignores `execution` and launches on the host (needs a format decision), container cleanup on kill, first-run image pulls inside the handshake, and wrapper quoting.
 
