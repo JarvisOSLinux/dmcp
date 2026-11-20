@@ -255,12 +255,17 @@ mod tests {
     use super::*;
 
     fn sample_paths() -> Paths {
+        sample_paths_on("")
+    }
+
+    fn sample_paths_on(drive: &str) -> Paths {
+        let path = |p: &str| PathBuf::from(format!("{drive}{p}"));
         Paths {
-            user_sources: PathBuf::from("/home/u/.config/mcp/sources.list"),
-            user_install_dir: PathBuf::from("/home/u/.local/share/mcp/installed"),
-            system_sources: PathBuf::from("/etc/mcp/sources.list"),
-            system_install_dir: PathBuf::from("/usr/share/mcp/installed"),
-            vector_index_dir: PathBuf::from("/home/u/.local/share/mcp/vector_index"),
+            user_sources: path("/home/u/.config/mcp/sources.list"),
+            user_install_dir: path("/home/u/.local/share/mcp/installed"),
+            system_sources: path("/etc/mcp/sources.list"),
+            system_install_dir: path("/usr/share/mcp/installed"),
+            vector_index_dir: path("/home/u/.local/share/mcp/vector_index"),
         }
     }
 
@@ -288,7 +293,10 @@ mod tests {
 
     #[test]
     fn as_json_serializes_all_keys_as_absolute_strings() {
-        let value = serde_json::to_value(sample_paths().as_json()).unwrap();
+        // Windows calls a path absolute only with a drive: `/home/u` is
+        // relative to the current one.
+        let drive = if cfg!(windows) { "C:" } else { "" };
+        let value = serde_json::to_value(sample_paths_on(drive).as_json()).unwrap();
         let obj = value.as_object().unwrap();
 
         for key in [

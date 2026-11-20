@@ -1079,6 +1079,30 @@ mod tests {
             }
             path.to_string_lossy().to_string()
         }
+
+        fn setup_scripts(&self, stem: &str, posix: &str, windows: &str) -> SetupScripts {
+            SetupScripts {
+                posix: self.script(&format!("{stem}.sh"), posix),
+                windows: self.script(&format!("{stem}.ps1"), windows),
+            }
+        }
+
+        fn ok_scripts(&self) -> SetupScripts {
+            self.setup_scripts("ok", "#!/bin/sh\nexit 0\n", "exit 0\n")
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// One setup step written for both hosts, as an entry that supports both
+    /// ships it: a Windows host refuses to run a POSIX `setupScript`.
+    struct SetupScripts {
+        posix: String,
+        windows: String,
     }
 
     /// An sse-transport entry installs without a git clone or a registry fetch,
@@ -1091,6 +1115,12 @@ mod tests {
             "transports": [{ "type": "sse", "url": "https://example.invalid/sse" }],
             "setupScript": setup_script,
         })
+    }
+
+    fn remote_server_with(scripts: &SetupScripts) -> serde_json::Value {
+        let mut server = remote_server(&scripts.posix);
+        server[WINDOWS_SETUP.manifest_key] = serde_json::json!(scripts.windows);
+        server
     }
 
     #[test]
@@ -1146,16 +1176,17 @@ mod tests {
     fn a_setup_script_can_read_its_own_manifest() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script(
-            "reads-manifest.sh",
+        let scripts = tree.setup_scripts(
+            "reads-manifest",
             "#!/bin/sh\ngrep -q '\"installDir\"' manifest.json || { echo 'no manifest' >&2; exit 7; }\n",
+            "if (-not (Select-String -Quiet -SimpleMatch -Path manifest.json -Pattern '\"installDir\"')) { [Console]::Error.WriteLine('no manifest'); exit 7 }\n",
         );
 
         install(
             &paths,
             "test.server",
             crate::discovery::Scope::User,
-            Some(remote_server(&script)),
+            Some(remote_server_with(&scripts)),
             true,
             false,
         )
@@ -1166,13 +1197,13 @@ mod tests {
     fn successful_setup_installs_cleanly() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+        let scripts = tree.ok_scripts();
 
         install(
             &paths,
             "test.server",
             crate::discovery::Scope::User,
-            Some(remote_server(&script)),
+            Some(remote_server_with(&scripts)),
             true,
             false,
         )
@@ -1187,8 +1218,8 @@ mod tests {
     /// A remote entry whose `platforms` list is passed straight through, plus a
     /// setup script that leaves a sentinel file: the sentinel is how a test tells
     /// "refused up front" from "refused after running the server's code".
-    fn platform_server(platforms: Option<&[&str]>, setup_script: &str) -> serde_json::Value {
-        let mut server = remote_server(setup_script);
+    fn platform_server(platforms: Option<&[&str]>, scripts: &SetupScripts) -> serde_json::Value {
+        let mut server = remote_server_with(scripts);
         if let Some(p) = platforms {
             server["platforms"] = serde_json::json!(p);
         }
@@ -1200,9 +1231,10 @@ mod tests {
         let tree = TempTree::new();
         let paths = tree.paths();
         let sentinel = tree.root.join("setup-ran");
-        let script = tree.script(
-            "touch.sh",
+        let scripts = tree.setup_scripts(
+            "touch",
             &format!("#!/bin/sh\ntouch {}\n", sentinel.display()),
+            &format!("New-Item -ItemType File -Path '{}'\n", sentinel.display()),
         );
 
         let err = install(
@@ -1211,7 +1243,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(platform_server(
                 Some(&[crate::platform::foreign_platform()]),
-                &script,
+                &scripts,
             )),
             true,
             false,
@@ -1246,13 +1278,13 @@ mod tests {
     fn refusal_leaves_an_existing_install_untouched() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+        let scripts = tree.ok_scripts();
 
         install(
             &paths,
             "test.server",
             crate::discovery::Scope::User,
-            Some(platform_server(None, &script)),
+            Some(platform_server(None, &scripts)),
             true,
             false,
         )
@@ -1268,7 +1300,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(platform_server(
                 Some(&[crate::platform::foreign_platform()]),
-                &script,
+                &scripts,
             )),
             true,
             false,
@@ -1389,7 +1421,7 @@ mod tests {
     fn ignore_platform_overrides_the_refusal() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+        let scripts = tree.ok_scripts();
 
         install(
             &paths,
@@ -1397,7 +1429,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(platform_server(
                 Some(&[crate::platform::foreign_platform()]),
-                &script,
+                &scripts,
             )),
             true,
             true,
@@ -1419,13 +1451,13 @@ mod tests {
     fn absent_platforms_installs_unrestricted() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+        let scripts = tree.ok_scripts();
 
         install(
             &paths,
             "test.server",
             crate::discovery::Scope::User,
-            Some(platform_server(None, &script)),
+            Some(platform_server(None, &scripts)),
             true,
             false,
         )
@@ -1445,9 +1477,9 @@ mod tests {
     fn a_server_with_an_unreadable_manifest_is_still_removable() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+        let scripts = tree.ok_scripts();
 
-        let mut server = platform_server(None, &script);
+        let mut server = platform_server(None, &scripts);
         server["platforms"] = serde_json::json!("windows");
         install(
             &paths,
@@ -1485,7 +1517,7 @@ mod tests {
     fn declared_host_platform_installs() {
         let tree = TempTree::new();
         let paths = tree.paths();
-        let script = tree.script("ok.sh", "#!/bin/sh\nexit 0\n");
+        let scripts = tree.ok_scripts();
 
         install(
             &paths,
@@ -1493,7 +1525,7 @@ mod tests {
             crate::discovery::Scope::User,
             Some(platform_server(
                 Some(&[crate::platform::host_platform()]),
-                &script,
+                &scripts,
             )),
             true,
             false,
